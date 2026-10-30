@@ -14,7 +14,8 @@ Not ported (out of scope so far, not tried): the premultiplied-blend fragment-sh
 in `grate_state.c`, the biggest and roughest part of the original patch against this
 branch (7 of 12 hunks fail even with fuzz).
 
-Builds clean (native x86_64 meson smoke test, 1018/1018 targets, zero warnings) — see
-[docs/3d-acceleration.md](../../docs/3d-acceleration.md) for that and for a separate,
-more serious gap found independent of this patch (shader binding is unimplemented on this
-branch). Not cross-compiled for armv7 or run on hardware.
+Builds clean (native x86_64 meson smoke test, 1018/1018 targets, zero warnings). An earlier
+version of this note claimed a separate, more serious gap (shader binding unimplemented on
+this branch) — that was a misread, retracted in
+[docs/3d-acceleration.md](../../docs/3d-acceleration.md). Not cross-compiled for armv7 or
+run on hardware.
