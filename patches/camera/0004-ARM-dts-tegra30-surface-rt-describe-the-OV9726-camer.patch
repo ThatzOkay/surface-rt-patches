@@ -1,0 +1,64 @@
+From a427e5b2ccd00bc06dff3ae891af53ffe83be18b Mon Sep 17 00:00:00 2001
+From: Kayori <noduhgamingxd@gmail.com>
+Date: Fri, 30 Oct 2026 01:16:26 +0100
+Subject: [PATCH 03/20] ARM: dts: tegra30: surface-rt: describe the OV9726
+ camera
+
+Add the 1.8 V camera supply (GPIO BB4) and the OV9726 sensor at I2C 0x10 on
+the camera bus, powered from vdd_cam1_ldo. The sensor clock is the Tegra
+CSUS clock from PLLP at 24 MHz. Test only: the VI and CSI nodes are not
+enabled, and it is not known which of the two 2.8 V rails the sensor uses.
+---
+ .../nvidia/tegra30-microsoft-surface-rt.dts   | 29 +++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
+index f1876836c..ab39042b0 100644
+--- a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
++++ b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
+@@ -212,6 +212,26 @@ i2c@7000c500 {
+ 		clock-frequency = <100000>;
+ 
+ 		/* Cams at 0x10 and 0x72 */
++
++		camera@10 {
++			compatible = "ovti,ov9726";
++			reg = <0x10>;
++
++			clocks = <&tegra_car TEGRA30_CLK_CSUS>;
++			assigned-clocks = <&tegra_car TEGRA30_CLK_VI_SENSOR>;
++			assigned-clock-parents = <&tegra_car TEGRA30_CLK_PLL_P>;
++			assigned-clock-rates = <24000000>;
++
++			avdd-supply = <&vdd_cam1_ldo>;
++			dovdd-supply = <&vdd_cam_1v8>;
++
++			port {
++				ov9726_ep: endpoint {
++					data-lanes = <1>;
++					link-frequencies = /bits/ 64 <240000000>;
++				};
++			};
++		};
+ 	};
+ 
+ 	hdmi_ddc: i2c@7000c700 {
+@@ -769,6 +789,15 @@ vdd_pnl: regulator-panel {
+ 		vin-supply = <&vdd_5v0_bat>;
+ 	};
+ 
++	vdd_cam_1v8: regulator-cam-1v8 {
++		compatible = "regulator-fixed";
++		regulator-name = "vdd_cam_1v8";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		gpio = <&gpio TEGRA_GPIO(BB, 4) GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
+ 	vdd_cam1_ldo: regulator-cam1 {
+ 		compatible = "regulator-fixed";
+ 		regulator-name = "vdd_cam1_ldo";
+-- 
+2.56.0
+

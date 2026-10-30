@@ -1,0 +1,98 @@
+From f3ad7994550ded79b22605617b4956ba37985404 Mon Sep 17 00:00:00 2001
+From: Kayori <noduhgamingxd@gmail.com>
+Date: Fri, 30 Oct 2026 08:01:57 +0100
+Subject: [PATCH 20/20] ARM: dts: tegra30: surface-rt: connect the OV9726 to VI
+ through CSI-A
+
+Enable the video input (vi) and CSI nodes and link the sensor to VI
+through CSI channel 0 (CSI-A), with one data lane. Label the 1.2 V
+avdd_dsi_csi regulator and use it as the CSI supply.
+
+Which CSI port the sensor is wired to is not known; CSI-A is a guess,
+and CSI-B would be channel@1 with nvidia,mipi-calibrate = <&csi 1>.
+---
+ .../nvidia/tegra30-microsoft-surface-rt.dts   | 54 ++++++++++++++++++-
+ 1 file changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
+index ab39042b0..2eb543a0b 100644
+--- a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
++++ b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
+@@ -207,6 +207,57 @@ touchscreen@5b {
+ 		};
+ 	};
+ 
++	host1x@50000000 {
++		vi@54080000 {
++			status = "okay";
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++
++					vi_in0: endpoint {
++						remote-endpoint = <&csi_out0>;
++					};
++				};
++			};
++
++			csi@800 {
++				status = "okay";
++
++				avdd-dsi-csi-supply = <&avdd_dsi_csi>;
++
++				/* Channel 0 is CSI-A, channel 1 is CSI-B. */
++				channel@0 {
++					reg = <0>;
++					nvidia,mipi-calibrate = <&csi 0>;
++
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					port@0 {
++						reg = <0>;
++
++						csi_in0: endpoint {
++							remote-endpoint = <&ov9726_ep>;
++							data-lanes = <1>;
++						};
++					};
++
++					port@1 {
++						reg = <1>;
++
++						csi_out0: endpoint {
++							remote-endpoint = <&vi_in0>;
++						};
++					};
++				};
++			};
++		};
++	};
++
+ 	i2c@7000c500 {
+ 		status = "okay";
+ 		clock-frequency = <100000>;
+@@ -227,6 +278,7 @@ camera@10 {
+ 
+ 			port {
+ 				ov9726_ep: endpoint {
++					remote-endpoint = <&csi_in0>;
+ 					data-lanes = <1>;
+ 					link-frequencies = /bits/ 64 <240000000>;
+ 				};
+@@ -355,7 +407,7 @@ vddio_usd: ldo5 {
+ 					regulator-max-microvolt = <3300000>;
+ 				};
+ 
+-				ldo6 {
++				avdd_dsi_csi: ldo6 {
+ 					regulator-name = "avdd_dsi_csi";
+ 					regulator-min-microvolt = <1200000>;
+ 					regulator-max-microvolt = <1200000>;
+-- 
+2.56.0
+

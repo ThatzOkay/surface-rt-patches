@@ -1,0 +1,28 @@
+Subject: [PATCH] ARM: tegra30: microsoft-surface-rt: keep vdd_cover always on
+
+The Type/Touch cover is a HID-over-I2C device behind an i2c-hotplug-gpio
+mux. Its supply, the TPS65911 LDO3 rail "vdd_cover", is only referenced
+by the cover@0 child node, and that child is only instantiated after the
+cover has been detected. Until then nothing holds the regulator, so the
+kernel switches the unused rail off at late init. If cover detection needs
+the cover to be powered, it can then never happen, and the keyboard stays
+dead.
+
+Mark the rail regulator-always-on so it stays powered and the cover is
+detected.
+
+Tested on a Microsoft Surface RT booted over APX (Fusee Gelee + U-Boot):
+before the change the regulator reported "disabled" and no cover I2C
+device appeared; with it, the cover keyboard works.
+
+---
+--- a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
++++ b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
+@@ -317,6 +317,7 @@
+ 					regulator-name = "vdd_cover";
+ 					regulator-min-microvolt = <2800000>;
+ 					regulator-max-microvolt = <2800000>;
++					regulator-always-on;
+ 					regulator-boot-on;
+ 				};
+ 

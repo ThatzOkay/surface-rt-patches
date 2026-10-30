@@ -1,0 +1,319 @@
+From e4f60e70f081eb1f17f381eeff5491ee308bb8fb Mon Sep 17 00:00:00 2001
+From: Kayori <noduhgamingxd@gmail.com>
+Date: Fri, 30 Oct 2026 01:51:57 +0100
+Subject: [PATCH 19/20] staging: media: tegra-video: support the grate host1x
+
+The libre-tegra tree has two mutually exclusive host1x implementations:
+the mainline one (TEGRA_HOST1X) and the grate one (GRATE_HOST1X). The
+Tegra video driver only built against the former, so it could not be
+enabled in a kernel using the grate stack.
+
+Add host1x-compat.h, which selects the right header and provides the
+few sync point helpers the VI code needs on top of whichever API is in
+use. The grate host1x can allocate, read and release a sync point but
+has no request-with-flags, id or wait-on-threshold calls, so there the
+wait polls the hardware counter. The grate host1x_driver remove callback
+returns int rather than void.
+
+Allow VIDEO_TEGRA with either host1x. Behaviour with the mainline host1x
+is unchanged.
+---
+ drivers/staging/media/tegra-video/Kconfig     |  2 +-
+ drivers/staging/media/tegra-video/csi.c       |  2 +-
+ .../staging/media/tegra-video/host1x-compat.h | 80 +++++++++++++++++++
+ drivers/staging/media/tegra-video/tegra20.c   | 20 ++---
+ drivers/staging/media/tegra-video/tegra210.c  |  2 +-
+ drivers/staging/media/tegra-video/vi.c        |  2 +-
+ drivers/staging/media/tegra-video/vi.h        |  2 +-
+ drivers/staging/media/tegra-video/video.c     |  6 +-
+ drivers/staging/media/tegra-video/video.h     |  2 +-
+ drivers/staging/media/tegra-video/vip.c       |  2 +-
+ 10 files changed, 101 insertions(+), 19 deletions(-)
+ create mode 100644 drivers/staging/media/tegra-video/host1x-compat.h
+
+diff --git a/drivers/staging/media/tegra-video/Kconfig b/drivers/staging/media/tegra-video/Kconfig
+index c53441822..5f7a70dcc 100644
+--- a/drivers/staging/media/tegra-video/Kconfig
++++ b/drivers/staging/media/tegra-video/Kconfig
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ config VIDEO_TEGRA
+ 	tristate "NVIDIA Tegra VI driver"
+-	depends on TEGRA_HOST1X
++	depends on TEGRA_HOST1X || GRATE_HOST1X_DRV
+ 	depends on VIDEO_DEV
+ 	select MEDIA_CONTROLLER
+ 	select VIDEOBUF2_DMA_CONTIG
+diff --git a/drivers/staging/media/tegra-video/csi.c b/drivers/staging/media/tegra-video/csi.c
+index 41d57dac6..597f0fd1d 100644
+--- a/drivers/staging/media/tegra-video/csi.c
++++ b/drivers/staging/media/tegra-video/csi.c
+@@ -6,7 +6,7 @@
+ #include <linux/clk.h>
+ #include <linux/clk/tegra.h>
+ #include <linux/device.h>
+-#include <linux/host1x.h>
++#include "host1x-compat.h"
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_graph.h>
+diff --git a/drivers/staging/media/tegra-video/host1x-compat.h b/drivers/staging/media/tegra-video/host1x-compat.h
+new file mode 100644
+index 000000000..7efe3e56e
+--- /dev/null
++++ b/drivers/staging/media/tegra-video/host1x-compat.h
+@@ -0,0 +1,80 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * host1x API selection for the Tegra video driver.
++ *
++ * The grate host1x (CONFIG_GRATE_HOST1X) is a fork of the mainline driver with a
++ * different sync point API: a sync point can be allocated, read and released, but
++ * the mainline request-with-flags, id and wait-on-threshold calls do not exist.
++ * This header gives the video driver one set of helpers for both.
++ */
++
++#ifndef __TEGRA_VIDEO_HOST1X_COMPAT_H__
++#define __TEGRA_VIDEO_HOST1X_COMPAT_H__
++
++#if IS_ENABLED(CONFIG_GRATE_HOST1X)
++
++#include <linux/delay.h>
++#include <linux/host1x-grate.h>
++#include <linux/jiffies.h>
++
++/* the grate host1x_driver.remove callback returns int, the mainline one is void */
++#define TEGRA_HOST1X_REMOVE_RET		int
++#define TEGRA_HOST1X_REMOVE_RETURN	return 0
++
++static inline struct host1x_syncpt *
++tegra_vi_syncpt_request(struct host1x_client *client)
++{
++	struct host1x *host = dev_get_drvdata(client->host->parent);
++	struct host1x_syncpt *sp = host1x_syncpt_request(host);
++
++	return IS_ERR(sp) ? NULL : sp;
++}
++
++static inline u32 tegra_vi_syncpt_id(struct host1x_syncpt *sp)
++{
++	return sp->id;
++}
++
++/* Polls the hardware counter; returns 0 once it reaches @thresh, -EAGAIN on timeout. */
++static inline int tegra_vi_syncpt_wait(struct host1x_syncpt *sp, u32 thresh,
++				       long timeout)
++{
++	unsigned long end = jiffies + timeout;
++
++	while ((s32)(host1x_syncpt_read(sp) - thresh) < 0) {
++		if (time_after(jiffies, end))
++			return -EAGAIN;
++
++		usleep_range(500, 1000);
++	}
++
++	return 0;
++}
++
++#else
++
++#include <linux/host1x.h>
++
++#define TEGRA_HOST1X_REMOVE_RET		void
++#define TEGRA_HOST1X_REMOVE_RETURN
++
++static inline struct host1x_syncpt *
++tegra_vi_syncpt_request(struct host1x_client *client)
++{
++	return host1x_syncpt_request(client, HOST1X_SYNCPT_CLIENT_MANAGED);
++}
++
++static inline u32 tegra_vi_syncpt_id(struct host1x_syncpt *sp)
++{
++	return host1x_syncpt_id(sp);
++}
++
++static inline int tegra_vi_syncpt_wait(struct host1x_syncpt *sp, u32 thresh,
++				       long timeout)
++{
++	return host1x_syncpt_wait(sp, thresh, timeout, NULL);
++}
++
++#endif
++
++#endif
+diff --git a/drivers/staging/media/tegra-video/tegra20.c b/drivers/staging/media/tegra-video/tegra20.c
+index e513e6ccb..7d1234c58 100644
+--- a/drivers/staging/media/tegra-video/tegra20.c
++++ b/drivers/staging/media/tegra-video/tegra20.c
+@@ -18,7 +18,7 @@
+ #include <linux/clk.h>
+ #include <linux/clk/tegra.h>
+ #include <linux/delay.h>
+-#include <linux/host1x.h>
++#include "host1x-compat.h"
+ #include <linux/iopoll.h>
+ #include <linux/kernel.h>
+ #include <linux/kthread.h>
+@@ -425,13 +425,13 @@ static int tegra20_channel_host1x_syncpt_init(struct tegra_vi_channel *chan)
+ 	struct tegra_vi *vi = chan->vi;
+ 	struct host1x_syncpt *out_sp, *fs_sp;
+ 
+-	out_sp = host1x_syncpt_request(&vi->client, HOST1X_SYNCPT_CLIENT_MANAGED);
++	out_sp = tegra_vi_syncpt_request(&vi->client);
+ 	if (!out_sp)
+ 		return dev_err_probe(vi->dev, -EBUSY, "failed to request mw ack syncpoint\n");
+ 
+ 	chan->mw_ack_sp[0] = out_sp;
+ 
+-	fs_sp = host1x_syncpt_request(&vi->client, HOST1X_SYNCPT_CLIENT_MANAGED);
++	fs_sp = tegra_vi_syncpt_request(&vi->client);
+ 	if (!fs_sp)
+ 		return dev_err_probe(vi->dev, -EBUSY, "failed to request frame start syncpoint\n");
+ 
+@@ -600,8 +600,8 @@ static int tegra20_channel_capture_frame(struct tegra_vi_channel *chan,
+ 
+ 		val = host1x_syncpt_read(chan->frame_start_sp[0]);
+ 		do {
+-			err = host1x_syncpt_wait(chan->frame_start_sp[0],
+-						 val + 1, TEGRA_VI_SYNCPT_WAIT_TIMEOUT, NULL);
++			err = tegra_vi_syncpt_wait(chan->frame_start_sp[0],
++						   val + 1, TEGRA_VI_SYNCPT_WAIT_TIMEOUT);
+ 		} while (err == -ERESTARTSYS);
+ 
+ 		if (err) {
+@@ -623,8 +623,8 @@ static int tegra20_channel_capture_frame(struct tegra_vi_channel *chan,
+ 
+ 	val = host1x_syncpt_read(chan->mw_ack_sp[0]);
+ 	do {
+-		err = host1x_syncpt_wait(chan->mw_ack_sp[0], val + 1,
+-					 TEGRA_VI_SYNCPT_WAIT_TIMEOUT, NULL);
++		err = tegra_vi_syncpt_wait(chan->mw_ack_sp[0], val + 1,
++					   TEGRA_VI_SYNCPT_WAIT_TIMEOUT);
+ 	} while (err == -ERESTARTSYS);
+ 
+ 	if (err) {
+@@ -1080,12 +1080,12 @@ static int tegra20_csi_port_start_streaming(struct tegra_csi_channel *csi_chan,
+ 
+ 	tegra20_vi_write(vi_chan, TEGRA_VI_CONT_SYNCPT_CSI_PP_FRAME_START(port),
+ 			 VI_CONT_SYNCPT_OUT_CONTINUOUS_SYNCPT |
+-			 host1x_syncpt_id(vi_chan->frame_start_sp[0])
++			 tegra_vi_syncpt_id(vi_chan->frame_start_sp[0])
+ 			 << VI_CONT_SYNCPT_OUT_SYNCPT_IDX_SFT);
+ 
+ 	tegra20_vi_write(vi_chan, TEGRA_VI_CONT_SYNCPT_OUT(output_channel),
+ 			 VI_CONT_SYNCPT_OUT_CONTINUOUS_SYNCPT |
+-			 host1x_syncpt_id(vi_chan->mw_ack_sp[0])
++			 tegra_vi_syncpt_id(vi_chan->mw_ack_sp[0])
+ 			 << VI_CONT_SYNCPT_OUT_SYNCPT_IDX_SFT);
+ 
+ 	value = (port == PORT_A) ? CSI_A_PHY_CIL_ENABLE | CSI_B_PHY_CIL_DISABLE :
+@@ -1243,7 +1243,7 @@ static int tegra20_vip_start_streaming(struct tegra_vip_channel *vip_chan)
+ 
+ 	tegra20_vi_write(vi_chan, TEGRA_VI_CONT_SYNCPT_OUT(output_channel),
+ 			 VI_CONT_SYNCPT_OUT_CONTINUOUS_SYNCPT |
+-			 host1x_syncpt_id(vi_chan->mw_ack_sp[0])
++			 tegra_vi_syncpt_id(vi_chan->mw_ack_sp[0])
+ 			 << VI_CONT_SYNCPT_OUT_SYNCPT_IDX_SFT);
+ 
+ 	tegra20_vi_write(vi_chan, TEGRA_VI_CAMERA_CONTROL, VI_CAMERA_CONTROL_STOP_CAPTURE);
+diff --git a/drivers/staging/media/tegra-video/tegra210.c b/drivers/staging/media/tegra-video/tegra210.c
+index da99f19a3..f42afc2e5 100644
+--- a/drivers/staging/media/tegra-video/tegra210.c
++++ b/drivers/staging/media/tegra-video/tegra210.c
+@@ -11,7 +11,7 @@
+ #include <linux/clk.h>
+ #include <linux/clk/tegra.h>
+ #include <linux/delay.h>
+-#include <linux/host1x.h>
++#include "host1x-compat.h"
+ #include <linux/kthread.h>
+ 
+ #include "csi.h"
+diff --git a/drivers/staging/media/tegra-video/vi.c b/drivers/staging/media/tegra-video/vi.c
+index f14cdc7b5..773420530 100644
+--- a/drivers/staging/media/tegra-video/vi.c
++++ b/drivers/staging/media/tegra-video/vi.c
+@@ -6,7 +6,7 @@
+ #include <linux/bitmap.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
+-#include <linux/host1x.h>
++#include "host1x-compat.h"
+ #include <linux/lcm.h>
+ #include <linux/list.h>
+ #include <linux/module.h>
+diff --git a/drivers/staging/media/tegra-video/vi.h b/drivers/staging/media/tegra-video/vi.h
+index 46328e488..836b7f4f6 100644
+--- a/drivers/staging/media/tegra-video/vi.h
++++ b/drivers/staging/media/tegra-video/vi.h
+@@ -6,7 +6,7 @@
+ #ifndef __TEGRA_VI_H__
+ #define __TEGRA_VI_H__
+ 
+-#include <linux/host1x.h>
++#include "host1x-compat.h"
+ #include <linux/list.h>
+ 
+ #include <linux/mutex.h>
+diff --git a/drivers/staging/media/tegra-video/video.c b/drivers/staging/media/tegra-video/video.c
+index 2e8438570..6c03e3467 100644
+--- a/drivers/staging/media/tegra-video/video.c
++++ b/drivers/staging/media/tegra-video/video.c
+@@ -3,7 +3,7 @@
+  * Copyright (C) 2020 NVIDIA CORPORATION.  All rights reserved.
+  */
+ 
+-#include <linux/host1x.h>
++#include "host1x-compat.h"
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ 
+@@ -107,7 +107,7 @@ static int host1x_video_probe(struct host1x_device *dev)
+ 	return ret;
+ }
+ 
+-static void host1x_video_remove(struct host1x_device *dev)
++static TEGRA_HOST1X_REMOVE_RET host1x_video_remove(struct host1x_device *dev)
+ {
+ 	struct tegra_video_device *vid = dev_get_drvdata(&dev->dev);
+ 
+@@ -118,6 +118,8 @@ static void host1x_video_remove(struct host1x_device *dev)
+ 
+ 	/* This calls v4l2_dev release callback on last reference */
+ 	v4l2_device_put(&vid->v4l2_dev);
++
++	TEGRA_HOST1X_REMOVE_RETURN;
+ }
+ 
+ static const struct of_device_id host1x_video_subdevs[] = {
+diff --git a/drivers/staging/media/tegra-video/video.h b/drivers/staging/media/tegra-video/video.h
+index 7275affa6..28791668c 100644
+--- a/drivers/staging/media/tegra-video/video.h
++++ b/drivers/staging/media/tegra-video/video.h
+@@ -6,7 +6,7 @@
+ #ifndef __TEGRA_VIDEO_H__
+ #define __TEGRA_VIDEO_H__
+ 
+-#include <linux/host1x.h>
++#include "host1x-compat.h"
+ 
+ #include <media/media-device.h>
+ #include <media/v4l2-device.h>
+diff --git a/drivers/staging/media/tegra-video/vip.c b/drivers/staging/media/tegra-video/vip.c
+index 9ff1f1750..5ab0665f6 100644
+--- a/drivers/staging/media/tegra-video/vip.c
++++ b/drivers/staging/media/tegra-video/vip.c
+@@ -9,7 +9,7 @@
+  */
+ 
+ #include <linux/device.h>
+-#include <linux/host1x.h>
++#include "host1x-compat.h"
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_graph.h>
+-- 
+2.56.0
+

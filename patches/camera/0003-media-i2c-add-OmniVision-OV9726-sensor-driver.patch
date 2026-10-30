@@ -1,0 +1,872 @@
+From 1fb4095ee1e3336d1ce66518d76e22a88edc9c9d Mon Sep 17 00:00:00 2001
+From: Kayori <noduhgamingxd@gmail.com>
+Date: Fri, 30 Oct 2026 01:16:26 +0100
+Subject: [PATCH 01/20] media: i2c: add OmniVision OV9726 sensor driver
+
+Add a V4L2 sub-device driver and devicetree binding for the OmniVision
+OV9726, a 1.3 megapixel sensor on one MIPI CSI-2 data lane (1296x808, 10
+bit, 24 MHz clock).
+
+The register settings come from the Android MSM camera driver for this
+sensor (Copyright (c) 2011, The Linux Foundation, GPL v2); there is no
+public datasheet. The Bayer order, analogue gain range, pixel rate and
+link frequency are not documented there and are unverified: the pixel
+rate and link frequency are derived from the table frame timing at an
+assumed 30 fps.
+
+Only exposure and analogue gain are adjustable; there is one mode.
+---
+ .../bindings/media/i2c/ovti,ov9726.yaml       |  98 +++
+ drivers/media/i2c/Kconfig                     |  14 +
+ drivers/media/i2c/Makefile                    |   1 +
+ drivers/media/i2c/ov9726.c                    | 696 ++++++++++++++++++
+ 4 files changed, 809 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/media/i2c/ovti,ov9726.yaml
+ create mode 100644 drivers/media/i2c/ov9726.c
+
+diff --git a/Documentation/devicetree/bindings/media/i2c/ovti,ov9726.yaml b/Documentation/devicetree/bindings/media/i2c/ovti,ov9726.yaml
+new file mode 100644
+index 000000000..a7974e13d
+--- /dev/null
++++ b/Documentation/devicetree/bindings/media/i2c/ovti,ov9726.yaml
+@@ -0,0 +1,98 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/media/i2c/ovti,ov9726.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: OmniVision OV9726 CMOS Image Sensor
++
++maintainers:
++  - Kayori <noduhgamingxd@gmail.com>
++
++description: |-
++  The OmniVision OV9726 is a 1.3 megapixel CMOS image sensor with a
++  1296x808 active array. It is controlled over I2C (7-bit address 0x10) and
++  sends image data over a single MIPI CSI-2 data lane.
++
++allOf:
++  - $ref: /schemas/media/video-interface-devices.yaml#
++
++properties:
++  compatible:
++    const: ovti,ov9726
++
++  reg:
++    maxItems: 1
++
++  clocks:
++    description: External master clock, 24 MHz.
++    maxItems: 1
++
++  avdd-supply:
++    description: Analog voltage supply, 2.8 volts.
++
++  dovdd-supply:
++    description: Digital I/O voltage supply, 1.8 volts.
++
++  reset-gpios:
++    maxItems: 1
++    description: |-
++      Reference to the GPIO connected to the active-low reset pin, if any.
++      It is asserted (low) while the sensor is powered down.
++
++  port:
++    $ref: /schemas/graph.yaml#/$defs/port-base
++    additionalProperties: false
++
++    properties:
++      endpoint:
++        $ref: /schemas/media/video-interfaces.yaml#
++        unevaluatedProperties: false
++
++        properties:
++          data-lanes:
++            items:
++              - const: 1
++
++          link-frequencies: true
++
++        required:
++          - data-lanes
++
++required:
++  - compatible
++  - reg
++  - clocks
++  - avdd-supply
++  - dovdd-supply
++  - port
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++
++    i2c {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        camera@10 {
++            compatible = "ovti,ov9726";
++            reg = <0x10>;
++            clocks = <&ov9726_clk>;
++            avdd-supply = <&ov9726_avdd>;
++            dovdd-supply = <&ov9726_dovdd>;
++            reset-gpios = <&gpio 5 GPIO_ACTIVE_LOW>;
++
++            port {
++                endpoint {
++                    remote-endpoint = <&csi_ep>;
++                    data-lanes = <1>;
++                    link-frequencies = /bits/ 64 <240000000>;
++                };
++            };
++        };
++    };
++
++...
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+index 5eb1e0e0a..d6f5214e8 100644
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -710,6 +710,20 @@ config VIDEO_OV9650
+ 	  This is a V4L2 sensor driver for the Omnivision
+ 	  OV9650 and OV9652 camera sensors.
+ 
++config VIDEO_OV9726
++	tristate "OmniVision OV9726 sensor support"
++	depends on I2C && VIDEO_DEV
++	select MEDIA_CONTROLLER
++	select VIDEO_V4L2_SUBDEV_API
++	select V4L2_CCI_I2C
++	select V4L2_FWNODE
++	help
++	  This is a Video4Linux2 sensor driver for the OmniVision
++	  OV9726 camera sensor.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called ov9726.
++
+ config VIDEO_OV9734
+ 	tristate "OmniVision OV9734 sensor support"
+ 	depends on ACPI || COMPILE_TEST
+diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
+index a3a6396df..69524bafa 100644
+--- a/drivers/media/i2c/Makefile
++++ b/drivers/media/i2c/Makefile
+@@ -121,6 +121,7 @@ obj-$(CONFIG_VIDEO_OV8865) += ov8865.o
+ obj-$(CONFIG_VIDEO_OV9282) += ov9282.o
+ obj-$(CONFIG_VIDEO_OV9640) += ov9640.o
+ obj-$(CONFIG_VIDEO_OV9650) += ov9650.o
++obj-$(CONFIG_VIDEO_OV9726) += ov9726.o
+ obj-$(CONFIG_VIDEO_OV9734) += ov9734.o
+ obj-$(CONFIG_VIDEO_RDACM20) += rdacm20.o
+ obj-$(CONFIG_VIDEO_RDACM21) += rdacm21.o
+diff --git a/drivers/media/i2c/ov9726.c b/drivers/media/i2c/ov9726.c
+new file mode 100644
+index 000000000..21cf7e28b
+--- /dev/null
++++ b/drivers/media/i2c/ov9726.c
+@@ -0,0 +1,696 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * A V4L2 driver for OmniVision OV9726 cameras.
++ *
++ * The register settings come from the Qualcomm/Code Aurora Android MSM camera
++ * driver for this sensor (drivers/media/platform/msm/camera_v1/ov9726_reg.c,
++ * Copyright (c) 2011, The Linux Foundation, GPL v2). There is no public
++ * datasheet; values not present in that driver are marked below.
++ *
++ * Structure follows drivers/media/i2c/imx219.c.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++
++#include <media/v4l2-cci.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-mediabus.h>
++
++#define OV9726_REG_CHIP_ID		CCI_REG16(0x0000)
++#define OV9726_CHIP_ID			0x9726
++
++#define OV9726_REG_MODE_SELECT		CCI_REG8(0x0100)
++#define OV9726_MODE_STANDBY		0x00
++#define OV9726_MODE_STREAMING		0x01
++
++#define OV9726_REG_SOFTWARE_RESET	CCI_REG8(0x0103)
++
++#define OV9726_REG_EXPOSURE		CCI_REG16(0x0202)
++#define OV9726_EXPOSURE_MIN		1
++#define OV9726_EXPOSURE_STEP		1
++#define OV9726_EXPOSURE_DEFAULT		0x343
++/* The vendor driver keeps exposure at least 6 lines below the frame length. */
++#define OV9726_EXPOSURE_OFFSET		6
++
++#define OV9726_REG_ANALOG_GAIN		CCI_REG16(0x0204)
++/* The upper limit is the vendor driver's clamp; the lower bound and default are guesses. */
++#define OV9726_GAIN_MIN			0x10
++#define OV9726_GAIN_MAX			0xff
++#define OV9726_GAIN_STEP		1
++#define OV9726_GAIN_DEFAULT		0x20
++
++#define OV9726_XCLK_FREQ		24000000
++
++#define OV9726_WIDTH			1296
++#define OV9726_HEIGHT			808
++/* Frame and line length programmed by the register table (0x0340/1, 0x0342/3). */
++#define OV9726_FRAME_LENGTH		0x3c1
++#define OV9726_LINE_LENGTH		0x680
++/*
++ * Derived, not from a datasheet: the vendor driver assumes 30 fps for the
++ * table's timing, so pixel rate = 1664 * 961 * 30 ~ 48 MHz. With 10 bits per
++ * pixel on one lane the bit rate is 480 Mbit/s, so the link (DDR) clock is
++ * 240 MHz.
++ */
++#define OV9726_PIXEL_RATE		48000000
++#define OV9726_LINK_FREQ		240000000
++
++/* The Bayer order is not stated in the vendor driver and is unverified. */
++#define OV9726_MBUS_CODE		MEDIA_BUS_FMT_SBGGR10_1X10
++
++/*
++ * Mode registers from the vendor driver's ov9726_init_settings_array, in
++ * their original order except that: the software reset (0x0103) and stream on
++ * (0x0100) entries are issued by the driver, the repeated frame/line length
++ * and integration time block (identical values) is written once, and the
++ * five AEC thresholds that follow stream on in the original are written
++ * before it.
++ */
++static const struct cci_reg_sequence ov9726_mode_regs[] = {
++	{ CCI_REG8(0x3026), 0x00 },	/* OUTPUT_SELECT01 */
++	{ CCI_REG8(0x3027), 0x00 },	/* OUTPUT_SELECT02 */
++	{ CCI_REG8(0x3002), 0xe8 },	/* IO_CTRL00 */
++	{ CCI_REG8(0x3004), 0x03 },	/* IO_CTRL01 */
++	{ CCI_REG8(0x3005), 0xff },	/* IO_CTRL02 */
++	{ CCI_REG8(0x3703), 0x42 },
++	{ CCI_REG8(0x3704), 0x10 },
++	{ CCI_REG8(0x3705), 0x45 },
++	{ CCI_REG8(0x3603), 0xaa },
++	{ CCI_REG8(0x3632), 0x2f },
++	{ CCI_REG8(0x3620), 0x66 },
++	{ CCI_REG8(0x3621), 0xc0 },
++	{ CCI_REG8(0x0340), 0x03 },	/* FRAME_LENGTH_LINES_HI */
++	{ CCI_REG8(0x0341), 0xc1 },	/* FRAME_LENGTH_LINES_LO */
++	{ CCI_REG8(0x0342), 0x06 },	/* LINE_LENGTH_PCK_HI */
++	{ CCI_REG8(0x0343), 0x80 },	/* LINE_LENGTH_PCK_LO */
++	{ CCI_REG8(0x0202), 0x03 },	/* COARSE_INTEGRATION_TIME_HI */
++	{ CCI_REG8(0x0203), 0x43 },	/* COARSE_INTEGRATION_TIME_LO */
++	{ CCI_REG8(0x3833), 0x04 },
++	{ CCI_REG8(0x3835), 0x02 },
++	{ CCI_REG8(0x4702), 0x04 },
++	{ CCI_REG8(0x4704), 0x00 },	/* DVP_CTRL01 */
++	{ CCI_REG8(0x4706), 0x08 },
++	{ CCI_REG8(0x5052), 0x01 },
++	{ CCI_REG8(0x3819), 0x6e },
++	{ CCI_REG8(0x3817), 0x94 },
++	{ CCI_REG8(0x3a18), 0x00 },	/* AEC_GAIN_CEILING_HI */
++	{ CCI_REG8(0x3a19), 0x7f },	/* AEC_GAIN_CEILING_LO */
++	{ CCI_REG8(0x404e), 0x7e },
++	{ CCI_REG8(0x3631), 0x52 },
++	{ CCI_REG8(0x3633), 0x50 },
++	{ CCI_REG8(0x3630), 0xd2 },
++	{ CCI_REG8(0x3604), 0x08 },
++	{ CCI_REG8(0x3601), 0x40 },
++	{ CCI_REG8(0x3602), 0x14 },
++	{ CCI_REG8(0x3610), 0xa0 },
++	{ CCI_REG8(0x3612), 0x20 },
++	{ CCI_REG8(0x034c), 0x05 },	/* X_OUTPUT_SIZE_HI */
++	{ CCI_REG8(0x034d), 0x10 },	/* X_OUTPUT_SIZE_LO */
++	{ CCI_REG8(0x034e), 0x03 },	/* Y_OUTPUT_SIZE_HI */
++	{ CCI_REG8(0x034f), 0x28 },	/* Y_OUTPUT_SIZE_LO */
++	{ CCI_REG8(0x0303), 0x01 },	/* VT_SYS_CLK_DIV_LO */
++	{ CCI_REG8(0x3002), 0x00 },	/* IO_CTRL00 */
++	{ CCI_REG8(0x3004), 0x00 },	/* IO_CTRL01 */
++	{ CCI_REG8(0x3005), 0x00 },	/* IO_CTRL02 */
++	{ CCI_REG8(0x4801), 0x0f },	/* MIPI_CTRL01 */
++	{ CCI_REG8(0x4803), 0x05 },	/* MIPI_CTRL03 */
++	{ CCI_REG8(0x4601), 0x16 },	/* VFIFO_READ_CONTROL */
++	{ CCI_REG8(0x3014), 0x05 },	/* SC_CMMN_MIPI / SC_CTRL00 */
++	{ CCI_REG8(0x3104), 0x80 },
++	{ CCI_REG8(0x0305), 0x04 },	/* PRE_PLL_CLK_DIV_LO */
++	{ CCI_REG8(0x0307), 0x64 },	/* PLL_MULTIPLIER_LO */
++	{ CCI_REG8(0x300c), 0x02 },
++	{ CCI_REG8(0x300d), 0x20 },
++	{ CCI_REG8(0x300e), 0x01 },
++	{ CCI_REG8(0x3010), 0x01 },
++	{ CCI_REG8(0x460e), 0x81 },	/* VFIFO_CONTROL00 */
++	{ CCI_REG8(0x0101), 0x01 },	/* IMAGE_ORIENTATION */
++	{ CCI_REG8(0x3707), 0x14 },
++	{ CCI_REG8(0x3622), 0x9f },
++	{ CCI_REG8(0x5047), 0x3d },	/* ISP_CTRL47 */
++	{ CCI_REG8(0x4002), 0x45 },	/* BLC_CTRL02 */
++	{ CCI_REG8(0x5000), 0x06 },	/* ISP_CTRL0 */
++	{ CCI_REG8(0x5001), 0x00 },	/* ISP_CTRL1 */
++	{ CCI_REG8(0x3406), 0x00 },	/* AWB_MANUAL_CTRL */
++	{ CCI_REG8(0x3503), 0x13 },	/* AEC_ENABLE */
++	{ CCI_REG8(0x4005), 0x18 },	/* BLC_CTRL05 */
++	{ CCI_REG8(0x4837), 0x21 },
++	{ CCI_REG8(0x3a0f), 0x64 },	/* AEC_CTRL0F */
++	{ CCI_REG8(0x3a10), 0x54 },	/* AEC_CTRL10 */
++	{ CCI_REG8(0x3a11), 0xc2 },	/* AEC_CTRL11 */
++	{ CCI_REG8(0x3a1b), 0x64 },	/* AEC_CTRL1B */
++	{ CCI_REG8(0x3a1e), 0x54 },	/* AEC_CTRL1E */
++	{ CCI_REG8(0x3a1a), 0x05 },	/* AEC_DIFF_MAX */
++};
++
++static const char * const ov9726_supply_name[] = {
++	"avdd",		/* analog, 2.8 V */
++	"dovdd",	/* digital I/O, 1.8 V */
++};
++
++#define OV9726_NUM_SUPPLIES ARRAY_SIZE(ov9726_supply_name)
++
++static const s64 ov9726_link_freq_menu[] = {
++	OV9726_LINK_FREQ,
++};
++
++struct ov9726 {
++	struct v4l2_subdev sd;
++	struct media_pad pad;
++
++	struct regmap *regmap;
++	struct clk *xclk;
++
++	struct gpio_desc *reset_gpio;
++	struct regulator_bulk_data supplies[OV9726_NUM_SUPPLIES];
++
++	struct v4l2_ctrl_handler ctrl_handler;
++	struct v4l2_ctrl *exposure;
++};
++
++static inline struct ov9726 *to_ov9726(struct v4l2_subdev *_sd)
++{
++	return container_of(_sd, struct ov9726, sd);
++}
++
++static int ov9726_set_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct ov9726 *ov9726 = container_of(ctrl->handler, struct ov9726,
++					     ctrl_handler);
++	struct i2c_client *client = v4l2_get_subdevdata(&ov9726->sd);
++	int ret = 0;
++
++	/* Controls are applied when streaming starts, if the sensor is off. */
++	if (pm_runtime_get_if_in_use(&client->dev) <= 0)
++		return 0;
++
++	switch (ctrl->id) {
++	case V4L2_CID_EXPOSURE:
++		cci_write(ov9726->regmap, OV9726_REG_EXPOSURE, ctrl->val, &ret);
++		break;
++	case V4L2_CID_ANALOGUE_GAIN:
++		cci_write(ov9726->regmap, OV9726_REG_ANALOG_GAIN, ctrl->val,
++			  &ret);
++		break;
++	case V4L2_CID_PIXEL_RATE:
++	case V4L2_CID_LINK_FREQ:
++	case V4L2_CID_HBLANK:
++	case V4L2_CID_VBLANK:
++		/* Read-only; fixed by the mode registers. */
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	pm_runtime_put(&client->dev);
++
++	return ret;
++}
++
++static const struct v4l2_ctrl_ops ov9726_ctrl_ops = {
++	.s_ctrl = ov9726_set_ctrl,
++};
++
++static int ov9726_init_controls(struct ov9726 *ov9726)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&ov9726->sd);
++	struct v4l2_ctrl_handler *ctrl_hdlr = &ov9726->ctrl_handler;
++	struct v4l2_fwnode_device_properties props;
++	struct v4l2_ctrl *ctrl;
++	int ret;
++
++	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 8);
++	if (ret)
++		return ret;
++
++	ctrl = v4l2_ctrl_new_std(ctrl_hdlr, &ov9726_ctrl_ops,
++				 V4L2_CID_PIXEL_RATE, OV9726_PIXEL_RATE,
++				 OV9726_PIXEL_RATE, 1, OV9726_PIXEL_RATE);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	ctrl = v4l2_ctrl_new_int_menu(ctrl_hdlr, &ov9726_ctrl_ops,
++				      V4L2_CID_LINK_FREQ,
++				      ARRAY_SIZE(ov9726_link_freq_menu) - 1, 0,
++				      ov9726_link_freq_menu);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	ctrl = v4l2_ctrl_new_std(ctrl_hdlr, &ov9726_ctrl_ops, V4L2_CID_HBLANK,
++				 OV9726_LINE_LENGTH - OV9726_WIDTH,
++				 OV9726_LINE_LENGTH - OV9726_WIDTH, 1,
++				 OV9726_LINE_LENGTH - OV9726_WIDTH);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	ctrl = v4l2_ctrl_new_std(ctrl_hdlr, &ov9726_ctrl_ops, V4L2_CID_VBLANK,
++				 OV9726_FRAME_LENGTH - OV9726_HEIGHT,
++				 OV9726_FRAME_LENGTH - OV9726_HEIGHT, 1,
++				 OV9726_FRAME_LENGTH - OV9726_HEIGHT);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	ov9726->exposure = v4l2_ctrl_new_std(ctrl_hdlr, &ov9726_ctrl_ops,
++					     V4L2_CID_EXPOSURE,
++					     OV9726_EXPOSURE_MIN,
++					     OV9726_FRAME_LENGTH -
++					     OV9726_EXPOSURE_OFFSET,
++					     OV9726_EXPOSURE_STEP,
++					     OV9726_EXPOSURE_DEFAULT);
++
++	v4l2_ctrl_new_std(ctrl_hdlr, &ov9726_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
++			  OV9726_GAIN_MIN, OV9726_GAIN_MAX, OV9726_GAIN_STEP,
++			  OV9726_GAIN_DEFAULT);
++
++	if (ctrl_hdlr->error) {
++		ret = ctrl_hdlr->error;
++		dev_err_probe(&client->dev, ret, "Control init failed\n");
++		goto error;
++	}
++
++	ret = v4l2_fwnode_device_parse(&client->dev, &props);
++	if (ret)
++		goto error;
++
++	ret = v4l2_ctrl_new_fwnode_properties(ctrl_hdlr, &ov9726_ctrl_ops,
++					      &props);
++	if (ret)
++		goto error;
++
++	ov9726->sd.ctrl_handler = ctrl_hdlr;
++
++	return 0;
++
++error:
++	v4l2_ctrl_handler_free(ctrl_hdlr);
++
++	return ret;
++}
++
++static int ov9726_enable_streams(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *state, u32 pad,
++				 u64 streams_mask)
++{
++	struct ov9726 *ov9726 = to_ov9726(sd);
++	struct i2c_client *client = v4l2_get_subdevdata(sd);
++	int ret;
++
++	ret = pm_runtime_resume_and_get(&client->dev);
++	if (ret < 0)
++		return ret;
++
++	ret = cci_write(ov9726->regmap, OV9726_REG_SOFTWARE_RESET, 1, NULL);
++	if (ret)
++		goto err_rpm_put;
++
++	usleep_range(5000, 6000);
++
++	ret = cci_multi_reg_write(ov9726->regmap, ov9726_mode_regs,
++				  ARRAY_SIZE(ov9726_mode_regs), NULL);
++	if (ret) {
++		dev_err(&client->dev, "failed to write mode registers\n");
++		goto err_rpm_put;
++	}
++
++	/* Apply the exposure and gain chosen by the user. */
++	ret = __v4l2_ctrl_handler_setup(ov9726->sd.ctrl_handler);
++	if (ret)
++		goto err_rpm_put;
++
++	ret = cci_write(ov9726->regmap, OV9726_REG_MODE_SELECT,
++			OV9726_MODE_STREAMING, NULL);
++	if (ret)
++		goto err_rpm_put;
++
++	return 0;
++
++err_rpm_put:
++	pm_runtime_put(&client->dev);
++	return ret;
++}
++
++static int ov9726_disable_streams(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *state, u32 pad,
++				  u64 streams_mask)
++{
++	struct ov9726 *ov9726 = to_ov9726(sd);
++	struct i2c_client *client = v4l2_get_subdevdata(sd);
++	int ret;
++
++	ret = cci_write(ov9726->regmap, OV9726_REG_MODE_SELECT,
++			OV9726_MODE_STANDBY, NULL);
++	if (ret)
++		dev_err(&client->dev, "failed to stop streaming\n");
++
++	pm_runtime_put(&client->dev);
++
++	return ret;
++}
++
++static void ov9726_update_pad_format(struct v4l2_mbus_framefmt *fmt)
++{
++	fmt->code = OV9726_MBUS_CODE;
++	fmt->width = OV9726_WIDTH;
++	fmt->height = OV9726_HEIGHT;
++	fmt->field = V4L2_FIELD_NONE;
++	fmt->colorspace = V4L2_COLORSPACE_RAW;
++	fmt->ycbcr_enc = V4L2_YCBCR_ENC_601;
++	fmt->quantization = V4L2_QUANTIZATION_FULL_RANGE;
++	fmt->xfer_func = V4L2_XFER_FUNC_NONE;
++}
++
++static int ov9726_enum_mbus_code(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *state,
++				 struct v4l2_subdev_mbus_code_enum *code)
++{
++	if (code->index > 0)
++		return -EINVAL;
++
++	code->code = OV9726_MBUS_CODE;
++
++	return 0;
++}
++
++static int ov9726_enum_frame_size(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *state,
++				  struct v4l2_subdev_frame_size_enum *fse)
++{
++	if (fse->index > 0 || fse->code != OV9726_MBUS_CODE)
++		return -EINVAL;
++
++	fse->min_width = OV9726_WIDTH;
++	fse->max_width = OV9726_WIDTH;
++	fse->min_height = OV9726_HEIGHT;
++	fse->max_height = OV9726_HEIGHT;
++
++	return 0;
++}
++
++/* There is a single mode, so any requested format is replaced by it. */
++static int ov9726_set_pad_format(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *state,
++				 struct v4l2_subdev_format *fmt)
++{
++	ov9726_update_pad_format(&fmt->format);
++	*v4l2_subdev_state_get_format(state, fmt->pad) = fmt->format;
++
++	return 0;
++}
++
++static int ov9726_get_selection(struct v4l2_subdev *sd,
++				struct v4l2_subdev_state *state,
++				struct v4l2_subdev_selection *sel)
++{
++	switch (sel->target) {
++	case V4L2_SEL_TGT_CROP:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++		sel->r.top = 0;
++		sel->r.left = 0;
++		sel->r.width = OV9726_WIDTH;
++		sel->r.height = OV9726_HEIGHT;
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++static int ov9726_init_state(struct v4l2_subdev *sd,
++			     struct v4l2_subdev_state *state)
++{
++	ov9726_update_pad_format(v4l2_subdev_state_get_format(state, 0));
++
++	return 0;
++}
++
++static const struct v4l2_subdev_video_ops ov9726_video_ops = {
++	.s_stream = v4l2_subdev_s_stream_helper,
++};
++
++static const struct v4l2_subdev_pad_ops ov9726_pad_ops = {
++	.enum_mbus_code = ov9726_enum_mbus_code,
++	.get_fmt = v4l2_subdev_get_fmt,
++	.set_fmt = ov9726_set_pad_format,
++	.get_selection = ov9726_get_selection,
++	.enum_frame_size = ov9726_enum_frame_size,
++	.enable_streams = ov9726_enable_streams,
++	.disable_streams = ov9726_disable_streams,
++};
++
++static const struct v4l2_subdev_ops ov9726_subdev_ops = {
++	.video = &ov9726_video_ops,
++	.pad = &ov9726_pad_ops,
++};
++
++static const struct v4l2_subdev_internal_ops ov9726_internal_ops = {
++	.init_state = ov9726_init_state,
++};
++
++static int ov9726_power_on(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct ov9726 *ov9726 = to_ov9726(sd);
++	int ret;
++
++	ret = regulator_bulk_enable(OV9726_NUM_SUPPLIES, ov9726->supplies);
++	if (ret) {
++		dev_err(dev, "failed to enable regulators\n");
++		return ret;
++	}
++
++	ret = clk_prepare_enable(ov9726->xclk);
++	if (ret) {
++		dev_err(dev, "failed to enable clock\n");
++		goto reg_off;
++	}
++
++	/* The vendor driver drives reset low, then high, then waits. */
++	gpiod_set_value_cansleep(ov9726->reset_gpio, 1);
++	usleep_range(1000, 2000);
++	gpiod_set_value_cansleep(ov9726->reset_gpio, 0);
++	msleep(20);
++
++	return 0;
++
++reg_off:
++	regulator_bulk_disable(OV9726_NUM_SUPPLIES, ov9726->supplies);
++
++	return ret;
++}
++
++static int ov9726_power_off(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct ov9726 *ov9726 = to_ov9726(sd);
++
++	gpiod_set_value_cansleep(ov9726->reset_gpio, 1);
++	clk_disable_unprepare(ov9726->xclk);
++	regulator_bulk_disable(OV9726_NUM_SUPPLIES, ov9726->supplies);
++
++	return 0;
++}
++
++static int ov9726_identify_module(struct ov9726 *ov9726)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&ov9726->sd);
++	u64 val;
++	int ret;
++
++	ret = cci_read(ov9726->regmap, OV9726_REG_CHIP_ID, &val, NULL);
++	if (ret)
++		return dev_err_probe(&client->dev, ret,
++				     "failed to read chip id\n");
++
++	if (val != OV9726_CHIP_ID)
++		return dev_err_probe(&client->dev, -EIO,
++				     "chip id mismatch: %x != %llx\n",
++				     OV9726_CHIP_ID, val);
++
++	return 0;
++}
++
++static int ov9726_check_hwcfg(struct device *dev)
++{
++	struct fwnode_handle *endpoint;
++	struct v4l2_fwnode_endpoint ep_cfg = {
++		.bus_type = V4L2_MBUS_CSI2_DPHY
++	};
++	int ret;
++
++	endpoint = fwnode_graph_get_next_endpoint(dev_fwnode(dev), NULL);
++	if (!endpoint)
++		return dev_err_probe(dev, -EINVAL, "endpoint node not found\n");
++
++	ret = v4l2_fwnode_endpoint_alloc_parse(endpoint, &ep_cfg);
++	fwnode_handle_put(endpoint);
++	if (ret)
++		return dev_err_probe(dev, ret, "could not parse endpoint\n");
++
++	if (ep_cfg.bus.mipi_csi2.num_data_lanes != 1)
++		ret = dev_err_probe(dev, -EINVAL,
++				    "only 1 MIPI CSI-2 data lane is supported\n");
++
++	v4l2_fwnode_endpoint_free(&ep_cfg);
++
++	return ret;
++}
++
++static int ov9726_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct ov9726 *ov9726;
++	unsigned int i;
++	int ret;
++
++	ov9726 = devm_kzalloc(dev, sizeof(*ov9726), GFP_KERNEL);
++	if (!ov9726)
++		return -ENOMEM;
++
++	v4l2_i2c_subdev_init(&ov9726->sd, client, &ov9726_subdev_ops);
++	ov9726->sd.internal_ops = &ov9726_internal_ops;
++
++	ret = ov9726_check_hwcfg(dev);
++	if (ret)
++		return ret;
++
++	ov9726->regmap = devm_cci_regmap_init_i2c(client, 16);
++	if (IS_ERR(ov9726->regmap))
++		return dev_err_probe(dev, PTR_ERR(ov9726->regmap),
++				     "failed to initialize CCI\n");
++
++	ov9726->xclk = devm_v4l2_sensor_clk_get(dev, NULL);
++	if (IS_ERR(ov9726->xclk))
++		return dev_err_probe(dev, PTR_ERR(ov9726->xclk),
++				     "failed to get xclk\n");
++
++	if (clk_get_rate(ov9726->xclk) != OV9726_XCLK_FREQ)
++		return dev_err_probe(dev, -EINVAL,
++				     "xclk frequency not supported: %lu Hz\n",
++				     clk_get_rate(ov9726->xclk));
++
++	for (i = 0; i < OV9726_NUM_SUPPLIES; i++)
++		ov9726->supplies[i].supply = ov9726_supply_name[i];
++
++	ret = devm_regulator_bulk_get(dev, OV9726_NUM_SUPPLIES,
++				      ov9726->supplies);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to get regulators\n");
++
++	/* Optional reset line (the pin is active low; use GPIO_ACTIVE_LOW). */
++	ov9726->reset_gpio = devm_gpiod_get_optional(dev, "reset",
++						     GPIOD_OUT_HIGH);
++	if (IS_ERR(ov9726->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(ov9726->reset_gpio),
++				     "failed to get reset gpio\n");
++
++	ret = ov9726_power_on(dev);
++	if (ret)
++		return ret;
++
++	ret = ov9726_identify_module(ov9726);
++	if (ret)
++		goto error_power_off;
++
++	ret = ov9726_init_controls(ov9726);
++	if (ret)
++		goto error_power_off;
++
++	ov9726->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	ov9726->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
++
++	ov9726->pad.flags = MEDIA_PAD_FL_SOURCE;
++	ret = media_entity_pads_init(&ov9726->sd.entity, 1, &ov9726->pad);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to init entity pads\n");
++		goto error_handler_free;
++	}
++
++	ov9726->sd.state_lock = ov9726->ctrl_handler.lock;
++	ret = v4l2_subdev_init_finalize(&ov9726->sd);
++	if (ret < 0) {
++		dev_err_probe(dev, ret, "subdev init error\n");
++		goto error_media_entity;
++	}
++
++	pm_runtime_set_active(dev);
++	pm_runtime_enable(dev);
++
++	ret = v4l2_async_register_subdev_sensor(&ov9726->sd);
++	if (ret < 0) {
++		dev_err_probe(dev, ret,
++			      "failed to register sensor sub-device\n");
++		goto error_subdev_cleanup;
++	}
++
++	pm_runtime_idle(dev);
++	pm_runtime_set_autosuspend_delay(dev, 1000);
++	pm_runtime_use_autosuspend(dev);
++
++	return 0;
++
++error_subdev_cleanup:
++	v4l2_subdev_cleanup(&ov9726->sd);
++	pm_runtime_disable(dev);
++	pm_runtime_set_suspended(dev);
++
++error_media_entity:
++	media_entity_cleanup(&ov9726->sd.entity);
++
++error_handler_free:
++	v4l2_ctrl_handler_free(ov9726->sd.ctrl_handler);
++
++error_power_off:
++	ov9726_power_off(dev);
++
++	return ret;
++}
++
++static void ov9726_remove(struct i2c_client *client)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++
++	v4l2_async_unregister_subdev(sd);
++	v4l2_subdev_cleanup(sd);
++	media_entity_cleanup(&sd->entity);
++	v4l2_ctrl_handler_free(sd->ctrl_handler);
++
++	pm_runtime_disable(&client->dev);
++	if (!pm_runtime_status_suspended(&client->dev)) {
++		ov9726_power_off(&client->dev);
++		pm_runtime_set_suspended(&client->dev);
++	}
++}
++
++static const struct of_device_id ov9726_dt_ids[] = {
++	{ .compatible = "ovti,ov9726" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, ov9726_dt_ids);
++
++static const struct dev_pm_ops ov9726_pm_ops = {
++	SET_RUNTIME_PM_OPS(ov9726_power_off, ov9726_power_on, NULL)
++};
++
++static struct i2c_driver ov9726_i2c_driver = {
++	.driver = {
++		.name = "ov9726",
++		.of_match_table = ov9726_dt_ids,
++		.pm = &ov9726_pm_ops,
++	},
++	.probe = ov9726_probe,
++	.remove = ov9726_remove,
++};
++
++module_i2c_driver(ov9726_i2c_driver);
++
++MODULE_DESCRIPTION("OmniVision OV9726 sensor driver");
++MODULE_LICENSE("GPL v2");
+-- 
+2.56.0
+

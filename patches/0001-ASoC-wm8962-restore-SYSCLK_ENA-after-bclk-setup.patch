@@ -1,0 +1,50 @@
+Subject: [PATCH] ASoC: wm8962: restore SYSCLK_ENA after bclk setup when mic detect is active
+
+wm8962_mic_detect() force-enables the "SYSCLK" DAPM pin while a jack is
+registered, so DAPM sees the SYSCLK supply as permanently powered and never
+rewrites its enable bit (WM8962_CLOCKING2 bit 5).
+
+On a cold stream start the bias level goes to SND_SOC_BIAS_PREPARE, where
+wm8962_configure_bclk() briefly enables SYSCLK to read DSPCLK_DIV and then
+clears SYSCLK_ENA again because the bias level is not yet ON. DAPM never
+turns it back on, so the DACs and the speaker and headphone amplifiers are
+all clocked off: the PCM runs normally but nothing is audible. A warm
+restart (bias already ON) skips the clear, which makes the problem look
+intermittent. A runtime resume also forces the bit off the same way.
+
+Re-enable SYSCLK at the end of the PREPARE step whenever mic detection (and
+therefore the forced SYSCLK pin) is active.
+
+Observed on Microsoft Surface RT (Tegra 30, WM8962 on i2c bus 4, address
+0x1a): R8 reads 0x09c7 (bit 5 clear) 0.4 s into a cold playback and stays
+0x09e7 once the bit is restored.
+
+---
+--- a/sound/soc/codecs/wm8962.c
++++ b/sound/soc/codecs/wm8962.c
+@@ -2585,6 +2585,7 @@
+ 				 enum snd_soc_bias_level level)
+ {
+ 	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
++	struct wm8962_priv *wm8962 = snd_soc_component_get_drvdata(component);
+ 
+ 	switch (level) {
+ 	case SND_SOC_BIAS_ON:
+@@ -2596,6 +2597,17 @@
+ 				    WM8962_VMID_SEL_MASK, 0x80);
+ 
+ 		wm8962_configure_bclk(component);
++
++		/*
++		 * With mic detection active, the "SYSCLK" DAPM pin is forced on,
++		 * so DAPM never sees a power-up transition for it and will not
++		 * rewrite SYSCLK_ENA. wm8962_configure_bclk() above (and a
++		 * runtime resume) leave the bit cleared in the hardware, which
++		 * silences every output. Put it back.
++		 */
++		if (wm8962->jack)
++			snd_soc_component_update_bits(component, WM8962_CLOCKING2,
++					WM8962_SYSCLK_ENA_MASK, WM8962_SYSCLK_ENA);
+ 		break;
+ 
+ 	case SND_SOC_BIAS_STANDBY:
