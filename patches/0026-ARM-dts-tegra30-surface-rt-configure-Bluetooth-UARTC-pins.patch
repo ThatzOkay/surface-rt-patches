@@ -1,0 +1,41 @@
+Subject: [PATCH] ARM: dts: tegra30: surface-rt: configure Bluetooth UARTC pins
+
+UARTC is enabled for the Surface RT's Marvell 88W8797 Bluetooth interface,
+but the board pinmux does not configure its four UART signals. Select the
+uartc function for RXD, TXD, CTS and RTS, enable the inputs on RXD and CTS,
+and disable tristate so the outputs can drive the pads.
+
+The stock ACPI BTH0 device describes a connection to UARTC at 115200 baud
+with hardware flow control, consistent with using all four signals.
+
+This supplies the UART pinmux configuration only. Bluetooth still times
+out on HCI Reset with H4; GPIO initialization and firmware requirements
+remain under investigation.
+
+---
+--- a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
++++ b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
+@@ -108,6 +108,23 @@
+ 				nvidia,enable-input = <TEGRA_PIN_ENABLE>;
+ 			};
+ 
++			/* Bluetooth UART-C */
++			uartc-rxd-cts {
++				nvidia,pins = "uart3_cts_n_pa1", "uart3_rxd_pw7";
++				nvidia,function = "uartc";
++				nvidia,pull = <TEGRA_PIN_PULL_NONE>;
++				nvidia,tristate = <TEGRA_PIN_DISABLE>;
++				nvidia,enable-input = <TEGRA_PIN_ENABLE>;
++			};
++
++			uartc-txd-rts {
++				nvidia,pins = "uart3_rts_n_pc0", "uart3_txd_pw6";
++				nvidia,function = "uartc";
++				nvidia,pull = <TEGRA_PIN_PULL_NONE>;
++				nvidia,tristate = <TEGRA_PIN_DISABLE>;
++				nvidia,enable-input = <TEGRA_PIN_DISABLE>;
++			};
++
+ 			sdmmc1-wp {
+ 				nvidia,pins = "vi_d11_pt3";
+ 				nvidia,pull = <TEGRA_PIN_PULL_NONE>;

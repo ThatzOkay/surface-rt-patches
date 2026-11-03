@@ -1,0 +1,32 @@
+Subject: [PATCH] tools: reject non-X11 displays and empty EGL config results
+
+This helper creates an X window. Never reinterpret a Wayland GDK display
+as an X Display, and never use an uninitialized EGLConfig after zero matches.
+
+--- a/tools/gnome-session-check-accelerated-gles-helper.c
++++ b/tools/gnome-session-check-accelerated-gles-helper.c
+@@ -85,9 +85,10 @@
+ 
+         egl_inited = TRUE;
+ 
+-        EGLint num_configs;
+-        EGLConfig config;
+-        if (!eglChooseConfig (egl_dpy, attribs, &config, 1, &num_configs)) {
++        EGLint num_configs = 0;
++        EGLConfig config = NULL;
++        if (!eglChooseConfig (egl_dpy, attribs, &config, 1, &num_configs) ||
++            num_configs == 0) {
+                 g_warning ("Failed to get EGL configuration");
+                 goto out;
+         }
+@@ -184,6 +185,10 @@
+         }
+ 
+ #ifdef GDK_WINDOWING_X11
++        if (!GDK_IS_X11_DISPLAY (gdk_display_get_default ())) {
++                g_warning ("The GLES helper requires an X11 display; use the GTK probe on Wayland");
++                goto out;
++        }
+         renderer = get_gles_renderer ();
+ #endif
+ 

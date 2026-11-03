@@ -1,0 +1,34 @@
+Subject: [PATCH 5/5] grate: invalidate the framebuffer/depth cache before draws
+
+The draw-state setup programs FDC_CONTROL without INVALIDATE, while clears
+write colour and depth through gr2d. Repeated depth-tested cube draws can
+therefore reuse stale cached depth after a clear. Waiting for job completion
+alone does not invalidate that cache.
+
+Set INVALIDATE alongside the existing FDC_CONTROL configuration, matching
+libgrate's 0xe01 initialization. This removes the observed horizontal streaks
+in deterministic rotating-cube captures and avoids the missing-frame event
+seen without forced submission waits in the earlier tests.
+
+Validated on Surface RT / Tegra30: clear, constant triangle, static cubes
+with no depth, GL_ALWAYS and GL_LESS; repeated rotating depth captures.
+Small isolated pixel differences from llvmpipe remain; this is not a claim
+of complete rasterization or depth correctness.
+
+Applies after 0004 on grate-26.2.3.
+
+diff --git a/src/gallium/drivers/grate/grate_draw.c b/src/gallium/drivers/grate/grate_draw.c
+--- a/src/gallium/drivers/grate/grate_draw.c
++++ b/src/gallium/drivers/grate/grate_draw.c
+@@ -266,7 +266,10 @@
+    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_DW_ST_ENABLE, 0));
+ 
+    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_FDC_CONTROL, 13));
+-   GRATE_PUSHBUF_WORD(ptr, 0x00000e00); // REG_TGR3D_FDC_CONTROL
++   /* Clears use gr2d, which does not invalidate gr3d's framebuffer/depth
++    * cache. Invalidate before drawing so depth tests see the cleared surface.
++    */
++   GRATE_PUSHBUF_WORD(ptr, 0x00000e00 | TGR3D_FDC_CONTROL_INVALIDATE);
+    GRATE_PUSHBUF_WORD(ptr, 0x00000000); // REG_TGR3D_FDC_STATUS
+    GRATE_PUSHBUF_WORD(ptr, 0x000001ff); // REG_TGR3D_FDC_MAX_QZ_LINES
+    GRATE_PUSHBUF_WORD(ptr, 0x000001ff); // REG_TGR3D_FDC_MAX_QV_LINES

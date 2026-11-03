@@ -1,0 +1,90 @@
+From 49d63ad22953be2a62c4c303cf4dcc211697f8fd Mon Sep 17 00:00:00 2001
+From: Kayori <noduhgamingxd@gmail.com>
+Date: Sat, 31 Oct 2026 01:54:55 +0100
+Subject: [PATCH 21/21] staging: media: tegra-video: bind the VI driver before
+ the host1x stub
+
+The grate host1x registers tegra-host1x-stub at init, a placeholder
+that binds the VI, MPE, EPP and ISP devices of Tegra20/30 because there
+used to be no driver for them. Its match table lists nvidia,tegra20-vi
+and nvidia,tegra30-vi, so it claims the VI device long before the
+tegra_video module is loaded, and tegra_vi_probe never runs. On the
+Surface RT that shows up as
+
+  tegra-host1x-stub 54080000.vi: Failed to create device link (0x180)
+  with supplier 2-0010 for .../vi@54080000/csi@800/channel@0
+
+and no camera video node. Drop the two VI entries from the stub's list
+and fix its comment. (Mainline's host1x has no stub any more.)
+
+The stub also called pm_runtime_enable() on the device and never
+disabled it. A VI device that was unbound from the stub and bound to
+tegra-vi by hand therefore had runtime PM enabled while
+tegra_vi_probe was still creating the children: the kernel resumes the
+parent before attaching a child, and vi_runtime_resume dereferenced the
+driver data, which tegra_vi_probe only set after
+devm_of_platform_populate(). Set vi->dev, vi->ops and the driver data
+first. With the stub gone this path is not reached on a normal boot,
+but using driver data before it is set is wrong in any case.
+
+Not compiled yet, only checked to apply on top of patch 0021.
+
+Signed-off-by: Kayori <noduhgamingxd@gmail.com>
+---
+ drivers/gpu/host1x-grate/host1x.c      | 7 +++----
+ drivers/staging/media/tegra-video/vi.c | 7 ++++---
+ 2 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/host1x-grate/host1x.c b/drivers/gpu/host1x-grate/host1x.c
+index 9289c1d..1e75c05 100644
+--- a/drivers/gpu/host1x-grate/host1x.c
++++ b/drivers/gpu/host1x-grate/host1x.c
+@@ -404,8 +404,9 @@ static struct platform_driver tegra_host1x_driver = {
+ };
+ 
+ /*
+- * We never had drivers for MPE, VI, EPP and ISP hardware units on Tegra20
+- * and Tegra30, but they are specified in the device-trees, and thus,
++ * We never had drivers for MPE, EPP and ISP hardware units on Tegra20
++ * and Tegra30 (VI has the tegra-video driver, which must not be shadowed
++ * by this stub), but they are specified in the device-trees, and thus,
+  * device entity is getting created for them by host1x bus a, but driver
+  * is never getting bound.  After adding support for generic power domains
+  * on Tegra20/30, we now have a situation where the state of PMC driver is
+@@ -420,8 +421,6 @@ static const struct of_device_id host1x_stub_of_matches[] = {
+ 	{ .compatible = "nvidia,tegra30-mpe", },
+ 	{ .compatible = "nvidia,tegra20-epp", },
+ 	{ .compatible = "nvidia,tegra30-epp", },
+-	{ .compatible = "nvidia,tegra20-vi", },
+-	{ .compatible = "nvidia,tegra30-vi", },
+ 	{ .compatible = "nvidia,tegra20-isp", },
+ 	{ .compatible = "nvidia,tegra30-isp", },
+ 	{ /* sentinel */ }
+diff --git a/drivers/staging/media/tegra-video/vi.c b/drivers/staging/media/tegra-video/vi.c
+index 7734205..1d9ccdf 100644
+--- a/drivers/staging/media/tegra-video/vi.c
++++ b/drivers/staging/media/tegra-video/vi.c
+@@ -1889,6 +1889,10 @@ static int tegra_vi_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
++	vi->dev = &pdev->dev;
++	vi->ops = vi->soc->ops;
++	platform_set_drvdata(pdev, vi);
++
+ 	ret = devm_of_platform_populate(&pdev->dev);
+ 	if (ret < 0) {
+ 		dev_err(&pdev->dev,
+@@ -1896,9 +1900,6 @@ static int tegra_vi_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
+-	vi->dev = &pdev->dev;
+-	vi->ops = vi->soc->ops;
+-	platform_set_drvdata(pdev, vi);
+ 	pm_runtime_enable(&pdev->dev);
+ 
+ 	/* initialize host1x interface */
+-- 
+2.56.0
+

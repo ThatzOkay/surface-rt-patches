@@ -1,0 +1,35 @@
+Subject: [PATCH 6/6] grate: complete draws before releasing their jobs
+
+Draw jobs are submitted immediately and released, without tracking their
+fences on resources. A later context flush sees an empty stream, and the
+resource transfer-map path maps memory without waiting for outstanding
+draws. CPU readback and gr2d clears can therefore race a gr3d draw.
+
+Wait in the draw submission path as a correctness-first fallback until
+resource fence tracking is implemented. The existing stream wait has its
+result checked and errors are logged. This serializes rendering and is
+not a performance optimization.
+
+Applies after 0005. Validate with original rotating cube shaders, depth
+on, and no GRATE_DRM_WAIT environment override. Isolated raster/depth
+pixel differences are a separate unresolved issue.
+
+diff --git a/src/gallium/drivers/grate/grate_draw.c b/src/gallium/drivers/grate/grate_draw.c
+--- a/src/gallium/drivers/grate/grate_draw.c
++++ b/src/gallium/drivers/grate/grate_draw.c
+@@ -408,7 +408,14 @@
+ 
+    grate_stream_end(stream, &ptr);
+ 
+-   grate_stream_flush(stream, false);
++   /* Draws are submitted immediately, but resource maps and context flushes
++    * do not track/wait their fences yet. Complete the draw before releasing
++    * its job so CPU readback and subsequent gr2d clears cannot race it.
++    * Replace this synchronous fallback with resource fence tracking later.
++    */
++   err = grate_stream_flush(stream, true);
++   if (err < 0)
++      grate_loge("grate_stream_flush() failed: %d\n", err);
+ }
+ 
+ void

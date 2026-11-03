@@ -1,0 +1,38 @@
+Subject: [PATCH 7/7] grate: assign alternating raster swaths on Tegra30
+
+The common initialization broadcasts zero to HORIZONTAL_SWATH_RENDERING
+on both pixel pipelines. Configure alternating horizontal swaths separately
+for GPU A (value 1, even) and GPU B (value 3, odd), then restore broadcast
+register writes. This matches libgrate's Tegra30 draw setup.
+
+With the cache invalidation and synchronous submission corrections applied,
+this removes the measured wrong-face-colour streaks inside solid faces in
+rotating depth-tested cube captures. No application culling, omitted faces,
+depth disablement or forced-submit-wait environment variable is needed.
+
+Applies after 0006 on grate-26.2.3. Limited to Tegra30; remaining silhouette
+pixel differences from software rendering are not claimed fixed.
+
+diff --git a/src/gallium/drivers/grate/grate_draw.c b/src/gallium/drivers/grate/grate_draw.c
+--- a/src/gallium/drivers/grate/grate_draw.c
++++ b/src/gallium/drivers/grate/grate_draw.c
+@@ -382,6 +382,19 @@
+       UNREACHABLE("invalid index_size");
+    }
+ 
++   /* Tegra30 has two pixel pipelines. Assign alternating horizontal swaths
++    * to GPU A (even) and GPU B (odd), as in libgrate's draw setup. Leaving
++    * both at the common reset value can corrupt depth-tested face interiors.
++    * Restore broadcast writes before emitting the remaining draw state.
++    */
++   if (context->drm->soc_id == DRM_TEGRA_SOC_T30) {
++      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_GSHIM_WRITE_MASK, 1));
++      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_GLOBAL_HORIZONTAL_SWATH_RENDERING, 1));
++      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_GSHIM_WRITE_MASK, 2));
++      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_GLOBAL_HORIZONTAL_SWATH_RENDERING, 3));
++      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_GSHIM_WRITE_MASK, 3));
++   }
++
+    /* draw params */
+    value  = TGR3D_IDX_SET_PRIM_DRAW_MODE(index_size);
+    value |= context->rast->draw_params;

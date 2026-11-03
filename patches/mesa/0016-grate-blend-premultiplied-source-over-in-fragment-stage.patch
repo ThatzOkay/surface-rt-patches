@@ -1,0 +1,210 @@
+From: Surface RT bring-up
+Subject: [PATCH 16] grate: blend premultiplied source-over in the fragment stage
+
+--- a/src/gallium/drivers/grate/grate_context.h
++++ b/src/gallium/drivers/grate/grate_context.h
+@@ -40,6 +40,8 @@
+    struct grate_vertexbuf_state vbs;
+    struct pipe_constant_buffer constant_buffer[PIPE_MAX_CONSTANT_BUFFERS]; // ??, stolen from other drivers but no idea
+ 
++   bool premultiplied_blend;
++
+    struct grate_zsa_state *zsa;
+    struct grate_rasterizer_state *rast;
+ 
+--- a/src/gallium/drivers/grate/grate_program.h
++++ b/src/gallium/drivers/grate/grate_program.h
+@@ -22,6 +22,7 @@
+ struct grate_fragment_shader_state {
+    struct pipe_shader_state base;
+    struct grate_shader_blob blob;
++   struct grate_shader_blob premultiplied_blob;
+    struct grate_fp_info info;
+ };
+ 
+--- a/src/gallium/drivers/grate/grate_program.c
++++ b/src/gallium/drivers/grate/grate_program.c
+@@ -163,6 +163,91 @@
+    FREE(so);
+ }
+ 
++/* Keep the application shader intact and append a source-over stage.
++ * Its packed source is R2/R3; PSEQ reads colour target 1 into R0/R1.
++ */
++static bool
++create_premultiplied_blob(const struct grate_shader_blob *source,
++                          unsigned fp_count, unsigned alu_count,
++                          struct grate_shader_blob *output)
++{
++   if (fp_count >= 63 || alu_count >= 64)
++      return false;
++   uint32_t blend_words[8];
++   for (unsigned c = 0; c < 4; c++) {
++      struct fp_alu_instr instruction = {
++         .op = FP_ALU_OP_MAD,
++         .dst = {.index = 2 + c / 2, .write_low_sub_reg = !(c & 1),
++                 .write_high_sub_reg = c & 1, .saturate = true},
++         .src = {
++            {.index = c / 2, .datatype = FP_DATATYPE_FIXED10,
++             .sub_reg_select_high = c & 1},
++            {.index = 3, .datatype = FP_DATATYPE_FIXED10,
++             .sub_reg_select_high = true, .minus_one = true, .negate = true},
++            {.index = 2 + c / 2, .datatype = FP_DATATYPE_FIXED10,
++             .sub_reg_select_high = c & 1},
++            {.index = 31, .datatype = FP_DATATYPE_FIXED10, .sub_reg_select_high = true},
++         },
++      };
++      grate_fp_pack_alu(blend_words + c * 2, &instruction);
++   }
++   struct util_dynarray result;
++   util_dynarray_init(&result, NULL);
++#define BLEND_PUSH(value) util_dynarray_append_typed(&result, uint32_t, (value))
++   unsigned seen = 0;
++   for (unsigned i = 0; i < (unsigned)source->num_commands;) {
++      uint32_t command = source->commands[i++];
++      unsigned opcode = command >> 28;
++      unsigned reg = (command >> 16) & 0xfff;
++      unsigned count = command & 0xffff;
++      if (opcode == 4) {
++         if (reg != REG_TGR3D_PSEQ_FLUSH) BLEND_PUSH(command);
++         continue;
++      }
++      if ((opcode != 1 && opcode != 2) || count > (unsigned)source->num_commands - i)
++         goto fail;
++      const uint32_t *values = source->commands + i;
++      i += count;
++      if (opcode == 1 && reg == REG_TGR3D_PSEQ_COMMAND_EVEN(0) && count == 1) {
++         BLEND_PUSH(command); BLEND_PUSH(0x20006000 | (fp_count + 1));
++         continue;
++      }
++      if (opcode == 1 && reg == REG_TGR3D_PSEQ_DWR_IF_STATE && count == 1) {
++         BLEND_PUSH(command); BLEND_PUSH(TGR3D_PSEQ_DWR_IF_STATE_COUNT(fp_count + 1));
++         continue;
++      }
++      unsigned extra = 0, last = 0, bit = 0;
++      if (opcode == 2) {
++         switch (reg) {
++         case REG_TGR3D_PSEQ_INST_DATA: extra = 1; last = 0x00810008; bit = 1; break;
++         case REG_TGR3D_AT_REMAP_DATA: extra = 1; bit = 2; break;
++         case REG_TGR3D_TEX_INST_DATA: extra = 1; bit = 4; break;
++         case REG_TGR3D_ALU_REMAP_DATA: extra = 1; last = (alu_count << 2) | 1; bit = 8; break;
++         case REG_TGR3D_ALU_INST_DATA: extra = 8; bit = 16; break;
++         case REG_TGR3D_ALU_P2CX_DATA: extra = 1; bit = 32; break;
++         case REG_TGR3D_DW_INST_DATA: extra = 1; last = 0x00028005; bit = 64; break;
++         }
++      }
++      if (bit) {
++         if ((seen & bit) || count != (bit == 16 ? alu_count * 8 : fp_count)) goto fail;
++         seen |= bit;
++      }
++      BLEND_PUSH((command & 0xffff0000) | (count + extra));
++      for (unsigned j = 0; j < count; j++) BLEND_PUSH(bit == 64 ? 0 : values[j]);
++      for (unsigned j = 0; j < extra; j++) BLEND_PUSH(bit == 16 ? blend_words[j] : last);
++      if (bit == 1) BLEND_PUSH(host1x_opcode_imm(REG_TGR3D_PSEQ_FLUSH, 0));
++   }
++   if (seen != 127) goto fail;
++   util_dynarray_trim(&result);
++   output->commands = result.data;
++   output->num_commands = result.size / sizeof(uint32_t);
++#undef BLEND_PUSH
++   return true;
++fail:
++   util_dynarray_fini(&result);
++   return false;
++}
++
+ static void
+ free_fragment_ir(struct grate_fp_shader *fp)
+ {
+@@ -332,6 +417,13 @@
+    so->blob.commands = buf.data;
+    so->info = fp.info;
+    free_fragment_ir(&fp);
++   if (!create_premultiplied_blob(&so->blob, num_fp_instrs, num_alu_instrs,
++                                 &so->premultiplied_blob)) {
++      grate_loge("failed to build premultiplied fragment variant\n");
++      FREE(so->blob.commands);
++      FREE(so);
++      return NULL;
++   }
+    return so;
+ }
+ 
+@@ -345,8 +437,11 @@
+ static void
+ grate_delete_fs_state(struct pipe_context *pcontext, void *so)
+ {
+-   grate_trace();
+-   FREE(so);
++   struct grate_fragment_shader_state *shader = so;
++   grate_trace();
++   FREE(shader->blob.commands);
++   FREE(shader->premultiplied_blob.commands);
++   FREE(shader);
+ }
+ 
+ void
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -249,7 +249,19 @@
+ static void
+ grate_bind_blend_state(struct pipe_context *pcontext, void *so)
+ {
+-   grate_unimplemented();
++   const struct pipe_blend_state *blend = so;
++   struct grate_context *ctx = grate_context(pcontext);
++   ctx->premultiplied_blend = blend && !blend->independent_blend_enable &&
++      !blend->logicop_enable && blend->rt[0].blend_enable &&
++      blend->rt[0].rgb_func == PIPE_BLEND_ADD &&
++      blend->rt[0].alpha_func == PIPE_BLEND_ADD &&
++      blend->rt[0].rgb_src_factor == PIPE_BLENDFACTOR_ONE &&
++      blend->rt[0].alpha_src_factor == PIPE_BLENDFACTOR_ONE &&
++      blend->rt[0].rgb_dst_factor == PIPE_BLENDFACTOR_INV_SRC_ALPHA &&
++      blend->rt[0].alpha_dst_factor == PIPE_BLENDFACTOR_INV_SRC_ALPHA &&
++      blend->rt[0].colormask == 0xf;
++   if (blend && blend->rt[0].blend_enable && !ctx->premultiplied_blend)
++      grate_loge("unsupported blend state (source-over with premultiplied RGBA required)\n");
+ }
+ 
+ static void
+@@ -731,7 +743,12 @@
+    uint32_t cull_face_linker_setup;
+ 
+    emit_shader(stream, ptrp, &context->vshader->blob);
+-   emit_shader(stream, ptrp, &context->fshader->blob);
++   if (context->premultiplied_blend) {
++      assert(context->framebuffer.base.nr_cbufs == 1);
++      emit_shader(stream, ptrp, &context->fshader->premultiplied_blob);
++   } else {
++      emit_shader(stream, ptrp, &context->fshader->blob);
++   }
+ 
+    cull_face_linker_setup = TGR3D_SU_PARAM_SUBPIX_XOFF(0x38) |
+                             TGR3D_SU_PARAM_SUBPIX_YOFF(0x38) |
+--- a/src/gallium/drivers/grate/fp/pack.c
++++ b/src/gallium/drivers/grate/fp/pack.c
+@@ -61,18 +61,24 @@
+ 
+       .rA_reg_select = instr->src[0].index,
+       .rA_negate = instr->src[0].negate,
++      .rA_minus_one = instr->src[0].minus_one,
++      .rA_scale_by_two = instr->src[0].scale_by_two,
+       .rA_absolute_value = instr->src[0].absolute_value,
+       .rA_fixed10 = instr->src[0].datatype != FP_DATATYPE_FP20,
+       .rA_sub_reg_select_high = instr->src[0].sub_reg_select_high,
+ 
+       .rB_reg_select = instr->src[1].index,
+       .rB_negate = instr->src[1].negate,
++      .rB_minus_one = instr->src[1].minus_one,
++      .rB_scale_by_two = instr->src[1].scale_by_two,
+       .rB_absolute_value = instr->src[1].absolute_value,
+       .rB_fixed10 = instr->src[1].datatype != FP_DATATYPE_FP20,
+       .rB_sub_reg_select_high = instr->src[1].sub_reg_select_high,
+ 
+       .rC_reg_select = instr->src[2].index,
+       .rC_negate = instr->src[2].negate,
++      .rC_minus_one = instr->src[2].minus_one,
++      .rC_scale_by_two = instr->src[2].scale_by_two,
+       .rC_absolute_value = instr->src[2].absolute_value,
+       .rC_fixed10 = instr->src[2].datatype != FP_DATATYPE_FP20,
+       .rC_sub_reg_select_high = instr->src[2].sub_reg_select_high,

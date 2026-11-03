@@ -1,0 +1,227 @@
+diff --git a/src/gallium/drivers/grate/fp/tgsi.c b/src/gallium/drivers/grate/fp/tgsi.c
+index fc20413..b017929 100644
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -122,6 +122,23 @@ emit_vMOV(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
+          mfu->var[i].tram_row = src->Index;
+          fp->info.max_tram_row = MAX2(fp->info.max_tram_row, src->Index);
+          src0 = fp_alu_src_row(comp);
++      } else if (src->File == TGSI_FILE_IMMEDIATE) {
++         /*
++          * The only constants this compiler can put into an ALU instruction are the hardware's zero and one. Any other
++          * value would need the hardware's constant mechanism, which is not understood here yet: say so and use zero
++          * instead of reading an undefined register.
++          */
++         float value = fp->immediates[src->Index][comp];
++         if (value == 1.0f)
++            src0 = fp_alu_src_one();
++         else {
++            if (value != 0.0f)
++               fprintf(stderr, "GRATE FRAG: immediate %f is not supported (only 0.0 and 1.0), using 0.0\n", value);
++            src0 = fp_alu_src_zero();
++         }
++      } else if (src->File == TGSI_FILE_CONSTANT) {
++         fprintf(stderr, "GRATE FRAG: constants (uniforms) are not supported in fragment shaders yet, using 0.0\n");
++         src0 = fp_alu_src_zero();
+       } else
+          src0 = fp_alu_src_reg(src->Index + comp);
+ 
+@@ -211,10 +228,22 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
+    fp->info.num_inputs = 0;
+    fp->info.color_input = -1;
+    fp->info.max_tram_row = 1;
++   fp->num_immediates = 0;
+ 
+    while (!tgsi_parse_end_of_tokens(tgsi)) {
+       tgsi_parse_token(tgsi);
+       switch (tgsi->FullToken.Token.Type) {
++      case TGSI_TOKEN_TYPE_IMMEDIATE: {
++         const struct tgsi_full_immediate *imm = &tgsi->FullToken.FullImmediate;
++         unsigned n = imm->Immediate.NrTokens - 1; /* number of 32-bit values: 1 to 4 */
++
++         assert(fp->num_immediates < GRATE_FP_MAX_IMMEDIATES);
++         for (unsigned i = 0; i < 4; ++i)
++            fp->immediates[fp->num_immediates][i] = i < n ? imm->u[i].Float : 0.0f;
++         fp->num_immediates++;
++         break;
++      }
++
+       case TGSI_TOKEN_TYPE_DECLARATION:
+          emit_tgsi_declaration(fp, &tgsi->FullToken.FullDeclaration);
+          break;
+@@ -231,6 +260,9 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
+     * This will overwrite instructions in some cases, need proper scheduler
+     * to fix properly
+     */
++    if (list_is_empty(&fp->mfu_instructions))
++       return; /* nothing is interpolated (for example a constant colour): no setup, and no first entry to write to */
++
+     struct fp_mfu_instr *first = list_first_entry(&fp->mfu_instructions, struct fp_mfu_instr, link);
+     first->sfu.op = FP_SFU_OP_RCP;
+     first->sfu.reg = 4;
+diff --git a/src/gallium/drivers/grate/grate_compiler.h b/src/gallium/drivers/grate/grate_compiler.h
+index 846b539..e9c7720 100644
+--- a/src/gallium/drivers/grate/grate_compiler.h
++++ b/src/gallium/drivers/grate/grate_compiler.h
+@@ -7,9 +7,21 @@
+ 
+ struct tgsi_parse_context;
+ 
++/*
++ * Constant RAM layout of a vertex program. Immediates (TGSI_FILE_IMMEDIATE) come first: immediate i is vec4 slot i. The
++ * application's uniforms (TGSI_FILE_CONSTANT) follow: uniform k is vec4 slot num_immediates + k. Both are uploaded as one
++ * block starting at slot 0 (see emit_vs_uniforms()). A write to REG_TGR3D_VPE_CONST_OFFSET with a non-zero index was
++ * found not to move the upload position (2026-10-31, on hardware: data written after it still landed in slot 0), so
++ * everything must start at offset 0, and the layout has to be known when the program is compiled; this is why the
++ * immediates are put first and the uniforms moved up, and not the other way round.
++ */
++#define GRATE_VP_MAX_IMMEDIATES 32
++
+ struct grate_vp_shader {
+    struct list_head instructions;
+    uint16_t output_mask;
++   uint32_t immediates[GRATE_VP_MAX_IMMEDIATES][4]; /* raw 32-bit words, slot i of the immediates */
++   unsigned num_immediates;
+ };
+ 
+ struct grate_fp_info {
+@@ -22,7 +34,11 @@ struct grate_fp_info {
+    int max_tram_row;
+ };
+ 
++#define GRATE_FP_MAX_IMMEDIATES 32
++
+ struct grate_fp_shader {
++   float immediates[GRATE_FP_MAX_IMMEDIATES][4];
++   unsigned num_immediates;
+    struct list_head fp_instructions;
+    struct list_head alu_instructions;
+    struct list_head mfu_instructions;
+diff --git a/src/gallium/drivers/grate/grate_program.c b/src/gallium/drivers/grate/grate_program.c
+index 3ecf5f9..16bb842 100644
+--- a/src/gallium/drivers/grate/grate_program.c
++++ b/src/gallium/drivers/grate/grate_program.c
+@@ -143,6 +143,8 @@ grate_create_vs_state(struct pipe_context *pcontext,
+    so->blob.commands = commands;
+    so->blob.num_commands = num_commands;
+    so->output_mask = vp.output_mask;
++   memcpy(so->immediates, vp.immediates, sizeof(so->immediates));
++   so->num_immediates = vp.num_immediates;
+ 
+    return so;
+ }
+diff --git a/src/gallium/drivers/grate/grate_program.h b/src/gallium/drivers/grate/grate_program.h
+index 716443f..5f4b605 100644
+--- a/src/gallium/drivers/grate/grate_program.h
++++ b/src/gallium/drivers/grate/grate_program.h
+@@ -15,6 +15,8 @@ struct grate_vertex_shader_state {
+    struct pipe_shader_state base;
+    struct grate_shader_blob blob;
+    uint16_t output_mask;
++   uint32_t immediates[GRATE_VP_MAX_IMMEDIATES][4]; /* uploaded with the uniforms, see emit_vs_uniforms() */
++   unsigned num_immediates;
+ };
+ 
+ struct grate_fragment_shader_state {
+diff --git a/src/gallium/drivers/grate/grate_state.c b/src/gallium/drivers/grate/grate_state.c
+index 82b43ad..efd1d47 100644
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -1,5 +1,7 @@
+ #include <assert.h>
+ #include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ #include <math.h>
+ 
+ #include "util/format/u_format.h"
+@@ -9,6 +11,7 @@
+ #include "util/u_memory.h"
+ #include "util/u_framebuffer.h"
+ 
++#include "grate_compiler.h"
+ #include "grate_common.h"
+ #include "grate_context.h"
+ #include "grate_program.h"
+@@ -635,18 +638,27 @@ emit_vs_uniforms(struct grate_context *context, uint32_t **ptrp)
+ {
+    struct grate_stream *stream = &context->gr3d->stream;
+    struct pipe_constant_buffer *constbuf = &context->constant_buffer[MESA_SHADER_VERTEX];
+-   int len;
++   unsigned num_imm = context->vshader ? context->vshader->num_immediates : 0;
++   unsigned user_words = 0;
+ 
+    if (constbuf->user_buffer != NULL) {
+       assert(constbuf->buffer_size % sizeof(uint32_t) == 0);
++      user_words = constbuf->buffer_size / 4;
++   }
++
++   /* one block from slot 0: the shader's immediates, then the application's uniforms; see grate_compiler.h */
++   unsigned len = num_imm * 4 + user_words;
++   if (len == 0)
++      return;
+ 
+-      len = constbuf->buffer_size / 4;
+-      assert(len < 256 * 4);
++   assert(len <= 256 * 4);
+ 
+-      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_imm(REG_TGR3D_VPE_CONST_OFFSET, 0));
+-      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_nonincr(REG_TGR3D_VPE_CONST_DATA, len));
+-      grate_stream_push_words(stream, ptrp, constbuf->user_buffer, len, 0);
+-   }
++   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_imm(REG_TGR3D_VPE_CONST_OFFSET, 0));
++   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_nonincr(REG_TGR3D_VPE_CONST_DATA, len));
++   if (num_imm)
++      grate_stream_push_words(stream, ptrp, context->vshader->immediates[0], num_imm * 4, 0);
++   if (user_words)
++      grate_stream_push_words(stream, ptrp, constbuf->user_buffer, user_words, 0);
+ }
+ 
+ static void
+diff --git a/src/gallium/drivers/grate/vp/tgsi.c b/src/gallium/drivers/grate/vp/tgsi.c
+index 94e330b..ba93400 100644
+--- a/src/gallium/drivers/grate/vp/tgsi.c
++++ b/src/gallium/drivers/grate/vp/tgsi.c
+@@ -242,14 +242,16 @@ tgsi_src_to_vp(struct grate_vp_shader *vp, const struct tgsi_src_register *src)
+       return attrib(src->Index, swizzle, negate, absolute);
+ 
+    case TGSI_FILE_CONSTANT:
+-      return uniform(src->Index, swizzle, negate, absolute);
++      /* the application's uniforms follow the immediates, see grate_compiler.h */
++      return uniform(vp->num_immediates + src->Index, swizzle, negate, absolute);
+ 
+    case TGSI_FILE_TEMPORARY:
+       return src_temp(src->Index, swizzle, negate, absolute);
+ 
+    case TGSI_FILE_IMMEDIATE:
+-      /* HACK: allocate uniforms from the top for immediates; need to actually record these */
+-      return uniform(1023 - src->Index, swizzle, negate, absolute);
++      /* the values are recorded in grate_tgsi_to_vp() and uploaded to the first slots, see grate_compiler.h */
++      assert(src->Index >= 0 && (unsigned)src->Index < vp->num_immediates);
++      return uniform(src->Index, swizzle, negate, absolute);
+ 
+    default:
+       UNREACHABLE("unsupported input!");
+@@ -331,10 +333,22 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi)
+ {
+    list_inithead(&vp->instructions);
+    vp->output_mask = 0;
++   vp->num_immediates = 0;
+ 
+    while (!tgsi_parse_end_of_tokens(tgsi)) {
+       tgsi_parse_token(tgsi);
+       switch (tgsi->FullToken.Token.Type) {
++      case TGSI_TOKEN_TYPE_IMMEDIATE: {
++         const struct tgsi_full_immediate *imm = &tgsi->FullToken.FullImmediate;
++         unsigned n = imm->Immediate.NrTokens - 1; /* number of 32-bit values: 1 to 4 */
++
++         assert(vp->num_immediates < GRATE_VP_MAX_IMMEDIATES);
++         for (unsigned i = 0; i < 4; ++i)
++            vp->immediates[vp->num_immediates][i] = i < n ? imm->u[i].Uint : 0;
++         vp->num_immediates++;
++         break;
++      }
++
+       case TGSI_TOKEN_TYPE_INSTRUCTION:
+          if (tgsi->FullToken.FullInstruction.Instruction.Opcode != TGSI_OPCODE_END) {
+             struct vp_instr *instr = tgsi_to_vp(vp, &tgsi->FullToken.FullInstruction);

@@ -1,0 +1,62 @@
+Subject: [PATCH] ARM: dts: tegra30: surface-rt: set up the digital microphone (WM8962 GPIOs and routing)
+
+The Surface RT has a digital (PDM) stereo microphone behind the WM8962, wired
+to two of the codec's GPIO pins as clock and data. Two things in the
+devicetree kept it from ever working:
+
+1. wm8962_probe() reads the codec's GPIO function registers and, unless one is
+   set to DMICCLK and one to DMICDAT, disables the "DMICDAT" DAPM pin for good.
+   Nothing configured them. Add the gpio-cfg property. Which pins carry the
+   signals is not documented anywhere found, so this uses GPIO2 as DMICCLK and
+   GPIO4 as DMICDAT, the example in the binding and the Wolfson reference
+   design. On the device the registers then read 0x0013 and 0x8014.
+
+2. The sound card is fully_routed, and on a fully routed card the codec's input
+   pins are never a signal source: audio can only enter through a board-level
+   microphone widget that is routed to the pin. The card has a "Digital Mic"
+   widget (from tegra_asoc_machine.c) but nothing routed it to the codec, so no
+   capture path could ever be powered: the ADCs, the input mux and the pin all
+   stay off and recordings are all zeros in every input mode. Route "Digital
+   Mic" to DMICDAT.
+
+Whether GPIO2 and GPIO4 are the right pair is not known yet; the route alone is
+the part that was shown to be missing (DAPM dump on the device).
+
+---
+--- a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts	2026-10-31 20:54:27.048119210 +0100
++++ b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts	2026-11-01 02:57:35.745324612 +0100
+@@ -321,6 +321,24 @@
+ 			PLLVDD-supply = <&vdd_1v8_vio>;
+ 			SPKVDD1-supply = <&vdd_1v8_vio>;
+ 			SPKVDD2-supply = <&vdd_1v8_vio>;
++
++			/*
++			 * The on-board digital microphone is wired to two of the
++			 * codec's GPIO pins as clock and data. Which pins is not
++			 * known (no schematic): GPIO2 as DMICCLK and GPIO4 as
++			 * DMICDAT is the guess from the binding's example and the
++			 * Wolfson reference design. The codec driver only enables
++			 * its digital microphone input when it finds these two
++			 * functions configured at probe.
++			 */
++			gpio-cfg = <
++				0x0000 /* 0: not a GPIO */
++				0x0000 /* 1: default */
++				0x0013 /* 2: DMICCLK */
++				0x0000 /* 3: no register */
++				0x8014 /* 4: DMICDAT (input) */
++				0x0000 /* 5: default */
++			>;
+ 		};
+ 
+ 		/* Texas Instruments TPS659110 PMIC */
+@@ -901,7 +919,8 @@
+ 			"Headphone Jack", "HPOUTR",
+ 			"Headphone Jack", "HPOUTL",
+ 			"Int Spk", "SPKOUTR",
+-			"Int Spk", "SPKOUTL";
++			"Int Spk", "SPKOUTL",
++			"DMICDAT", "Digital Mic";
+ 
+ 		nvidia,i2s-controller = <&tegra_i2s1>;
+ 		nvidia,audio-codec = <&wm8962>;

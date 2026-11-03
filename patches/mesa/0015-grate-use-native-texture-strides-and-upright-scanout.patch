@@ -1,0 +1,66 @@
+From: Surface RT bring-up
+Subject: [PATCH 15] grate: use native texture strides and upright scanout
+
+--- a/src/gallium/drivers/grate/grate_resource.c
++++ b/src/gallium/drivers/grate/grate_resource.c
+@@ -189,7 +189,9 @@
+       else if (template->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SCANOUT))
+          resource->pitch = align(resource->pitch, 32);
+ 
+-      flags = DRM_TEGRA_GEM_CREATE_BOTTOM_UP;
++      /* The kernel reflects BOTTOM_UP framebuffers at scanout. GBM/KMS
++       * buffers already use the display's normal row order. */
++      flags = (template->bind & PIPE_BIND_SCANOUT) ? 0 : DRM_TEGRA_GEM_CREATE_BOTTOM_UP;
+    }
+ 
+    if (template->target != PIPE_BUFFER) {
+@@ -205,6 +207,13 @@
+       resource->format = format;
+    }
+ 
++   /* Textures use either tight POT rows or 64-byte NPOT rows. Renderable
++    * textures can be sampled later, so allocate a native NPOT-compatible
++    * stride rather than the framebuffer-only 32-byte alignment.
++    */
++   if (template->target != PIPE_BUFFER && (template->bind & PIPE_BIND_SAMPLER_VIEW))
++      resource->pitch = align(resource->pitch, 64);
++
+    size = resource->pitch * height;
+ 
+    resource->bo = grate_bo_alloc(screen->drm, size, flags);
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -778,10 +778,20 @@
+       struct grate_resource *res = grate_resource(view->texture);
+       assert(view->target == PIPE_TEXTURE_2D && view->u.tex.first_level == 0);
+       assert(view->u.tex.last_level == 0 && sampler->min_mip_filter == PIPE_TEX_MIPFILTER_NONE);
+-      /* A single-row texture never advances to another row. Its allocation
+-       * may be padded for rendering/import without changing sampler layout. */
+-      assert(res->pitch == res->b.width0 * util_format_get_blocksize(res->b.format) ||
+-             (res->b.height0 == 1 && res->pitch >= res->b.width0 * util_format_get_blocksize(res->b.format)));
++      unsigned row_bytes = res->b.width0 * util_format_get_blocksize(res->b.format);
++      /* POT layout is tightly packed. NPOT layout rounds rows to 64 bytes,
++       * even when the logical dimensions themselves are powers of two.
++       */
++      bool pot_layout = util_is_power_of_two_or_zero(res->b.width0) &&
++                        util_is_power_of_two_or_zero(res->b.height0) &&
++                        (res->pitch == row_bytes || res->b.height0 == 1);
++      unsigned native_pitch = pot_layout ? row_bytes : align(row_bytes, 64);
++      bool native_layout = res->pitch == native_pitch ||
++                           (res->b.height0 == 1 && res->pitch >= row_bytes);
++      if (!native_layout)
++         fprintf(stderr, "GRATE unsupported sampler layout: %s %ux%u pitch=%u native=%u\n",
++                 util_format_name(res->b.format),res->b.width0,res->b.height0,res->pitch,native_pitch);
++      assert(native_layout);
+       if (grate_debug & GRATE_DEBUG_TRACE)
+          fprintf(stderr, "GRATE sampler: %s view %s swizzle=%u,%u,%u,%u size=%ux%u pitch=%u format=%u\n",
+                  util_format_name(res->b.format), util_format_name(view->format),
+@@ -814,7 +824,7 @@
+       if (sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR) lo |= TGR3D_TEX_TEXDESC_LO_LERP_MIN;
+       if (sampler->mag_img_filter == PIPE_TEX_FILTER_LINEAR) lo |= TGR3D_TEX_TEXDESC_LO_LERP_MAG;
+       uint32_t hi = 0x80; /* base level only */
+-      if (util_is_power_of_two_or_zero(res->b.width0) && util_is_power_of_two_or_zero(res->b.height0)) {
++      if (pot_layout) {
+          hi |= TGR3D_TEX_TEXDESC_HI_LOG2_WIDTH(util_logbase2(res->b.width0));
+          hi |= TGR3D_TEX_TEXDESC_HI_LOG2_HEIGHT(util_logbase2(res->b.height0));
+       } else {

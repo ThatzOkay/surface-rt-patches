@@ -1,0 +1,46 @@
+Subject: [PATCH] ARM: dts: tegra30: surface-rt: hold Bluetooth PD1 active
+
+The 8797 UART Bluetooth trials work with PD1 held LOW, the pad out of
+tristate and H4 at 3 Mbaud with hardware flow control. Describe that GPIO
+state in the kernel rather than using userspace /dev/mem writes.
+
+Keep the observed pad mux selection and claim PD1 as an output-low hog.
+Patch 0026 already configures UARTC. Userspace still attaches H4 after the
+WLAN driver loads the SDIO+UART combo firmware. This does not implement
+Bluetooth sleep/wake sequencing or claim that PD1 is a reset signal.
+
+---
+--- a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
++++ b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
+@@ -69,6 +69,15 @@
+ 		assigned-clocks = <&tegra_car TEGRA30_CLK_VDE>;
+ 		assigned-clock-parents = <&tegra_car TEGRA30_CLK_PLL_P>;
+ 		assigned-clock-rates = <408000000>;
++	};
++
++	gpio@6000d000 {
++		bluetooth-pd1-active {
++			gpio-hog;
++			gpios = <TEGRA_GPIO(D, 1) GPIO_ACTIVE_HIGH>;
++			output-low;
++			line-name = "bluetooth-pd1-active";
++		};
+ 	};
+ 
+ 	pinmux@70000868 {
+@@ -114,6 +123,15 @@
+ 				nvidia,pull = <TEGRA_PIN_PULL_DOWN>;
+ 				nvidia,tristate = <TEGRA_PIN_DISABLE>;
+ 				nvidia,enable-input = <TEGRA_PIN_ENABLE>;
++			};
++
++			/* Hold the Bluetooth control pad in the tested active state. */
++			bluetooth-pd1 {
++				nvidia,pins = "sdmmc3_dat4_pd1";
++				nvidia,function = "sdmmc3";
++				nvidia,pull = <TEGRA_PIN_PULL_NONE>;
++				nvidia,tristate = <TEGRA_PIN_DISABLE>;
++				nvidia,enable-input = <TEGRA_PIN_DISABLE>;
+ 			};
+ 
+ 			/* Bluetooth UART-C */

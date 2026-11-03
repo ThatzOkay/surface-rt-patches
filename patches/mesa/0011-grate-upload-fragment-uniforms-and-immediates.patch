@@ -1,0 +1,157 @@
+From: Surface RT bring-up
+Subject: [PATCH 11/11] grate: upload fragment uniforms and arbitrary immediates
+
+Map used scalar constants to the fragment ALU's 32 FP20 registers, upload
+values on each draw, preserve source modifiers, and correct the constant
+buffer capability from 32 bytes to 32 floats. Uniforms and nontrivial
+immediates share the bank; zero/one immediates keep their existing encoding.
+Only direct indexing of constant buffer zero is supported.
+
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -92,6 +92,25 @@
+ }
+ 
+ static struct fp_alu_src_operand
++fp_constant(struct grate_fp_shader *fp, int word, float immediate)
++{
++   unsigned i;
++   for (i = 0; i < fp->info.num_constants; i++) {
++      if (fp->info.constants[i].word == word &&
++          (word >= 0 || fp->info.constants[i].immediate == immediate))
++         break;
++   }
++   assert(i < 32);
++   if (i == fp->info.num_constants) {
++      fp->info.constants[i].word = word;
++      fp->info.constants[i].immediate = immediate;
++      fp->info.num_constants++;
++   }
++   struct fp_alu_src_operand value = {.index = 32 + i};
++   return value;
++}
++
++static struct fp_alu_src_operand
+ fp_tgsi_src(struct grate_fp_shader *fp, const struct tgsi_src_register *src,
+             unsigned component, struct fp_mfu_instr *mfu)
+ {
+@@ -111,14 +130,13 @@
+       break;
+    case TGSI_FILE_IMMEDIATE: {
+       float imm = fp->immediates[src->Index][comp];
+-      if (imm != 0.0f && imm != 1.0f)
+-         fprintf(stderr, "GRATE FRAG: immediate %f is not supported (only 0.0 and 1.0), using 0.0\n", imm);
+-      value = imm == 1.0f ? fp_alu_src_one() : fp_alu_src_zero();
++      value = imm == 1.0f ? fp_alu_src_one() :
++              imm == 0.0f ? fp_alu_src_zero() : fp_constant(fp, -1, imm);
+       break;
+    }
+    case TGSI_FILE_CONSTANT:
+-      fprintf(stderr, "GRATE FRAG: constants (uniforms) are not supported in fragment shaders yet, using 0.0\n");
+-      value = fp_alu_src_zero();
++      assert(!src->Indirect);
++      value = fp_constant(fp, src->Index * 4 + comp, 0.0f);
+       break;
+    case TGSI_FILE_TEMPORARY:
+       value = fp_alu_src_reg(src->Index * 4 + comp);
+@@ -274,6 +292,10 @@
+ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *inst)
+ {
+    bool saturate = inst->Instruction.Saturate != 0;
++   for (unsigned i = 0; i < inst->Instruction.NumSrcRegs; i++) {
++      if (inst->Src[i].Register.File == TGSI_FILE_CONSTANT && inst->Src[i].Register.Dimension)
++         assert(inst->Src[i].Dimension.Index == 0 && !inst->Src[i].Dimension.Indirect);
++   }
+ 
+    switch (inst->Instruction.Opcode) {
+    case TGSI_OPCODE_TEX:
+@@ -366,6 +388,7 @@
+    list_inithead(&fp->mfu_instructions);
+ 
+    fp->info.num_inputs = 0;
++   fp->info.num_constants = 0;
+    fp->info.color_input = -1;
+    fp->info.max_tram_row = 1;
+    fp->num_immediates = 0;
+--- a/src/gallium/drivers/grate/grate_compiler.h
++++ b/src/gallium/drivers/grate/grate_compiler.h
+@@ -32,6 +32,13 @@
+    int num_inputs;
+    int color_input;
+    int max_tram_row;
++   /* Scalar hardware constants: uniforms point into TGSI constant buffer 0;
++    * immediates share the same 32-entry FP20 bank. */
++   struct {
++      int word; /* -1 for an immediate */
++      float immediate;
++   } constants[32];
++   unsigned num_constants;
+ };
+ 
+ #define GRATE_FP_MAX_IMMEDIATES 32
+--- a/src/gallium/drivers/grate/grate_screen.c
++++ b/src/gallium/drivers/grate/grate_screen.c
+@@ -340,7 +340,7 @@
+    caps->max_tex_indirections = 128;
+    caps->max_inputs = 16;
+    caps->max_outputs = 16;
+-   caps->max_const_buffer0_size = 32;
++   caps->max_const_buffer0_size = 32 * sizeof(float);
+    caps->max_const_buffers = 1;
+    caps->max_temps = 16; // scalars
+    caps->max_texture_samplers = 16;
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -678,6 +678,44 @@
+       grate_stream_push_words(stream, ptrp, context->vshader->immediates[0], num_imm * 4, 0);
+    if (user_words)
+       grate_stream_push_words(stream, ptrp, constbuf->user_buffer, user_words, 0);
++}
++
++/* Tegra fragment constants are sign:1 exponent:6 mantissa:13 (bias 31).
++ * Flush values below the normalized range rather than wrapping the exponent.
++ */
++static uint32_t
++fragment_fp20(float value)
++{
++   uint32_t bits = fui(value);
++   unsigned exponent = (bits >> 23) & 0xff;
++   uint32_t sign = (bits >> 12) & 0x80000;
++   if (exponent == 0xff)
++      return sign | 0x7e000 | ((bits & 0x7fffff) ? 1 : 0);
++   int adjusted = (int)exponent - 127 + 31;
++   if (adjusted <= 0)
++      return 0;
++   if (adjusted >= 63)
++      return sign | 0x7e000;
++   return sign | ((uint32_t)adjusted << 13) | ((bits & 0x7fffff) >> 10);
++}
++
++static void
++emit_fs_uniforms(struct grate_context *context, uint32_t **ptrp)
++{
++   const struct grate_fp_info *info = &context->fshader->info;
++   const struct pipe_constant_buffer *cb = &context->constant_buffer[MESA_SHADER_FRAGMENT];
++   if (!info->num_constants)
++      return;
++   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(0x820, info->num_constants));
++   for (unsigned i = 0; i < info->num_constants; i++) {
++      float value = info->constants[i].immediate;
++      int word = info->constants[i].word;
++      if (word >= 0) {
++         assert(cb->user_buffer && ((unsigned)word + 1) * sizeof(float) <= cb->buffer_size);
++         memcpy(&value, (const uint8_t *)cb->user_buffer + word * sizeof(float), sizeof(value));
++      }
++      GRATE_PUSHBUF_WORD(*ptrp, fragment_fp20(value));
++   }
+ }
+ 
+ static void
+@@ -775,6 +813,7 @@
+    emit_zsa_state(context, ptrp);
+    emit_attribs(context, ptrp);
+    emit_vs_uniforms(context, ptrp);
++   emit_fs_uniforms(context, ptrp);
+    emit_program(context, ptrp);
+    emit_textures(context, ptrp);
+ }

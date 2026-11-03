@@ -1,0 +1,260 @@
+From: Surface RT bring-up
+Subject: [PATCH 18] grate: track BO uses and drain draws at synchronization boundaries
+
+Replace patch 0006's per-draw CPU wait with per-BO last-use fences.
+Same-channel work stays ordered; cross-channel uses and CPU maps wait
+for prior work. Retain BO references until the channel drains so queued
+GEM handles cannot be recycled. Drain at context flush and channel close,
+and after 128 submissions to bound the outstanding queue. Wait before
+resource export and flush_resource as presentation/sharing boundaries.
+
+This keeps context flush synchronous and returns no outstanding pipe
+fence. It does not implement native fence FDs or asynchronous presentation.
+The classic interface's per-context job counter is the fence source.
+
+Applies after 0017. See docs/data/gpu/mesa-0018 for hardware validation.
+
+--- a/src/gallium/drivers/grate/drm/channel.c
++++ b/src/gallium/drivers/grate/drm/channel.c
+@@ -120,8 +120,30 @@
+         return -ENOTSUP;
+     }
+ 
++    util_dynarray_init(&channel->pending_bos, NULL);
+     *channelp = channel;
+ 
++    return 0;
++}
++
++/* Complete all submitted work before presentation, channel close, or a bounded
++ * queue rollover. Retaining BOs prevents GEM handle reuse while jobs are queued.
++ */
++int drm_tegra_channel_drain(struct drm_tegra_channel *channel)
++{
++    if (!channel->pending_jobs)
++        return 0;
++    int err = drm_tegra_fence_wait(&channel->pending, 1000000000UL);
++    if (err)
++        return err;
++    util_dynarray_foreach(&channel->pending_bos, struct grate_bo *, item) {
++        struct grate_bo *bo = *item;
++        if (bo->pending_channel == channel)
++            bo->pending_channel = NULL;
++        grate_bo_unref(bo);
++    }
++    util_dynarray_clear(&channel->pending_bos);
++    channel->pending_jobs = 0;
+     return 0;
+ }
+ 
+@@ -134,6 +156,9 @@
+     if (!channel)
+         return -EINVAL;
+ 
++    err = drm_tegra_channel_drain(channel);
++    if (err)
++        return err;
+     drm = channel->drm;
+ 
+     memset(&args, 0, sizeof(args));
+@@ -143,6 +168,7 @@
+     if (err < 0)
+         return -errno;
+ 
++    util_dynarray_fini(&channel->pending_bos);
+     grate_bo_unref(channel->gather);
+     free(channel);
+ 
+--- a/src/gallium/drivers/grate/drm/job.c
++++ b/src/gallium/drivers/grate/drm/job.c
+@@ -171,6 +171,22 @@
+     void *map;
+     int err;
+ 
++    if (channel->pending_jobs >= 128) {
++        err = drm_tegra_channel_drain(channel);
++        if (err)
++            return err;
++    }
++    /* Same-channel submissions execute in order. Across channels (especially
++     * gr3d draw -> gr2d clear/copy), finish the previous use first.
++     */
++    for (i = 0; i < job->num_buffers; i++) {
++        struct grate_bo *bo = grate_lookup_bo(drm, job->buffers[i].mapping);
++        if (bo->pending_channel && bo->pending_channel != channel) {
++            err = grate_bo_wait(bo);
++            if (err)
++                return err;
++        }
++    }
+     words = job->pushbuf->ptr - job->pushbuf->start;
+ 
+     /* waiting for another job's sync point is a per-command feature the classic interface does not have */
+@@ -272,6 +288,17 @@
+     }
+ 
+     job->syncpt.fence = args.fence;
++    channel->pending = (struct drm_tegra_fence){drm, job->syncpt.id, args.fence};
++    channel->pending_jobs++;
++    for (i = 0; i < job->num_buffers; i++) {
++        struct grate_bo *bo = grate_lookup_bo(drm, job->buffers[i].mapping);
++        if (bo->pending_channel != channel) {
++            grate_bo_ref(bo);
++            util_dynarray_append_typed(&channel->pending_bos, struct grate_bo *, bo);
++        }
++        bo->pending_channel = channel;
++        bo->pending = channel->pending;
++    }
+ 
+     if (fence) {
+         fence->drm = drm;
+--- a/src/gallium/drivers/grate/drm/tegra.h
++++ b/src/gallium/drivers/grate/drm/tegra.h
+@@ -63,6 +63,7 @@
+ int drm_tegra_channel_open(struct grate_device *drm,
+                            enum drm_tegra_class client,
+                            struct drm_tegra_channel **channelp);
++int drm_tegra_channel_drain(struct drm_tegra_channel *channel);
+ int drm_tegra_channel_close(struct drm_tegra_channel *channel);
+ unsigned int drm_tegra_channel_get_version(struct drm_tegra_channel *channel);
+ int drm_tegra_channel_map(struct drm_tegra_channel *channel,
+--- a/src/gallium/drivers/grate/drm/tegra_private.h
++++ b/src/gallium/drivers/grate/drm/tegra_private.h
+@@ -31,6 +31,7 @@
+ 
+ #include "drm-uapi/tegra_drm.h"
+ #include "tegra.h"
++#include "util/u_dynarray.h"
+ 
+ enum host1x_class {
+     HOST1X_CLASS_HOST1X = 0x01,
+@@ -51,6 +52,10 @@
+      * mapped staging BO rather than allocating one for every draw.
+      */
+     struct grate_bo *gather;
++
++    struct drm_tegra_fence pending;
++    struct util_dynarray pending_bos;
++    unsigned int pending_jobs;
+ 
+     unsigned int cond_shift;
+ };
+--- a/src/gallium/drivers/grate/grate_bo.c
++++ b/src/gallium/drivers/grate/grate_bo.c
+@@ -164,8 +164,18 @@
+     return 0;
+ }
+ 
++int grate_bo_wait(struct grate_bo *bo)
++{
++    if (!bo->pending_channel)
++        return 0;
++    return drm_tegra_fence_wait(&bo->pending, 1000000000UL);
++}
++
+ int grate_bo_map(struct grate_bo *bo, void **ptr)
+ {
++    int wait_err = grate_bo_wait(bo);
++    if (wait_err)
++        return wait_err;
+     struct grate_device *drm = bo->drm;
+ 
+     if (!bo->map) {
+@@ -223,6 +233,9 @@
+ 
+ int grate_bo_export(struct grate_bo *bo, uint32_t flags)
+ {
++    int wait_err = grate_bo_wait(bo);
++    if (wait_err)
++        return wait_err;
+     int fd, err;
+ 
+     /* DRM_RDWR: the importer (e.g. the compositor) needs to be able to
+--- a/src/gallium/drivers/grate/grate_bo.h
++++ b/src/gallium/drivers/grate/grate_bo.h
+@@ -26,6 +26,7 @@
+ #define __GRATE_BO_H__ 1
+ 
+ #include <stdint.h>
++#include "tegra.h"
+ #include <stdlib.h>
+ #include <util/u_dynarray.h>
+ #include <util/sparse_array.h>
+@@ -38,6 +39,9 @@
+     uint32_t size;
+     int32_t refcnt;
+     void *map;
++    /* Last GPU use, including reads. The channel retains this BO until drain. */
++    struct drm_tegra_channel *pending_channel;
++    struct drm_tegra_fence pending;
+     
+     /* List of channel mappings where made for this BO, for cleanup */
+     struct util_dynarray channel_maps;
+@@ -49,6 +53,7 @@
+ struct grate_bo *grate_bo_ref(struct grate_bo *bo);
+ void grate_bo_unref(struct grate_bo *bo);
+ int grate_bo_get_handle(struct grate_bo *bo, uint32_t *handle);
++int grate_bo_wait(struct grate_bo *bo);
+ int grate_bo_map(struct grate_bo *bo, void **ptr);
+ int grate_bo_unmap(struct grate_bo *bo);
+ 
+--- a/src/gallium/drivers/grate/grate_context.c
++++ b/src/gallium/drivers/grate/grate_context.c
+@@ -90,7 +90,15 @@
+                     struct pipe_fence_handle **pfence,
+                     enum pipe_flush_flags flags)
+ {
+-   //TODO grate_unimplemented();
++   struct grate_context *context = grate_context(pcontext);
++   int err = drm_tegra_channel_drain(context->gr3d->stream.channel);
++   if (!err)
++      err = drm_tegra_channel_drain(context->gr2d->stream.channel);
++   if (err)
++      grate_loge("context drain failed: %d\n", err);
++   /* Work is complete on return; there is no outstanding pipe fence. */
++   if (pfence)
++      *pfence = NULL;
+ }
+ 
+ struct pipe_context *
+--- a/src/gallium/drivers/grate/grate_draw.c
++++ b/src/gallium/drivers/grate/grate_draw.c
+@@ -421,12 +421,10 @@
+ 
+    grate_stream_end(stream, &ptr);
+ 
+-   /* Draws are submitted immediately, but resource maps and context flushes
+-    * do not track/wait their fences yet. Complete the draw before releasing
+-    * its job so CPU readback and subsequent gr2d clears cannot race it.
+-    * Replace this synchronous fallback with resource fence tracking later.
+-    */
+-   err = grate_stream_flush(stream, true);
++   /* BO maps, cross-channel use and context flush wait on the recorded fences.
++    * Consecutive draws on this channel can therefore run without CPU waits.
++    */
++   err = grate_stream_flush(stream, false);
+    if (err < 0)
+       grate_loge("grate_stream_flush() failed: %d\n", err);
+ }
+--- a/src/gallium/drivers/grate/grate_resource.c
++++ b/src/gallium/drivers/grate/grate_resource.c
+@@ -37,6 +37,8 @@
+       return false;
+ 
+    resource = grate_resource(presource);
++   if (grate_bo_wait(resource->bo))
++      return false;
+ 
+    if (handle->type == WINSYS_HANDLE_TYPE_KMS) {
+       ret = grate_bo_get_handle(resource->bo, &handle->handle);
+@@ -557,7 +559,9 @@
+ static void
+ grate_flush_resource(struct pipe_context *ctx, struct pipe_resource *resource)
+ {
+-   //TODO grate_unimplemented();
++   int err = grate_bo_wait(grate_resource(resource)->bo);
++   if (err)
++      grate_loge("resource wait failed: %d\n", err);
+ }
+ 
+ void

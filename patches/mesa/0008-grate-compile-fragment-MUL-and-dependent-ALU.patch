@@ -1,0 +1,356 @@
+Subject: [PATCH 8/8] grate: compile fragment MUL and schedule dependent ALU operations
+
+Work-in-progress snapshot, 2026-11-02. Applies after patches 0001-0007.
+Ten fragment readback cases passed on Surface RT in the preceding candidate.
+Final cleanup and the added varying-W perspective case still need hardware
+validation. This snapshot is retained for review and continuation, not marked
+as a fully validated release.
+
+Implement MUL using the fragment MAD unit, correct source modifiers and
+input/temporary addressing, stage distinct interpolated operands, schedule
+ALU dependencies, and configure the fragment pipeline for multiple batches.
+General fragment uniforms, arbitrary immediates and texture formats remain
+incomplete. See docs/3d-acceleration.md for evidence and remaining work.
+
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -69,7 +69,7 @@
+ {
+    struct fp_alu_dst_operand ret = { 0 };
+ 
+-   ret.index = dst->Index;
++   ret.index = 16 + dst->Index * 4;
+    if (dst->File == TGSI_FILE_OUTPUT) {
+       ret.index = 2; // HACK: r2+r3 to match hard-coded store shader for now
+ 
+@@ -79,33 +79,84 @@
+       ret.index += o / 2;
+       ret.write_low_sub_reg = (o % 2) == 0;
+       ret.write_high_sub_reg = (o % 2) != 0;
+-   } else
++   } else {
++      assert(dst->File == TGSI_FILE_TEMPORARY && dst->Index < 2);
+       ret.index += subreg;
++      ret.write_low_sub_reg = true;
++      ret.write_high_sub_reg = true;
++   }
+ 
+    ret.saturate = saturate;
+ 
+    return ret;
+ }
+ 
+-static void
+-emit_vMOV(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
+-          bool saturate, const struct tgsi_src_register *src)
++static struct fp_alu_src_operand
++fp_tgsi_src(struct grate_fp_shader *fp, const struct tgsi_src_register *src,
++            unsigned component, struct fp_mfu_instr *mfu)
++{
++   unsigned swizzle[] = {src->SwizzleX, src->SwizzleY, src->SwizzleZ, src->SwizzleW};
++   unsigned comp = swizzle[component];
++   struct fp_alu_src_operand value;
++
++   switch (src->File) {
++   case TGSI_FILE_INPUT:
++      /* Interpolate the selected source channel, not the destination channel. */
++      assert(mfu);
++      assert(mfu->var[comp].op == FP_VAR_OP_NOP || mfu->var[comp].tram_row == src->Index);
++      mfu->var[comp].op = FP_VAR_OP_FP20;
++      mfu->var[comp].tram_row = src->Index;
++      fp->info.max_tram_row = MAX2(fp->info.max_tram_row, src->Index + 1);
++      value = fp_alu_src_row(comp);
++      break;
++   case TGSI_FILE_IMMEDIATE: {
++      float imm = fp->immediates[src->Index][comp];
++      if (imm != 0.0f && imm != 1.0f)
++         fprintf(stderr, "GRATE FRAG: immediate %f is not supported (only 0.0 and 1.0), using 0.0\n", imm);
++      value = imm == 1.0f ? fp_alu_src_one() : fp_alu_src_zero();
++      break;
++   }
++   case TGSI_FILE_CONSTANT:
++      fprintf(stderr, "GRATE FRAG: constants (uniforms) are not supported in fragment shaders yet, using 0.0\n");
++      value = fp_alu_src_zero();
++      break;
++   case TGSI_FILE_TEMPORARY:
++      value = fp_alu_src_reg(src->Index * 4 + comp);
++      break;
++   default:
++      UNREACHABLE("unsupported fragment ALU source");
++   }
++   value.absolute_value = src->Absolute;
++   value.negate = src->Negate;
++   return value;
++}
++
++static void
++setup_interpolation(struct fp_mfu_instr *mfu)
++{
++   mfu->sfu.op = FP_SFU_OP_RCP;
++   mfu->sfu.reg = 4;
++   for (unsigned k = 0; k < 2; k++) {
++      mfu->mul[k].dst = FP_MFU_MUL_DST_BARYCENTRIC_WEIGHT;
++      mfu->mul[k].src[0] = FP_MFU_MUL_SRC_SFU_RESULT;
++      mfu->mul[k].src[1] = k ? FP_MFU_MUL_SRC_BARYCENTRIC_COEF_1 : FP_MFU_MUL_SRC_BARYCENTRIC_COEF_0;
++   }
++}
++
++static void
++emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
++          bool saturate, const struct tgsi_src_register *src,
++          const struct tgsi_src_register *rhs)
+ {
+    struct fp_instr *inst = CALLOC_STRUCT(fp_instr);
+    list_inithead(&inst->link);
+ 
+    struct fp_mfu_instr *mfu = NULL;
+-   if (src->File == TGSI_FILE_INPUT) {
++   if (src->File == TGSI_FILE_INPUT || (rhs && rhs->File == TGSI_FILE_INPUT)) {
+       mfu = CALLOC_STRUCT(fp_mfu_instr);
+       list_inithead(&mfu->link);
+-   }
+-
+-   int swizzle[] = {
+-      src->SwizzleX,
+-      src->SwizzleY,
+-      src->SwizzleZ,
+-      src->SwizzleW
+-   };
++      setup_interpolation(mfu);
++   }
+ 
+    struct fp_alu_instr_packet *alu = CALLOC_STRUCT(fp_alu_instr_packet);
+    int alu_instrs = 0;
+@@ -114,42 +165,18 @@
+       if ((dst->WriteMask & (1 << i)) == 0)
+          continue;
+ 
+-      int comp = swizzle[i];
+-
+-      struct fp_alu_src_operand src0 = { };
+-      if (src->File == TGSI_FILE_INPUT) {
+-         mfu->var[i].op = FP_VAR_OP_FP20;
+-         mfu->var[i].tram_row = src->Index;
+-         fp->info.max_tram_row = MAX2(fp->info.max_tram_row, src->Index);
+-         src0 = fp_alu_src_row(comp);
+-      } else if (src->File == TGSI_FILE_IMMEDIATE) {
+-         /*
+-          * The only constants this compiler can put into an ALU instruction are the hardware's zero and one. Any other
+-          * value would need the hardware's constant mechanism, which is not understood here yet: say so and use zero
+-          * instead of reading an undefined register.
+-          */
+-         float value = fp->immediates[src->Index][comp];
+-         if (value == 1.0f)
+-            src0 = fp_alu_src_one();
+-         else {
+-            if (value != 0.0f)
+-               fprintf(stderr, "GRATE FRAG: immediate %f is not supported (only 0.0 and 1.0), using 0.0\n", value);
+-            src0 = fp_alu_src_zero();
+-         }
+-      } else if (src->File == TGSI_FILE_CONSTANT) {
+-         fprintf(stderr, "GRATE FRAG: constants (uniforms) are not supported in fragment shaders yet, using 0.0\n");
+-         src0 = fp_alu_src_zero();
+-      } else
+-         src0 = fp_alu_src_reg(src->Index + comp);
+-
+-      alu->slots[alu_instrs++] = fp_alu_sMOV(fp_alu_dst(dst, i, saturate), src0);
++      struct fp_alu_src_operand a = fp_tgsi_src(fp, src, i, mfu);
++      struct fp_alu_src_operand b = rhs ? fp_tgsi_src(fp, rhs, i, mfu) : fp_alu_src_one();
++      struct fp_alu_instr op = fp_alu_sMOV(fp_alu_dst(dst, i, saturate), a);
++      op.src[1] = b; /* MAD(a, b, zero, one) implements MOV or MUL. */
++      alu->slots[alu_instrs++] = op;
+    }
+    inst->alu_sched.num_instructions = 1;
+-   inst->alu_sched.address = list_length(&fp->fp_instructions);
++   inst->alu_sched.address = list_length(&fp->alu_instructions);
+ 
+    if (mfu != NULL) {
+       inst->mfu_sched.num_instructions = 1;
+-      inst->mfu_sched.address = list_length(&fp->fp_instructions);
++      inst->mfu_sched.address = list_length(&fp->mfu_instructions);
+       list_addtail(&mfu->link, &fp->mfu_instructions);
+    }
+ 
+@@ -164,6 +191,26 @@
+    }
+ 
+    list_addtail(&alu->link, &fp->alu_instructions);
++   if (!mfu && !list_is_empty(&fp->fp_instructions)) {
++      struct fp_instr *previous = list_last_entry(&fp->fp_instructions, struct fp_instr, link);
++      if (!previous->dw.enable && previous->alu_sched.num_instructions < 3) {
++         if (previous->alu_sched.num_instructions == 1 &&
++             (src->File == TGSI_FILE_TEMPORARY || (rhs && rhs->File == TGSI_FILE_TEMPORARY))) {
++            struct fp_alu_instr_packet *nop = CALLOC_STRUCT(fp_alu_instr_packet);
++            list_inithead(&nop->link);
++            /* Allow the GPR result to become available before it is read. */
++            struct fp_alu_dst_operand discard = {.index = 31};
++            for (unsigned n = 0; n < 4; n++)
++               nop->slots[n] = fp_alu_sMOV(discard, fp_alu_src_zero());
++            list_addtail(&nop->link, &alu->link);
++            previous->alu_sched.num_instructions++;
++         }
++         previous->alu_sched.num_instructions++;
++         previous->dw = inst->dw;
++         FREE(inst);
++         return;
++      }
++   }
+    list_addtail(&inst->link, &fp->fp_instructions);
+ }
+ 
+@@ -174,9 +221,37 @@
+ 
+    switch (inst->Instruction.Opcode) {
+    case TGSI_OPCODE_MOV:
+-      emit_vMOV(fp, &inst->Dst[0].Register, saturate,
+-                    &inst->Src[0].Register);
+-      break;
++      emit_vALU(fp, &inst->Dst[0].Register, saturate,
++                    &inst->Src[0].Register, NULL);
++      break;
++
++   case TGSI_OPCODE_MUL: {
++      const struct tgsi_src_register *a = &inst->Src[0].Register;
++      const struct tgsi_src_register *b = &inst->Src[1].Register;
++      struct tgsi_src_register staged = {0};
++      if (a->File == TGSI_FILE_INPUT && b->File == TGSI_FILE_INPUT && a->Index != b->Index) {
++         /* One MFU packet can interpolate one vec4. Preserve A in an unused general-purpose vec4
++          * before loading B. Scratch registers must not alias a live
++          * TGSI temporary. General register allocation is still missing.
++          */
++         assert(fp->num_temporaries <= 1);
++         struct tgsi_dst_register scratch = {0};
++         scratch.File = TGSI_FILE_TEMPORARY;
++         scratch.Index = fp->num_temporaries;
++         scratch.WriteMask = TGSI_WRITEMASK_XYZW;
++         emit_vALU(fp, &scratch, false, a, NULL);
++         staged.File = TGSI_FILE_TEMPORARY;
++         staged.Index = fp->num_temporaries;
++         staged.SwizzleX = TGSI_SWIZZLE_X;
++         staged.SwizzleY = TGSI_SWIZZLE_Y;
++         staged.SwizzleZ = TGSI_SWIZZLE_Z;
++         staged.SwizzleW = TGSI_SWIZZLE_W;
++         a = &staged;
++      }
++      emit_vALU(fp, &inst->Dst[0].Register, saturate, a, b);
++
++      break;
++   }
+ 
+    default:
+       fprintf(stderr, "GRATE FRAG TGSI UNIMPLEMENTED: 0x%02x\n", inst->Instruction.Opcode);
+@@ -197,7 +272,7 @@
+    grate_trace();
+    assert(decl->Range.First == decl->Range.Last);
+ 
+-   uint32_t src = LINK_SRC(1);
++   uint32_t src = LINK_SRC(decl->Range.First + 1) | (decl->Range.First << 9);
+    uint32_t dst = 0;
+    for (int i = 0; i < 4; ++i)
+       dst |= LINK_DST(i, i, LINK_DST_FP20);
+@@ -215,6 +290,9 @@
+ emit_tgsi_declaration(struct grate_fp_shader *fp, const struct tgsi_full_declaration *decl)
+ {
+    switch (decl->Declaration.File) {
++   case TGSI_FILE_TEMPORARY:
++      fp->num_temporaries = MAX2(fp->num_temporaries, decl->Range.Last + 1);
++      break;
+    case TGSI_FILE_INPUT:
+       emit_tgsi_input(fp, decl);
+       break;
+@@ -232,6 +310,7 @@
+    fp->info.color_input = -1;
+    fp->info.max_tram_row = 1;
+    fp->num_immediates = 0;
++   fp->num_temporaries = 0;
+ 
+    while (!tgsi_parse_end_of_tokens(tgsi)) {
+       tgsi_parse_token(tgsi);
+@@ -258,22 +337,4 @@
+       }
+    }
+ 
+-   /*
+-    * HACK: insert barycentric interpolation setup
+-    * This will overwrite instructions in some cases, need proper scheduler
+-    * to fix properly
+-    */
+-    if (list_is_empty(&fp->mfu_instructions))
+-       return; /* nothing is interpolated (for example a constant colour): no setup, and no first entry to write to */
+-
+-    struct fp_mfu_instr *first = list_first_entry(&fp->mfu_instructions, struct fp_mfu_instr, link);
+-    first->sfu.op = FP_SFU_OP_RCP;
+-    first->sfu.reg = 4;
+-    first->mul[0].dst = FP_MFU_MUL_DST_BARYCENTRIC_WEIGHT;
+-    first->mul[0].src[0] = FP_MFU_MUL_SRC_SFU_RESULT;
+-    first->mul[0].src[1] = FP_MFU_MUL_SRC_BARYCENTRIC_COEF_0;
+-
+-    first->mul[1].dst = FP_MFU_MUL_DST_BARYCENTRIC_WEIGHT;
+-    first->mul[1].src[0] = FP_MFU_MUL_SRC_SFU_RESULT;
+-    first->mul[1].src[1] = FP_MFU_MUL_SRC_BARYCENTRIC_COEF_1;
+-}
++}
+--- a/src/gallium/drivers/grate/fp/pack.c
++++ b/src/gallium/drivers/grate/fp/pack.c
+@@ -59,14 +59,20 @@
+       .write_high_sub_reg = instr->dst.write_high_sub_reg,
+ 
+       .rA_reg_select = instr->src[0].index,
++      .rA_negate = instr->src[0].negate,
++      .rA_absolute_value = instr->src[0].absolute_value,
+       .rA_fixed10 = instr->src[0].datatype != FP_DATATYPE_FP20,
+       .rA_sub_reg_select_high = instr->src[0].sub_reg_select_high,
+ 
+       .rB_reg_select = instr->src[1].index,
++      .rB_negate = instr->src[1].negate,
++      .rB_absolute_value = instr->src[1].absolute_value,
+       .rB_fixed10 = instr->src[1].datatype != FP_DATATYPE_FP20,
+       .rB_sub_reg_select_high = instr->src[1].sub_reg_select_high,
+ 
+       .rC_reg_select = instr->src[2].index,
++      .rC_negate = instr->src[2].negate,
++      .rC_absolute_value = instr->src[2].absolute_value,
+       .rC_fixed10 = instr->src[2].datatype != FP_DATATYPE_FP20,
+       .rC_sub_reg_select_high = instr->src[2].sub_reg_select_high,
+ 
+--- a/src/gallium/drivers/grate/grate_compiler.h
++++ b/src/gallium/drivers/grate/grate_compiler.h
+@@ -37,6 +37,7 @@
+ #define GRATE_FP_MAX_IMMEDIATES 32
+ 
+ struct grate_fp_shader {
++   unsigned num_temporaries;
+    float immediates[GRATE_FP_MAX_IMMEDIATES][4];
+    unsigned num_immediates;
+    struct list_head fp_instructions;
+--- a/src/gallium/drivers/grate/grate_program.c
++++ b/src/gallium/drivers/grate/grate_program.c
+@@ -202,8 +202,17 @@
+ 
+ #define PUSH(x) util_dynarray_append_typed(&buf, uint32_t, (x))
+    PUSH(host1x_opcode_incr(REG_TGR3D_GLOBAL_PIX_ATTR, 1));
+-   // TODO: document/convert these values
+-   PUSH(0x58000000);
++   /* One pixel row, with the matching sequencer capacity used by libgrate.
++    * The old capacity/flow-control combination only worked reliably for a
++    * single pipeline batch. MUL with independently interpolated operands
++    * needs more than one batch.
++    */
++   PUSH(TGR3D_GLOBAL_PIX_ATTR_MAX_QID((0x12c - 1) / 4));
++   PUSH(host1x_opcode_incr(REG_TGR3D_PSEQ_CTL, 1));
++   PUSH(0x22000000 | TGR3D_PSEQ_CTL_MAX_OUT(0x12c) |
++        TGR3D_PSEQ_CTL_MIN_OUT(0xc8) |
++        TGR3D_PSEQ_CTL_MERGE_SPAN_STARTS | TGR3D_PSEQ_CTL_MERGE_REGISTERS |
++        TGR3D_PSEQ_CTL_REMOVE_KILLED_PIXELS | TGR3D_PSEQ_CTL_ALLOW_QID_COLLISIONS);
+ 
+    PUSH(host1x_opcode_imm(REG_TGR3D_PSEQ_QUAD_ID, 0));
+    PUSH(host1x_opcode_imm(REG_TGR3D_GLOBAL_INST_OFFSET, 0));
+@@ -219,7 +228,7 @@
+ 
+    PUSH(host1x_opcode_incr(REG_TGR3D_PSEQ_DWR_IF_STATE, 1));
+    // TODO: document/convert these values
+-   PUSH(0x00000040);
++   PUSH(TGR3D_PSEQ_DWR_IF_STATE_COUNT(num_fp_instrs));
+ 
+    if (soc_id == DRM_TEGRA_SOC_T114) {
+       // TODO: document/convert these values

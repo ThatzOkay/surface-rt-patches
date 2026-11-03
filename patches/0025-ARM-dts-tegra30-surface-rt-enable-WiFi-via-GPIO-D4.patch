@@ -1,0 +1,44 @@
+--- a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
++++ b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
+@@ -101,6 +101,14 @@
+ 				nvidia,enable-input = <TEGRA_PIN_DISABLE>;
+ 			};
+ 
++			wifi-power {
++				nvidia,pins = "sdmmc3_dat7_pd4";
++				nvidia,function = "rsvd1";
++				nvidia,pull = <TEGRA_PIN_PULL_NONE>;
++				nvidia,tristate = <TEGRA_PIN_DISABLE>;
++				nvidia,enable-input = <TEGRA_PIN_DISABLE>;
++			};
++
+ 			wifi-interrupt {
+ 				nvidia,pins = "pu5";
+ 				nvidia,pull = <TEGRA_PIN_PULL_DOWN>;
+@@ -564,7 +572,7 @@
+ 		non-removable;
+ 
+ 		mmc-pwrseq = <&mrvl_wifi_pwrseq>; // TODO: why and how much is needed?
+-		// vmmc-supply TODO
++		vmmc-supply = <&vmmc_wifi_reg>;
+ 		vqmmc-supply = <&vqmmc_3v3_wifi>; // TODO: is it even needed
+ 
+ 		/* Marvell 88W8797 WiFi */
+@@ -849,6 +857,17 @@
+ 		vin-supply = <&vdd_5v0_sys>;
+ 	};
+ 
++	vmmc_wifi_reg: regulator-wifi {
++		compatible = "regulator-fixed";
++		regulator-name = "vmmc_wifi";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		gpio = <&gpio TEGRA_GPIO(D, 4) GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		off-on-delay-us = <300000>;
++		vin-supply = <&vdd_5v0_sys>;
++	};
++
+ 	vdd_pnl: regulator-panel {
+ 		compatible = "regulator-fixed";
+ 		regulator-name = "vdd_panel";

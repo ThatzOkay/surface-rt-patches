@@ -1,0 +1,46 @@
+Subject: [PATCH] ASoC: tegra_wm8962: do not dereference a missing runtime on card remove
+
+tegra_wm8962_remove() looks up the PCM runtime of the card's only DAI link
+and dereferences it unconditionally. When the codec is unbound first (for
+example by writing the device name to the wm8962 driver's unbind file in
+sysfs, or by a failed probe), the runtime has already been removed with the
+codec component, snd_soc_get_pcm_runtime() returns NULL and the card's
+remove hook oopses:
+
+  Unable to handle kernel NULL pointer dereference at virtual address 00000570
+  PC is at tegra_wm8962_remove+0x20/0x48
+  tegra_wm8962_remove from snd_soc_card_remove+0x88/0x98
+  ... from i2c_device_remove
+
+Return early when there is no runtime or no codec DAI; there is no jack to
+unregister in that case.
+
+Observed on Microsoft Surface RT (Tegra 30, WM8962) on 7.0.1.
+
+---
+--- a/sound/soc/tegra/tegra_wm8962.c	2026-10-31 20:54:27.046164690 +0100
++++ b/sound/soc/tegra/tegra_wm8962.c	2026-10-31 20:54:27.061851719 +0100
+@@ -101,10 +101,20 @@
+ {
+ 	struct snd_soc_dai_link *link = &card->dai_link[0];
+ 	struct snd_soc_pcm_runtime *rtd = snd_soc_get_pcm_runtime(card, link);
+-	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
+-	struct snd_soc_component *component = codec_dai->component;
++	struct snd_soc_dai *codec_dai;
+ 
+-	wm8962_mic_detect(component, NULL);
++	/*
++	 * The codec can be unbound before the card is removed (for example
++	 * through sysfs), and its PCM runtime is gone by then.
++	 */
++	if (!rtd)
++		return 0;
++
++	codec_dai = snd_soc_rtd_to_codec(rtd, 0);
++	if (!codec_dai)
++		return 0;
++
++	wm8962_mic_detect(codec_dai->component, NULL);
+ 
+ 	return 0;
+ }

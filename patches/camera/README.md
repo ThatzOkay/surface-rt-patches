@@ -1,5 +1,9 @@
 # Camera kernel patches (OV9726 on the Surface RT)
 
+Current series: 20 camera patches, `0003`–`0022`, after the two base patches.
+Front-camera raw capture works on r9; see the current camera results.
+The build-only validation paragraphs below describe the earlier `0003`–`0021` pass.
+
 Apply in order, after `0001` (audio) and `0002` (cover keyboard) in `../`, to the pinned kernel
 (libre-tegra `v7.0.1-stable`, `bfffc6d6656e87f3de3aa4c09d852849081ef088`). All 21 patches were
 checked to apply in sequence with `patch -p1` to a fresh copy of that kernel with no fuzz, offsets or
@@ -12,6 +16,7 @@ rejects, and the resulting tree was compiled (see below). They are not yet boote
 | `0005`..`0019` | The upstream series "tegra-video: add CSI support for Tegra20 and Tegra30", v7, patches 1 to 15. Unmodified except patch 5 (`0009`), which converts the MIPI calibration code: it is ported to `drivers/gpu/host1x-grate/` and `drivers/gpu/drm/grate/dsi.c` because this kernel uses the grate host1x |
 | `0020` | Lets the Tegra video driver build against the grate host1x (`host1x-compat.h`, Kconfig) |
 | `0021` | Surface RT devicetree: enable `vi` and `csi`, link sensor to VI through CSI-A |
+| [`0022`](0022-staging-media-tegra-video-bind-the-VI-driver-before-.patch) | Removes VI from the grate host1x stub's match table so tegra-video can bind, and initializes VI driver data before child population |
 
 Kernel config: `CONFIG_VIDEO_TEGRA=m` and `CONFIG_VIDEO_OV9726=m` (the only two lines that change).
 

@@ -1,0 +1,42 @@
+Subject: [PATCH] wifi: mwifiex: sdio: add opt-in legacy scan parameter
+
+The Surface RT's Windows SD8797 combo firmware 14.62.17.p215 initializes
+Bluetooth over UART but rejects HostCmd_CMD_802_11_SCAN_EXT (0x107).
+NetworkManager gets no scan results. The SD8797 device table enables extended
+scanning regardless of which firmware image is loaded.
+
+Add a read-only force_legacy_scan module parameter so a controlled trial can
+use the existing legacy scan command and matching request/response paths.
+Default behavior is unchanged. This is an experimental compatibility switch,
+not a claim that the older firmware supports every other driver command.
+
+Enable before probe with options mwifiex_sdio force_legacy_scan=1, or with
+mwifiex_sdio.force_legacy_scan=1 on the kernel command line.
+
+---
+
+--- a/drivers/net/wireless/marvell/mwifiex/sdio.c
++++ b/drivers/net/wireless/marvell/mwifiex/sdio.c
+@@ -19,6 +19,10 @@
+ 
+ #define SDIO_VERSION	"1.0"
+ 
++static bool force_legacy_scan;
++module_param(force_legacy_scan, bool, 0444);
++MODULE_PARM_DESC(force_legacy_scan, "Use legacy scanning (default: false)");
++
+ static void mwifiex_sdio_work(struct work_struct *work);
+ 
+ static const struct mwifiex_if_ops sdio_ops;
+@@ -2615,7 +2619,10 @@
+ 	}
+ 
+ 	adapter->auto_tdls = card->can_auto_tdls;
+-	adapter->ext_scan = card->can_ext_scan;
++	adapter->ext_scan = card->can_ext_scan && !force_legacy_scan;
++	if (force_legacy_scan && card->can_ext_scan)
++		mwifiex_dbg(adapter, MSG,
++			    "extended scan disabled by force_legacy_scan\n");
+ 	return 0;
+ }
+ 

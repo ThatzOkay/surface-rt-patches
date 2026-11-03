@@ -1,0 +1,25 @@
+Subject: [PATCH] tools: select GLES before GTK initializes the GLES probe
+
+GTK3 creates a shared context inside gdk_window_create_gl_context().
+Selecting ES on the returned context is too late for GLES2-only drivers.
+Set the GTK GLES flag before gtk_init, only for the existing GTK probe
+path. Preserve other GDK flags and leave the X11 helper path unchanged.
+
+--- a/tools/gnome-session-check-accelerated.c
++++ b/tools/gnome-session-check-accelerated.c
+@@ -139,6 +139,15 @@
+         glong is_accelerated, is_software_rendering;
+         GError *gl_error = NULL, *gles_error = NULL, *gtk_gles_error = NULL;
+ 
++        /* GTK3 creates its shared paint context before the caller can set
++         * use_es on the returned context. Select GLES before GTK parses its
++         * GL flags, and only for the GTK GLES probe below. */
++        if (is_discrete_gpu_check () || g_strcmp0 (g_getenv ("XDG_SESSION_TYPE"), "x11") != 0) {
++                const char *flags = g_getenv ("GDK_GL");
++                g_autofree char *gles_flags = g_strconcat (flags ? flags : "", ",gles", NULL);
++                g_setenv ("GDK_GL", gles_flags, TRUE);
++        }
++
+         gtk_init (NULL, NULL);
+ 
+         /* gnome-session-check-accelerated gets run before X is started in the wayland

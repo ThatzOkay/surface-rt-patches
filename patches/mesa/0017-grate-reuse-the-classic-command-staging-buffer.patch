@@ -1,0 +1,66 @@
+From: Surface RT bring-up
+Subject: [PATCH 17] grate: reuse the classic command staging buffer per channel
+
+Every draw currently creates, maps, unmaps and closes a GEM buffer solely
+for passing command words to the classic submit ioctl. The kernel copies
+and patches those words during that ioctl, so retain the mapped staging
+buffer on the channel and grow it only when needed. Release it when the
+channel closes. Allocation failure leaves the previous buffer intact.
+
+Keep patch 0006's synchronous completion and all resource ordering intact.
+This change does not introduce asynchronous rendering or GPU fences.
+
+--- a/src/gallium/drivers/grate/drm/tegra_private.h
++++ b/src/gallium/drivers/grate/drm/tegra_private.h
+@@ -47,6 +47,11 @@
+     unsigned int version;
+     uint64_t context;
+ 
++    /* Classic submit copies command words before returning. Reuse the
++     * mapped staging BO rather than allocating one for every draw.
++     */
++    struct grate_bo *gather;
++
+     unsigned int cond_shift;
+ };
+ 
+--- a/src/gallium/drivers/grate/drm/channel.c
++++ b/src/gallium/drivers/grate/drm/channel.c
+@@ -143,6 +143,7 @@
+     if (err < 0)
+         return -errno;
+ 
++    grate_bo_unref(channel->gather);
+     free(channel);
+ 
+     return 0;
+--- a/src/gallium/drivers/grate/drm/job.c
++++ b/src/gallium/drivers/grate/drm/job.c
+@@ -179,9 +179,15 @@
+             return -ENOTSUP;
+     }
+ 
+-    gather = grate_bo_alloc(drm, align(words * 4, job->page_size), 0);
+-    if (!gather)
+-        return -ENOMEM;
++    unsigned int gather_size = align(words * 4, job->page_size);
++    if (!channel->gather || channel->gather->size < gather_size) {
++        gather = grate_bo_alloc(drm, gather_size, 0);
++        if (!gather)
++            return -ENOMEM;
++        grate_bo_unref(channel->gather);
++        channel->gather = gather;
++    }
++    gather = channel->gather;
+ 
+     err = grate_bo_map(gather, &map);
+     if (err < 0)
+@@ -280,8 +286,6 @@
+ out_relocs:
+     free(relocs);
+ out_bo:
+-    grate_bo_unref(gather);
+-
+     return err;
+ }
+ 

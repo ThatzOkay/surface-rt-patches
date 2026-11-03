@@ -1,0 +1,238 @@
+From: Surface RT bring-up
+Subject: [PATCH 10/10] grate: implement initial base-level 2D texture sampling
+
+Bind fragment sampler states and referenced views, emit linear texture
+addresses/descriptors, and compile TEX with interpolated coordinates and
+packed sample conversion. Keep sampler-only storage tightly packed because
+the texture engine derives stride from width. Initial path: direct varying
+2D coordinates, base level only, no general texture register allocation.
+
+--- a/src/gallium/drivers/grate/fp/fpir.h
++++ b/src/gallium/drivers/grate/fp/fpir.h
+@@ -148,7 +148,7 @@
+    struct list_head link;
+    // TODO: PSEQ
+    struct fp_sched mfu_sched;
+-   // TODO: TEX
++   uint32_t tex;
+    struct fp_sched alu_sched;
+    struct fp_dw_instr dw;
+ };
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -214,12 +214,71 @@
+    list_addtail(&inst->link, &fp->fp_instructions);
+ }
+ 
++/* The initial TEX path supports an interpolated vec2 coordinate and one
++ * base-level 2D sample. TEX returns packed fx10 channels in row registers 2/3.
++ */
++static void
++emit_TEX(struct grate_fp_shader *fp, const struct tgsi_full_instruction *tgsi)
++{
++   const struct tgsi_src_register *coord = &tgsi->Src[0].Register;
++   const struct tgsi_src_register *sampler = &tgsi->Src[1].Register;
++   const struct tgsi_dst_register *dst = &tgsi->Dst[0].Register;
++   assert(tgsi->Texture.Texture == TGSI_TEXTURE_2D);
++   assert(coord->File == TGSI_FILE_INPUT && !coord->Negate && !coord->Absolute);
++   assert(coord->SwizzleX == 0 && coord->SwizzleY == 1);
++   assert(sampler->File == TGSI_FILE_SAMPLER && sampler->Index < 16);
++
++   struct fp_instr *interp = CALLOC_STRUCT(fp_instr);
++   struct fp_mfu_instr *mfu = CALLOC_STRUCT(fp_mfu_instr);
++   list_inithead(&interp->link);
++   list_inithead(&mfu->link);
++   setup_interpolation(mfu);
++   for (unsigned i = 0; i < 2; i++) {
++      mfu->var[i].op = FP_VAR_OP_FP20;
++      mfu->var[i].tram_row = coord->Index;
++   }
++   fp->info.max_tram_row = MAX2(fp->info.max_tram_row, coord->Index + 1);
++   interp->mfu_sched.address = list_length(&fp->mfu_instructions);
++   interp->mfu_sched.num_instructions = 1;
++   list_addtail(&mfu->link, &fp->mfu_instructions);
++   list_addtail(&interp->link, &fp->fp_instructions);
++
++   struct fp_instr *sample = CALLOC_STRUCT(fp_instr);
++   list_inithead(&sample->link);
++   sample->tex = (1 << 10) | (1 << 5) | sampler->Index;
++   struct fp_alu_instr_packet *alu = CALLOC_STRUCT(fp_alu_instr_packet);
++   list_inithead(&alu->link);
++   unsigned slot = 0;
++   for (unsigned i = 0; i < 4; i++) {
++      if (!(dst->WriteMask & (1 << i))) continue;
++      unsigned channel = i;
++      struct fp_alu_src_operand src = {
++         .index = 2 + channel / 2,
++         .datatype = FP_DATATYPE_FIXED10,
++         .sub_reg_select_high = channel % 2,
++      };
++      alu->slots[slot++] = fp_alu_sMOV(fp_alu_dst(dst, i, tgsi->Instruction.Saturate), src);
++   }
++   sample->alu_sched.address = list_length(&fp->alu_instructions);
++   sample->alu_sched.num_instructions = 1;
++   list_addtail(&alu->link, &fp->alu_instructions);
++   if (dst->File == TGSI_FILE_OUTPUT) {
++      sample->dw.enable = true;
++      sample->dw.index = dst->Index + 1;
++      sample->dw.src_regs = FP_DW_REGS_R2_R3;
++   }
++   list_addtail(&sample->link, &fp->fp_instructions);
++}
++
+ static void
+ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *inst)
+ {
+    bool saturate = inst->Instruction.Saturate != 0;
+ 
+    switch (inst->Instruction.Opcode) {
++   case TGSI_OPCODE_TEX:
++      emit_TEX(fp, inst);
++      break;
+    case TGSI_OPCODE_MOV:
+       emit_vALU(fp, &inst->Dst[0].Register, saturate,
+                     &inst->Src[0].Register, NULL);
+--- a/src/gallium/drivers/grate/grate_context.c
++++ b/src/gallium/drivers/grate/grate_context.c
+@@ -7,6 +7,7 @@
+ #include "grate_common.h"
+ #include "grate_device.h"
+ #include "grate_context.h"
++#include "util/u_inlines.h"
+ #include "grate_draw.h"
+ #include "grate_program.h"
+ #include "grate_resource.h"
+@@ -73,6 +74,9 @@
+ {
+    struct grate_context *context = grate_context(pcontext);
+    grate_trace();
++
++   for (unsigned i = 0; i < 16; i++)
++      pipe_sampler_view_reference(&context->sampler_views[i], NULL);
+ 
+    slab_destroy_child(&context->transfer_pool);
+ 
+--- a/src/gallium/drivers/grate/grate_context.h
++++ b/src/gallium/drivers/grate/grate_context.h
+@@ -46,6 +46,9 @@
+    struct grate_vertex_shader_state *vshader;
+    struct grate_fragment_shader_state *fshader;
+ 
++   struct pipe_sampler_view *sampler_views[16];
++   struct pipe_sampler_state *samplers[16];
++
+    uint32_t no_scissor[3];
+    uint32_t viewport[10];
+    uint32_t guardband[4];
+--- a/src/gallium/drivers/grate/grate_program.c
++++ b/src/gallium/drivers/grate/grate_program.c
+@@ -259,10 +259,9 @@
+       PUSH(words[1]);
+    }
+ 
+-   // TODO: emit actual instructions here
+    PUSH(host1x_opcode_nonincr(REG_TGR3D_TEX_INST_DATA, num_fp_instrs));
+-   for (int i = 0; i < num_fp_instrs; ++i)
+-      PUSH(0x00000000);
++   list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link)
++      PUSH(instr->tex);
+ 
+    PUSH(host1x_opcode_nonincr(REG_TGR3D_ALU_REMAP_DATA, num_fp_instrs));
+    list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link) {
+--- a/src/gallium/drivers/grate/grate_resource.c
++++ b/src/gallium/drivers/grate/grate_resource.c
+@@ -186,7 +186,7 @@
+                          PIPE_BIND_SCANOUT | PIPE_BIND_DEPTH_STENCIL)) {
+       if (template->bind & PIPE_BIND_DEPTH_STENCIL)
+          resource->pitch = align(resource->pitch, 256);
+-      else
++      else if (template->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SCANOUT))
+          resource->pitch = align(resource->pitch, 32);
+ 
+       flags = DRM_TEGRA_GEM_CREATE_BOTTOM_UP;
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -181,7 +181,13 @@
+                         unsigned unbind_num_trailing_slots,
+                         struct pipe_sampler_view **views)
+ {
+-   grate_unimplemented();
++   struct grate_context *ctx = grate_context(pctx);
++   assert(shader == MESA_SHADER_FRAGMENT);
++   assert(start_slot + num_views + unbind_num_trailing_slots <= 16);
++   for (unsigned i = 0; i < num_views; i++)
++      pipe_sampler_view_reference(&ctx->sampler_views[start_slot + i], views ? views[i] : NULL);
++   for (unsigned i = 0; i < unbind_num_trailing_slots; i++)
++      pipe_sampler_view_reference(&ctx->sampler_views[start_slot + num_views + i], NULL);
+ }
+ 
+ static void
+@@ -279,7 +285,11 @@
+                           unsigned start_slot, unsigned num_samplers,
+                           void **samplers)
+ {
+-   grate_unimplemented();
++   struct grate_context *ctx = grate_context(pcontext);
++   assert(shader == MESA_SHADER_FRAGMENT);
++   assert(start_slot + num_samplers <= 16);
++   for (unsigned i = 0; i < num_samplers; i++)
++      ctx->samplers[start_slot + i] = samplers ? samplers[i] : NULL;
+ }
+ 
+ static void
+@@ -714,6 +724,47 @@
+    grate_stream_push_words(stream, ptrp, linker_insts, ARRAY_SIZE(linker_insts), 0);
+ }
+ 
++/* Base-level linear 2D textures. The texture engine derives row stride from
++ * width; sampler-only resources therefore have tightly packed rows.
++ */
++static void
++emit_textures(struct grate_context *ctx, uint32_t **ptrp)
++{
++   struct grate_stream *stream = &ctx->gr3d->stream;
++   uint32_t *ptr = *ptrp;
++   for (unsigned i = 0; i < 16; i++) {
++      struct pipe_sampler_view *view = ctx->sampler_views[i];
++      struct pipe_sampler_state *sampler = ctx->samplers[i];
++      if (!view || !sampler)
++         continue;
++      struct grate_resource *res = grate_resource(view->texture);
++      assert(view->target == PIPE_TEXTURE_2D && view->u.tex.first_level == 0);
++      assert(view->u.tex.last_level == 0 && sampler->min_mip_filter == PIPE_TEX_MIPFILTER_NONE);
++      assert(res->pitch == res->b.width0 * util_format_get_blocksize(res->b.format));
++      uint32_t lo = TGR3D_TEX_TEXDESC_LO_SURF_FORMAT(res->format);
++      if (sampler->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE) lo |= 2;
++      else assert(sampler->wrap_s == PIPE_TEX_WRAP_REPEAT);
++      if (sampler->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE) lo |= 1;
++      else assert(sampler->wrap_t == PIPE_TEX_WRAP_REPEAT);
++      if (sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR) lo |= TGR3D_TEX_TEXDESC_LO_LERP_MIN;
++      if (sampler->mag_img_filter == PIPE_TEX_FILTER_LINEAR) lo |= TGR3D_TEX_TEXDESC_LO_LERP_MAG;
++      uint32_t hi = 0x80; /* base level only */
++      if (util_is_power_of_two_or_zero(res->b.width0) && util_is_power_of_two_or_zero(res->b.height0)) {
++         hi |= TGR3D_TEX_TEXDESC_HI_LOG2_WIDTH(util_logbase2(res->b.width0));
++         hi |= TGR3D_TEX_TEXDESC_HI_LOG2_HEIGHT(util_logbase2(res->b.height0));
++      } else {
++         hi |= 0x40 | TGR3D_TEX_TEXDESC_HI_WIDTH(res->b.width0) |
++                      TGR3D_TEX_TEXDESC_HI_HEIGHT(res->b.height0);
++      }
++      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_TEX_TEXADDR(i), 1));
++      grate_stream_push_reloc(stream, &ptr, res->bo, 0);
++      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_TEX_TEXDESC_LO(i), 2));
++      GRATE_PUSHBUF_WORD(ptr, lo);
++      GRATE_PUSHBUF_WORD(ptr, hi);
++   }
++   *ptrp = ptr;
++}
++
+ void
+ grate_emit_state(struct grate_context *context, uint32_t **ptrp)
+ {
+@@ -725,6 +776,7 @@
+    emit_attribs(context, ptrp);
+    emit_vs_uniforms(context, ptrp);
+    emit_program(context, ptrp);
++   emit_textures(context, ptrp);
+ }
+ 
+ void
