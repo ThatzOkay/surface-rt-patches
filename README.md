@@ -54,7 +54,7 @@ Sub-series:
 Bluetooth needs the SDIO+UART combo firmware `14.62.17.p215` installed as
 `/lib/firmware/mrvl/sd8797_uapsta.bin` (or `/usr/lib/firmware/updates/mrvl/`), together with patch
 0027 (`mwifiex_sdio.force_legacy_scan=1`), PD1 held LOW (patch 0028) and an H4 attach at 3 Mbaud with
-RTS/CTS. Booting the stock `p59` firmware instead (user test, 2026-11-03) left UART Bluetooth non-functional, so p215 is required for Bluetooth.
+RTS/CTS. Booting the stock `p59` firmware instead (user test, 2026-11-03) left UART Bluetooth non-functional while Wi-Fi worked, so p215 is required for Bluetooth.
 
 The image is Marvell/Microsoft firmware taken from the Surface RT Windows driver, and extracting it
 does not give a redistribution licence, so it is **not in this repository**. Instead,
