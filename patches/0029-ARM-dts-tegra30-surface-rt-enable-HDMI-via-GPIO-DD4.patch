@@ -1,0 +1,69 @@
+Subject: [PATCH] ARM: dts: tegra30: surface-rt: enable HDMI via GPIO DD4
+
+HDMI never came up under Linux: the connector's HPD pin (PN7) stayed low and
+reads on the DDC bus returned 128 zero bytes, with no NACK. Windows RT drives
+PDD4 (GPIO 236) high whenever HDMI works. Comparing full GPIO captures taken
+under Windows RT and Linux with the same monitor, PDD4 was one of several
+pins Windows holds high that Linux leaves unconfigured. Driving each of
+those pins high in turn under Linux, only PDD4 changed anything: PN7 went
+high, the EDID read returned a valid header and data, DRM reported the
+connector as connected with its 1080p modes, and GNOME extended onto the
+monitor at 1920x1080@60. Unplugging and replugging the cable then toggled
+PN7 and the connector state as expected.
+
+Describe PDD4 as a fixed regulator and give it to the HDMI connector as
+`hdmi-pwr-supply`, which display-connector enables when it probes, before
+any hotplug detection. Configure the pad as an untristated output with input
+disabled, which is the pad state observed while it worked.
+
+What PDD4 physically switches (connector +5 V, a level shifter, or
+something else) has not been measured, so no voltage or input supply is
+described. This does not touch the hdmi node's own TODO supplies.
+
+---
+--- a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
++++ b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
+@@ -94,6 +94,15 @@
+ 				nvidia,enable-input = <TEGRA_PIN_ENABLE>;
+ 			};
+ 
++			/* HDMI power enable (PDD4): output, so the pad must not be tristated */
++			hdmi-power {
++				nvidia,pins = "pex_l1_prsnt_n_pdd4";
++				nvidia,function = "pcie";
++				nvidia,pull = <TEGRA_PIN_PULL_NONE>;
++				nvidia,tristate = <TEGRA_PIN_DISABLE>;
++				nvidia,enable-input = <TEGRA_PIN_DISABLE>;
++			};
++
+ 			vol-keys {
+ 				nvidia,pins = "kb_row14_ps6", //down
+ 					      "kb_row15_ps7"; //up
+@@ -606,6 +615,7 @@
+ 
+ 		hpd-gpios = <&gpio TEGRA_GPIO(N, 7) GPIO_ACTIVE_HIGH>;
+ 		ddc-i2c-bus = <&hdmi_ddc>;
++		hdmi-pwr-supply = <&hdmi_pwr_reg>;
+ 
+ 		port {
+ 			connector_in: endpoint {
+@@ -831,6 +841,19 @@
+ 		vin-supply = <&vdd_5v0_sys>;
+ 	};
+ 
++	/*
++	 * Windows RT drives PDD4 high whenever HDMI works. With it low, HPD stays
++	 * low and the DDC bus returns all-zero reads. What PDD4 physically
++	 * switches (connector +5 V, a level shifter) is not known, so no voltage
++	 * or input supply is described.
++	 */
++	hdmi_pwr_reg: regulator-hdmi {
++		compatible = "regulator-fixed";
++		regulator-name = "hdmi_pwr";
++		gpio = <&gpio TEGRA_GPIO(DD, 4) GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
+ 	vdd_pnl: regulator-panel {
+ 		compatible = "regulator-fixed";
+ 		regulator-name = "vdd_panel";

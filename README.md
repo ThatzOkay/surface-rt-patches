@@ -24,7 +24,7 @@ Measured on one device, 2026-10-29 to 2026-11-03.
 | Front camera | raw Bayer capture works (patches 0003–0022); the rear camera has never answered |
 | H.264 decode, 2D engine | work for a subset, from userspace |
 | Microphone (on-board digital) | not working; patches 0023 and 0024 are written, the mic does not appear in Phosh settings |
-| HDMI output | not working under APX-booted Linux (works in Windows RT) |
+| HDMI output | works at 1920x1080@60 once GPIO PDD4 is driven high (confirmed at runtime with a userspace register write, with hotplug); patch 0029 does this from the devicetree and has not been booted yet |
 | Light, motion and temperature sensors | enumerate over I2C/IIO; cover response untested |
 
 ## `patches/` (kernel)
@@ -41,6 +41,7 @@ Apply in numeric order with `patch -p1` to the kernel tree above.
 | `0026-ARM-dts-tegra30-surface-rt-configure-Bluetooth-UARTC-pins.patch` | Bluetooth: UARTC TX/RX/RTS/CTS pinmux. |
 | `0027-wifi-mwifiex-sdio-add-opt-in-legacy-scan.patch` | `mwifiex_sdio.force_legacy_scan=1`: needed for scanning with the combo firmware below. |
 | `0028-ARM-dts-tegra30-surface-rt-hold-Bluetooth-PD1-active.patch` | Bluetooth: PD1 as a kernel-owned output-low GPIO hog. |
+| `0029-ARM-dts-tegra30-surface-rt-enable-HDMI-via-GPIO-DD4.patch` | HDMI: PDD4 as a fixed regulator, the connector's `hdmi-pwr-supply`. Windows RT holds it high; with it low HPD stays low and DDC reads return zeros. Not yet booted. |
 
 Sub-series:
 
