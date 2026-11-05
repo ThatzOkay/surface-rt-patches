@@ -30,6 +30,27 @@ zfail) passes all cases; the cube regression gives the same faces as before (5 w
 Tzompantli (stock Alpine builds, without their former no-depth-stencil patches) start and draw on it. Limits: no sampling of Z24 textures; stencil is dropped with more than one
 colour buffer; `glColorMask` is still ignored by the driver (a stencil-only pass paints colour too).
 
+Patches 0027-0030 (2026-11-05) are on top of 0026 and are what made Epitaph's panel text and icons render (dual-source blending).
+
+Patch [0027-grate-keep-values-alive-across-fetches-add-SNE-and-RCP-drop-dead-code.patch](0027-grate-keep-values-alive-across-fetches-add-SNE-and-RCP-drop-dead-code.patch)
+fixes the fragment compiler, found with a ladder of small shaders around a texture fetch: a varying read after a fetch (tile-constant garbage), SNE, RCP through
+the SFU, a TEX coordinate copy and dead code. It also settles why global registers looked broken: R4 and up and the globals are storage of four lanes shared by every pixel in
+flight, so a program that needs one runs with `MAX_OUT 4` (about 25x slower per pixel, only that program). The earlier "MAX_OUT <= 8 is enough" was measured with flat values and
+is wrong.
+
+Patch [0028-grate-blend-with-any-factor-pair-and-equation-and-honour-the-colormask.patch](0028-grate-blend-with-any-factor-pair-and-equation-and-honour-the-colormask.patch)
+generates the blend epilogue from the blend state (`fp/blend.c`, table driven; the top of the file says how to add a factor or an equation): ADD, SUBTRACT, REVERSE_SUBTRACT,
+ten factors, separate rgb and alpha, and the colormask (also with blending off). 318 of 318 cases match a CPU reference. Not yet: constant colour factors, SRC_ALPHA_SATURATE, MIN/MAX,
+logic ops.
+
+Patch [0029-grate-dual-source-blending-in-two-passes.patch](0029-grate-dual-source-blending-in-two-passes.patch)
+implements `GL_EXT_blend_func_extended`. The epilogue cannot hold src0, src1 and the destination at once, so a draw is split into up to two single-source blend passes
+(`dst * Fd`, then `+ src0 * Fs`), exact for non-overlapping fragments such as text. Epitaph's text shader renders exactly in both glyph paths and the pulled-down panel shows its text and
+icons on the tablet. Measured (1024x1024 draw): plain texture 9.7 ms, blended 16 ms, dual source 339 ms.
+
+Patch [0030-grate-format-the-lines-added-since-the-fork-to-the-Mesa-style.patch](0030-grate-format-the-lines-added-since-the-fork-to-the-Mesa-style.patch)
+wraps the lines added by the earlier patches to 78 columns in the Mesa style (formatting only; `drm/` keeps its libdrm style).
+
 Against [`github.com/external-mirrors/libre-tegra-mesa`](https://github.com/external-mirrors/libre-tegra-mesa),
 branch `grate-26.2.3` — a current mirror of `codeberg.org/libre-tegra/mesa` (which 404s;
 the longer research notes are kept in a private repo). Not a

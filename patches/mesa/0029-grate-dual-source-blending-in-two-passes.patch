@@ -1,0 +1,782 @@
+From d1941263eead9c72d945a65d29c0334a60ad6f4d Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Thu, 5 Nov 2026 23:30:36 +0100
+Subject: [PATCH 29/30] grate: dual-source blending
+ (GL_EXT_blend_func_extended) in two passes
+
+Expose max_dual_source_render_targets = 1 (the assignment sat inside a
+commented-out block and never took effect) and implement the extension.
+
+The epilogue cannot hold src0, src1 and the destination at once: a
+per-pixel value in a global register does not survive the destination read
+and R0-R3 hold eight FX10 values. So a dual-source draw is drawn in up to
+two passes, each a single-source blend that the existing epilogue handles
+(fp/blend.h):
+
+  dst pass:  colour = src1,            blend ZERO, Fd'      -> dst * Fd
+  src pass:  colour = src0 * Fs(src1), blend ONE, ONE       -> + src0 * Fs
+
+where Fd' is Fd written with the colour (SRC1_COLOR becomes SRC_COLOR).
+A factor that is ONE (dst) or ZERO (src) skips its pass. This is exact as
+long as the fragments of one draw do not overlap; fine for text. Supported:
+equations ADD, factors ZERO, ONE and the four SRC1 ones.
+
+The fragment compiler grew output modes (enum grate_fp_output_mode): store
+output 0 as written, output 1, or output 0 times a factor made of output 1.
+grate_compile_fs() is the old body of grate_create_fs_state() so a pass can
+compile the same tokens differently, and the variants are cached on the
+program (grate_fragment_dual_variant()). With a single output stored the
+dead code of the other output disappears before allocation.
+
+grate_draw_vbo() draws the passes by calling itself once per pass with
+the pass's program and blend key. Epitaph's text shader (colour and plain
+glyphs) renders exactly.
+---
+ src/gallium/drivers/grate/fp/blend.c       | 112 ++++++++++++++++
+ src/gallium/drivers/grate/fp/blend.h       |  41 ++++++
+ src/gallium/drivers/grate/fp/tgsi.c        | 144 +++++++++++++++++++--
+ src/gallium/drivers/grate/grate_compiler.h |  39 +++++-
+ src/gallium/drivers/grate/grate_context.h  |   8 ++
+ src/gallium/drivers/grate/grate_draw.c     |  47 +++++++
+ src/gallium/drivers/grate/grate_program.c  | 120 ++++++++++++-----
+ src/gallium/drivers/grate/grate_program.h  |  12 ++
+ src/gallium/drivers/grate/grate_screen.c   |   1 +
+ src/gallium/drivers/grate/grate_state.c    |  18 ++-
+ 10 files changed, 494 insertions(+), 48 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/fp/blend.c b/src/gallium/drivers/grate/fp/blend.c
+index 78c62ccce1b..5f58085b292 100644
+--- a/src/gallium/drivers/grate/fp/blend.c
++++ b/src/gallium/drivers/grate/fp/blend.c
+@@ -1,3 +1,5 @@
++#include <string.h>
++
+ #include "util/macros.h"
+ 
+ #include "blend.h"
+@@ -352,3 +354,113 @@ grate_fp_blend_alu(uint32_t key,
+ 
+    return num_packets;
+ }
++
++static bool
++factor_is_dual(enum pipe_blendfactor factor)
++{
++   switch (factor) {
++   case PIPE_BLENDFACTOR_SRC1_COLOR:
++   case PIPE_BLENDFACTOR_SRC1_ALPHA:
++   case PIPE_BLENDFACTOR_INV_SRC1_COLOR:
++   case PIPE_BLENDFACTOR_INV_SRC1_ALPHA:
++      return true;
++   default:
++      return false;
++   }
++}
++
++bool
++grate_fp_blend_is_dual(const struct pipe_rt_blend_state *rt)
++{
++   return rt->blend_enable && (factor_is_dual(rt->rgb_src_factor) ||
++                               factor_is_dual(rt->alpha_src_factor) ||
++                               factor_is_dual(rt->rgb_dst_factor) ||
++                               factor_is_dual(rt->alpha_dst_factor));
++}
++
++/* The factors a pass may use, one row each. `colour` and `alpha` are how
++ * the factor reads when the colour channels / the alpha channel are blended
++ * against the stored colour (src1 is stored as the colour in the dst pass).
++ */
++static const struct {
++   enum pipe_blendfactor factor;
++   enum grate_fp_dual_factor dual;
++   enum pipe_blendfactor colour;
++   enum pipe_blendfactor alpha;
++} dual_factors[] = {
++   {PIPE_BLENDFACTOR_ZERO, GRATE_FP_DUAL_ZERO, PIPE_BLENDFACTOR_ZERO,
++    PIPE_BLENDFACTOR_ZERO},
++   {PIPE_BLENDFACTOR_ONE, GRATE_FP_DUAL_ONE, PIPE_BLENDFACTOR_ONE,
++    PIPE_BLENDFACTOR_ONE},
++   {PIPE_BLENDFACTOR_SRC1_COLOR, GRATE_FP_DUAL_SRC1_COLOR,
++    PIPE_BLENDFACTOR_SRC_COLOR, PIPE_BLENDFACTOR_SRC_ALPHA},
++   {PIPE_BLENDFACTOR_INV_SRC1_COLOR, GRATE_FP_DUAL_INV_SRC1_COLOR,
++    PIPE_BLENDFACTOR_INV_SRC_COLOR, PIPE_BLENDFACTOR_INV_SRC_ALPHA},
++   {PIPE_BLENDFACTOR_SRC1_ALPHA, GRATE_FP_DUAL_SRC1_ALPHA,
++    PIPE_BLENDFACTOR_SRC_ALPHA, PIPE_BLENDFACTOR_SRC_ALPHA},
++   {PIPE_BLENDFACTOR_INV_SRC1_ALPHA, GRATE_FP_DUAL_INV_SRC1_ALPHA,
++    PIPE_BLENDFACTOR_INV_SRC_ALPHA, PIPE_BLENDFACTOR_INV_SRC_ALPHA},
++};
++
++static bool
++dual_factor_lookup(enum pipe_blendfactor factor, unsigned *index)
++{
++   for (unsigned i = 0; i < ARRAY_SIZE(dual_factors); i++) {
++      if (dual_factors[i].factor == factor) {
++         *index = i;
++         return true;
++      }
++   }
++   return false;
++}
++
++bool
++grate_fp_blend_dual_plan(const struct pipe_rt_blend_state *rt,
++                         struct grate_fp_dual_plan *plan)
++{
++   unsigned src_rgb, src_alpha, dst_rgb, dst_alpha;
++
++   memset(plan, 0, sizeof(*plan));
++
++   /* Only sums: both passes add their term. */
++   if (rt->rgb_func != PIPE_BLEND_ADD || rt->alpha_func != PIPE_BLEND_ADD)
++      return false;
++
++   if (!dual_factor_lookup(rt->rgb_src_factor, &src_rgb) ||
++       !dual_factor_lookup(rt->alpha_src_factor, &src_alpha) ||
++       !dual_factor_lookup(rt->rgb_dst_factor, &dst_rgb) ||
++       !dual_factor_lookup(rt->alpha_dst_factor, &dst_alpha))
++      return false;
++
++   /* dst * Fd, unless Fd is one */
++   if (dual_factors[dst_rgb].factor != PIPE_BLENDFACTOR_ONE ||
++       dual_factors[dst_alpha].factor != PIPE_BLENDFACTOR_ONE) {
++      struct grate_fp_dual_pass *pass = &plan->pass[plan->num_passes++];
++
++      pass->output.mode = GRATE_FP_OUTPUT_SRC1;
++      pass->rt = *rt;
++      pass->rt.rgb_func = pass->rt.alpha_func = PIPE_BLEND_ADD;
++      pass->rt.rgb_src_factor = pass->rt.alpha_src_factor =
++         PIPE_BLENDFACTOR_ZERO;
++      pass->rt.rgb_dst_factor = dual_factors[dst_rgb].colour;
++      pass->rt.alpha_dst_factor = dual_factors[dst_alpha].alpha;
++   }
++
++   /* + src0 * Fs, unless Fs is zero */
++   if (dual_factors[src_rgb].factor != PIPE_BLENDFACTOR_ZERO ||
++       dual_factors[src_alpha].factor != PIPE_BLENDFACTOR_ZERO) {
++      struct grate_fp_dual_pass *pass = &plan->pass[plan->num_passes++];
++
++      pass->output.mode = GRATE_FP_OUTPUT_SRC0_TIMES_FACTOR;
++      pass->output.factor[0] = dual_factors[src_rgb].dual;
++      pass->output.factor[1] = dual_factors[src_alpha].dual;
++      pass->rt = *rt;
++      pass->rt.rgb_func = pass->rt.alpha_func = PIPE_BLEND_ADD;
++      pass->rt.rgb_src_factor = pass->rt.alpha_src_factor =
++         PIPE_BLENDFACTOR_ONE;
++      pass->rt.rgb_dst_factor = pass->rt.alpha_dst_factor =
++         PIPE_BLENDFACTOR_ONE;
++   }
++
++   return true;
++}
+diff --git a/src/gallium/drivers/grate/fp/blend.h b/src/gallium/drivers/grate/fp/blend.h
+index c34947d4c25..c328a89fdeb 100644
+--- a/src/gallium/drivers/grate/fp/blend.h
++++ b/src/gallium/drivers/grate/fp/blend.h
+@@ -5,6 +5,8 @@
+ 
+ #include "pipe/p_state.h"
+ 
++#include "grate_compiler.h"
++
+ /* Blend epilogue of the fragment program, see blend.c. */
+ 
+ #define GRATE_FP_BLEND_MAX_PACKETS 3
+@@ -26,4 +28,43 @@ uint32_t grate_fp_blend_key(const struct pipe_rt_blend_state *rt);
+ unsigned grate_fp_blend_alu(uint32_t key,
+                             uint32_t words[GRATE_FP_BLEND_MAX_PACKETS * 8]);
+ 
++/**
++ * Dual-source blending (GL_EXT_blend_func_extended), where factors come from
++ * the fragment program's second output, src1:
++ *
++ *    out = src0 * Fs + dst * Fd         with Fs, Fd made of src1
++ *
++ * The epilogue cannot hold src0, src1 and the destination at once (a
++ * per-pixel value in a global register does not survive the destination
++ * read, and R0-R3 hold eight FX10 values), so the draw is split in
++ * passes that each blend one colour, which is exact as long as the
++ * fragments of one draw do not overlap:
++ *
++ *    pass dst:  colour = src1,           blend ZERO, Fd'      -> dst * Fd
++ *    pass src:  colour = src0 * Fs(src1), blend ONE, ONE      -> + src0 * Fs
++ *
++ * where Fd' is Fd written with the colour (SRC1_COLOR -> SRC_COLOR).
++ */
++#define GRATE_FP_DUAL_MAX_PASSES 2
++
++struct grate_fp_dual_pass {
++   struct grate_fp_output output; /* what the fragment program stores */
++   struct pipe_rt_blend_state rt; /* how that colour is blended */
++};
++
++struct grate_fp_dual_plan {
++   unsigned num_passes;
++   struct grate_fp_dual_pass pass[GRATE_FP_DUAL_MAX_PASSES];
++};
++
++/** True if a factor of the state comes from src1. */
++bool grate_fp_blend_is_dual(const struct pipe_rt_blend_state *rt);
++
++/**
++ * Splits a dual-source state of render target 0 in passes. Returns false
++ * for a combination that has no such split (the caller logs the state).
++ */
++bool grate_fp_blend_dual_plan(const struct pipe_rt_blend_state *rt,
++                              struct grate_fp_dual_plan *plan);
++
+ #endif
+diff --git a/src/gallium/drivers/grate/fp/tgsi.c b/src/gallium/drivers/grate/fp/tgsi.c
+index 809764923d2..703c8b03983 100644
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -1131,9 +1131,119 @@ forward_tex_coord(struct tgsi_full_instruction *code, unsigned count)
+    return count;
+ }
+ 
++/* Append the instructions for dual-source output modes (see
++ * enum grate_fp_output_mode). t0 and t1 are the temporaries that hold
++ * output 0 and 1. Returns the temporary to store as the colour. */
++static bool
++build_dual_output(struct grate_fp_shader *fp,
++                  struct util_dynarray *instructions,
++                  const struct grate_fp_output *output,
++                  const int *output_temps, const unsigned *output_masks,
++                  int *result)
++{
++   if (output_temps[1] < 0) {
++      fprintf(stderr, "GRATE FRAG: dual-source blending but the program "
++                      "has no second output\n");
++      fp->allocation_failed = true;
++      return false;
++   }
++
++   if (output->mode == GRATE_FP_OUTPUT_SRC1) {
++      *result = output_temps[1];
++      return true;
++   }
++
++   assert(fp->num_temporaries < GRATE_FP_MAX_TEMPS);
++   unsigned factor_temp = fp->num_temporaries++;
++   unsigned one_comp, zero_comp;
++   unsigned one_imm = find_immediate(fp, 1.0f, &one_comp);
++   unsigned zero_imm = find_immediate(fp, 0.0f, &zero_comp);
++
++   /* group 0: the colour channels, group 1: alpha */
++   for (unsigned group = 0; group < 2; group++) {
++      enum grate_fp_dual_factor factor = output->factor[group];
++      unsigned mask = group ? TGSI_WRITEMASK_W : TGSI_WRITEMASK_XYZ;
++      struct tgsi_full_instruction mov = {0};
++
++      mov.Instruction.Opcode = TGSI_OPCODE_MOV;
++      mov.Instruction.NumDstRegs = 1;
++      mov.Instruction.NumSrcRegs = 1;
++      mov.Dst[0].Register.File = TGSI_FILE_TEMPORARY;
++      mov.Dst[0].Register.Index = factor_temp;
++      mov.Dst[0].Register.WriteMask = mask;
++
++      bool invert = factor == GRATE_FP_DUAL_INV_SRC1_COLOR ||
++                    factor == GRATE_FP_DUAL_INV_SRC1_ALPHA;
++      if (factor == GRATE_FP_DUAL_ZERO || factor == GRATE_FP_DUAL_ONE) {
++         unsigned comp = factor == GRATE_FP_DUAL_ONE ? one_comp : zero_comp;
++
++         mov.Src[0].Register.File = TGSI_FILE_IMMEDIATE;
++         mov.Src[0].Register.Index =
++            factor == GRATE_FP_DUAL_ONE ? one_imm : zero_imm;
++         set_src_swizzle(&mov.Src[0].Register, comp, comp, comp, comp);
++      } else {
++         mov.Src[0].Register.File = TGSI_FILE_TEMPORARY;
++         mov.Src[0].Register.Index = output_temps[1];
++         if (factor == GRATE_FP_DUAL_SRC1_COLOR ||
++             factor == GRATE_FP_DUAL_INV_SRC1_COLOR)
++            set_src_swizzle(&mov.Src[0].Register, TGSI_SWIZZLE_X,
++                            TGSI_SWIZZLE_Y, TGSI_SWIZZLE_Z, TGSI_SWIZZLE_W);
++         else
++            set_src_swizzle(&mov.Src[0].Register, TGSI_SWIZZLE_W,
++                            TGSI_SWIZZLE_W, TGSI_SWIZZLE_W, TGSI_SWIZZLE_W);
++      }
++      util_dynarray_append_typed(instructions, struct tgsi_full_instruction,
++                                 mov);
++
++      if (invert) {
++         /* factor = 1 - factor */
++         struct tgsi_full_instruction add = {0};
++
++         add.Instruction.Opcode = TGSI_OPCODE_ADD;
++         add.Instruction.NumDstRegs = 1;
++         add.Instruction.NumSrcRegs = 2;
++         add.Dst[0] = mov.Dst[0];
++         add.Src[0].Register.File = TGSI_FILE_IMMEDIATE;
++         add.Src[0].Register.Index = one_imm;
++         set_src_swizzle(&add.Src[0].Register, one_comp, one_comp, one_comp,
++                         one_comp);
++         add.Src[1].Register.File = TGSI_FILE_TEMPORARY;
++         add.Src[1].Register.Index = factor_temp;
++         add.Src[1].Register.Negate = 1;
++         set_src_swizzle(&add.Src[1].Register, TGSI_SWIZZLE_X, TGSI_SWIZZLE_Y,
++                         TGSI_SWIZZLE_Z, TGSI_SWIZZLE_W);
++         util_dynarray_append_typed(instructions,
++                                    struct tgsi_full_instruction, add);
++      }
++   }
++
++   /* factor = src0 * factor */
++   struct tgsi_full_instruction mul = {0};
++
++   mul.Instruction.Opcode = TGSI_OPCODE_MUL;
++   mul.Instruction.NumDstRegs = 1;
++   mul.Instruction.NumSrcRegs = 2;
++   mul.Dst[0].Register.File = TGSI_FILE_TEMPORARY;
++   mul.Dst[0].Register.Index = factor_temp;
++   mul.Dst[0].Register.WriteMask = TGSI_WRITEMASK_XYZW;
++   mul.Src[0].Register.File = TGSI_FILE_TEMPORARY;
++   mul.Src[0].Register.Index = output_temps[0];
++   mul.Src[1].Register.File = TGSI_FILE_TEMPORARY;
++   mul.Src[1].Register.Index = factor_temp;
++   for (unsigned i = 0; i < 2; i++) {
++      set_src_swizzle(&mul.Src[i].Register, TGSI_SWIZZLE_X, TGSI_SWIZZLE_Y,
++                      TGSI_SWIZZLE_Z, TGSI_SWIZZLE_W);
++   }
++   util_dynarray_append_typed(instructions, struct tgsi_full_instruction,
++                              mul);
++
++   *result = factor_temp;
++   return true;
++}
++
+ void
+-grate_tgsi_to_fp(struct grate_fp_shader *fp,
+-                 struct tgsi_parse_context *tgsi)
++grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
++                 const struct grate_fp_output *output)
+ {
+    list_inithead(&fp->fp_instructions);
+    list_inithead(&fp->alu_instructions);
+@@ -1205,22 +1315,32 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp,
+          dst->Index = output_temps[index];
+       }
+    }
+-   for (unsigned out = 0; out < 16; out++) {
+-      if (output_temps[out] < 0) continue;
++   /* One colour is stored: output 0, or what a dual-source pass makes of
++    * the two outputs. */
++   int stored_temp = output_temps[0];
++   if (output->mode != GRATE_FP_OUTPUT_SRC0 &&
++       !build_dual_output(fp, &instructions, output, output_temps,
++                          output_masks, &stored_temp)) {
++      util_dynarray_fini(&instructions);
++      return;
++   }
++   if (stored_temp >= 0) {
+       struct tgsi_full_instruction store = {0};
++
+       store.Instruction.Opcode = TGSI_OPCODE_MOV;
+       store.Instruction.NumDstRegs = 1;
+       store.Instruction.NumSrcRegs = 1;
+       store.Dst[0].Register.File = TGSI_FILE_OUTPUT;
+-      store.Dst[0].Register.Index = out;
+-      store.Dst[0].Register.WriteMask = output_masks[out];
++      store.Dst[0].Register.Index = 0;
++      store.Dst[0].Register.WriteMask = output->mode == GRATE_FP_OUTPUT_SRC1
++                                           ? output_masks[1]
++                                           : output_masks[0];
+       store.Src[0].Register.File = TGSI_FILE_TEMPORARY;
+-      store.Src[0].Register.Index = output_temps[out];
+-      store.Src[0].Register.SwizzleX = TGSI_SWIZZLE_X;
+-      store.Src[0].Register.SwizzleY = TGSI_SWIZZLE_Y;
+-      store.Src[0].Register.SwizzleZ = TGSI_SWIZZLE_Z;
+-      store.Src[0].Register.SwizzleW = TGSI_SWIZZLE_W;
+-      util_dynarray_append_typed(&instructions, struct tgsi_full_instruction, store);
++      store.Src[0].Register.Index = stored_temp;
++      set_src_swizzle(&store.Src[0].Register, TGSI_SWIZZLE_X, TGSI_SWIZZLE_Y,
++                      TGSI_SWIZZLE_Z, TGSI_SWIZZLE_W);
++      util_dynarray_append_typed(&instructions, struct tgsi_full_instruction,
++                                 store);
+    }
+    assert(fp->num_temporaries < GRATE_FP_MAX_TEMPS);
+    unsigned count = util_dynarray_num_elements(&instructions, struct tgsi_full_instruction);
+diff --git a/src/gallium/drivers/grate/grate_compiler.h b/src/gallium/drivers/grate/grate_compiler.h
+index 95d88f2dbb9..a085ea88510 100644
+--- a/src/gallium/drivers/grate/grate_compiler.h
++++ b/src/gallium/drivers/grate/grate_compiler.h
+@@ -59,7 +59,7 @@ struct grate_fp_shader {
+    bool texture_rows;
+    bool allocation_failed;
+    /* a value lives in a global register (16-23): only valid while the
+-    * sequencer has few pixels in flight, see grate_create_fs_state() */
++    * sequencer has few pixels in flight, see grate_compile_fs() */
+    bool uses_globals;
+    float immediates[GRATE_FP_MAX_IMMEDIATES][4];
+    unsigned num_immediates;
+@@ -69,10 +69,43 @@ struct grate_fp_shader {
+    struct grate_fp_info info;
+ };
+ 
++/**
++ * Which fragment output a fragment program stores as its colour. Dual-source
++ * blending (fp/blend.c) splits a draw into passes that each store one value
++ * computed from the shader's two outputs, src0 (output 0) and src1
++ * (output 1).
++ */
++enum grate_fp_output_mode {
++   /* output 0, as the application wrote it */
++   GRATE_FP_OUTPUT_SRC0,
++   /* output 1 */
++   GRATE_FP_OUTPUT_SRC1,
++   /* output 0 * factor(output 1), see grate_fp_dual_factor */
++   GRATE_FP_OUTPUT_SRC0_TIMES_FACTOR,
++};
++
++/* A blend factor made of src1 (the second fragment output). */
++enum grate_fp_dual_factor {
++   GRATE_FP_DUAL_ZERO,
++   GRATE_FP_DUAL_ONE,
++   GRATE_FP_DUAL_SRC1_COLOR,
++   GRATE_FP_DUAL_INV_SRC1_COLOR,
++   GRATE_FP_DUAL_SRC1_ALPHA,
++   GRATE_FP_DUAL_INV_SRC1_ALPHA,
++};
++
++struct grate_fp_output {
++   enum grate_fp_output_mode mode;
++   /* GRATE_FP_OUTPUT_SRC0_TIMES_FACTOR: the factor of the colour channels
++    * and of the alpha channel */
++   enum grate_fp_dual_factor factor[2];
++};
++
+ void
+ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi);
+ 
+-void
+-grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi);
++void grate_tgsi_to_fp(struct grate_fp_shader *fp,
++                      struct tgsi_parse_context *tgsi,
++                      const struct grate_fp_output *output);
+ 
+ #endif
+diff --git a/src/gallium/drivers/grate/grate_context.h b/src/gallium/drivers/grate/grate_context.h
+index 6ca414938e2..ffb540106e2 100644
+--- a/src/gallium/drivers/grate/grate_context.h
++++ b/src/gallium/drivers/grate/grate_context.h
+@@ -12,6 +12,8 @@
+ #include "grate_stream.h"
+ #include "tgr_3d.xml.h"
+ 
++#include "fp/blend.h"
++
+ /* Hardware surface slot of the stencil plane (slot 0 is depth, colour output i is slot i + 1). */
+ #define GRATE_STENCIL_SLOT 2
+ 
+@@ -48,6 +50,12 @@ struct grate_context {
+ 
+    uint32_t blend_key; /* grate_fp_blend_key(), 0 = not blending */
+ 
++   /* Dual-source blending is drawn in passes, see fp/blend.h. */
++   bool blend_dual;
++   struct grate_fp_dual_plan dual_plan;
++   uint32_t dual_keys[GRATE_FP_DUAL_MAX_PASSES];
++   unsigned dual_pass; /* 1-based pass being drawn, 0 = none */
++
+    struct grate_zsa_state *zsa;
+    struct pipe_stencil_ref stencil_ref;
+    struct grate_rasterizer_state *rast;
+diff --git a/src/gallium/drivers/grate/grate_draw.c b/src/gallium/drivers/grate/grate_draw.c
+index ff95626ad53..2e0995b879d 100644
+--- a/src/gallium/drivers/grate/grate_draw.c
++++ b/src/gallium/drivers/grate/grate_draw.c
+@@ -302,6 +302,47 @@ grate_init_state(struct grate_context *context, uint32_t **ptrp)
+    return 0;
+ }
+ 
++static void grate_draw_vbo(struct pipe_context *pcontext,
++                           const struct pipe_draw_info *info,
++                           unsigned drawid_offset,
++                           const struct pipe_draw_indirect_info *indirect,
++                           const struct pipe_draw_start_count_bias *draws,
++                           unsigned num_draws);
++
++/**
++ * Draws with a dual-source blend state: once per pass of the plan (see
++ * fp/blend.h), with the program variant and the blend of that pass.
++ */
++static void
++grate_draw_dual(struct pipe_context *pcontext,
++                const struct pipe_draw_info *info, unsigned drawid_offset,
++                const struct pipe_draw_indirect_info *indirect,
++                const struct pipe_draw_start_count_bias *draws,
++                unsigned num_draws)
++{
++   struct grate_context *context = grate_context(pcontext);
++   struct grate_fragment_shader_state *fshader = context->fshader;
++
++   for (unsigned i = 0; i < context->dual_plan.num_passes; i++) {
++      struct grate_fragment_shader_state *variant =
++         grate_fragment_dual_variant(context, fshader,
++                                     &context->dual_plan.pass[i].output);
++
++      if (!variant)
++         continue;
++
++      context->fshader = variant;
++      context->blend_key = context->dual_keys[i];
++      context->dual_pass = i + 1;
++      grate_draw_vbo(pcontext, info, drawid_offset, indirect, draws,
++                     num_draws);
++   }
++
++   context->fshader = fshader;
++   context->blend_key = 0;
++   context->dual_pass = 0;
++}
++
+ static void
+ grate_draw_vbo(struct pipe_context *pcontext,
+                const struct pipe_draw_info *info,
+@@ -324,6 +365,12 @@ grate_draw_vbo(struct pipe_context *pcontext,
+    if (!indirect && (!draws[0].count || !info->instance_count))
+       return;
+ 
++   if (context->blend_dual && !context->dual_pass) {
++      grate_draw_dual(pcontext, info, drawid_offset, indirect, draws,
++                      num_draws);
++      return;
++   }
++
+    if (context->rast->base.scissor &&
+        (context->scissor.minx >= context->scissor.maxx ||
+         context->scissor.miny >= context->scissor.maxy ||
+diff --git a/src/gallium/drivers/grate/grate_program.c b/src/gallium/drivers/grate/grate_program.c
+index a4343f4459f..29310851b47 100644
+--- a/src/gallium/drivers/grate/grate_program.c
++++ b/src/gallium/drivers/grate/grate_program.c
+@@ -297,46 +297,27 @@ free_fragment_ir(struct grate_fp_shader *fp)
+    }
+ }
+ 
+-static void *
+-grate_create_fs_state(struct pipe_context *pcontext,
+-                      const struct pipe_shader_state *template)
++/**
++ * Compiles the program of so->base.tokens, storing the output the mode asks
++ * for, into so->blob and so->info.
++ */
++static bool
++grate_compile_fs(struct grate_context *context,
++                 struct grate_fragment_shader_state *so,
++                 const struct grate_fp_output *output)
+ {
+-   grate_trace();
+-   struct grate_context *context = grate_context(pcontext);
+-   struct grate_fragment_shader_state *so = CALLOC_STRUCT(grate_fragment_shader_state);
+    enum drm_tegra_soc_id soc_id = context->drm->soc_id;
+ 
+-   if (!so)
+-      return NULL;
+-
+-   so->base = *template;
+-
+-   if (template->type == PIPE_SHADER_IR_NIR) {
+-      so->base.tokens = nir_to_tgsi(template->ir.nir,
+-                                    pcontext->screen);
+-      so->base.type = PIPE_SHADER_IR_TGSI;
+-   }
+-
+-
+-   if (grate_debug & GRATE_DEBUG_TGSI) {
+-      fprintf(stderr, "DEBUG: TGSI:\n");
+-      tgsi_dump(so->base.tokens, 0);
+-      fprintf(stderr, "\n");
+-   }
+-
+    struct tgsi_parse_context parser;
+    unsigned ok = tgsi_parse_init(&parser, so->base.tokens);
+    assert(ok == TGSI_PARSE_OK);
+ 
+    struct grate_fp_shader fp;
+-   grate_tgsi_to_fp(&fp, &parser);
++   grate_tgsi_to_fp(&fp, &parser, output);
+    tgsi_parse_free(&parser);
+    if (fp.allocation_failed) {
+       free_fragment_ir(&fp);
+-      if (template->type == PIPE_SHADER_IR_NIR)
+-         FREE((void *)so->base.tokens);
+-      FREE(so);
+-      return NULL;
++      return false;
+    }
+ 
+    struct util_dynarray buf;
+@@ -360,7 +341,8 @@ grate_create_fs_state(struct pipe_context *pcontext,
+    PUSH(0x22000000 | TGR3D_PSEQ_CTL_MAX_OUT(fp.uses_globals ? 0x4 : 0x12c) |
+         TGR3D_PSEQ_CTL_MIN_OUT(fp.uses_globals ? 0x2 : 0xc8) |
+         TGR3D_PSEQ_CTL_MERGE_SPAN_STARTS | TGR3D_PSEQ_CTL_MERGE_REGISTERS |
+-        TGR3D_PSEQ_CTL_REMOVE_KILLED_PIXELS | TGR3D_PSEQ_CTL_ALLOW_QID_COLLISIONS);
++        TGR3D_PSEQ_CTL_REMOVE_KILLED_PIXELS |
++        TGR3D_PSEQ_CTL_ALLOW_QID_COLLISIONS);
+ 
+    PUSH(host1x_opcode_imm(REG_TGR3D_PSEQ_QUAD_ID, 0));
+    PUSH(host1x_opcode_imm(REG_TGR3D_GLOBAL_INST_OFFSET, 0));
+@@ -454,9 +436,81 @@ grate_create_fs_state(struct pipe_context *pcontext,
+    free_fragment_ir(&fp);
+    so->num_fp_instrs = num_fp_instrs;
+    so->num_alu_instrs = num_alu_instrs;
++   return true;
++}
++
++static void *
++grate_create_fs_state(struct pipe_context *pcontext,
++                      const struct pipe_shader_state *template)
++{
++   grate_trace();
++   struct grate_context *context = grate_context(pcontext);
++   struct grate_fragment_shader_state *so =
++      CALLOC_STRUCT(grate_fragment_shader_state);
++   const struct grate_fp_output output = {.mode = GRATE_FP_OUTPUT_SRC0};
++
++   if (!so)
++      return NULL;
++
++   so->base = *template;
++
++   if (template->type == PIPE_SHADER_IR_NIR) {
++      so->base.tokens = nir_to_tgsi(template->ir.nir, pcontext->screen);
++      so->base.type = PIPE_SHADER_IR_TGSI;
++   }
++
++   if (grate_debug & GRATE_DEBUG_TGSI) {
++      fprintf(stderr, "DEBUG: TGSI:\n");
++      tgsi_dump(so->base.tokens, 0);
++      fprintf(stderr, "\n");
++   }
++
++   if (!grate_compile_fs(context, so, &output)) {
++      if (template->type == PIPE_SHADER_IR_NIR)
++         FREE((void *)so->base.tokens);
++      FREE(so);
++      return NULL;
++   }
++
+    return so;
+ }
+ 
++/**
++ * The program that stores what a dual-source pass blends (see
++ * fp/blend.h), compiled on first use. NULL if it cannot be compiled.
++ */
++struct grate_fragment_shader_state *
++grate_fragment_dual_variant(struct grate_context *context,
++                            struct grate_fragment_shader_state *shader,
++                            const struct grate_fp_output *output)
++{
++   struct grate_fragment_shader_state *variant;
++
++   for (variant = shader->dual_variants; variant;
++        variant = variant->next_dual) {
++      if (!memcmp(&variant->output, output, sizeof(*output)))
++         return variant;
++   }
++
++   variant = CALLOC_STRUCT(grate_fragment_shader_state);
++   if (!variant)
++      return NULL;
++
++   /* shares the tokens; the variant never frees them */
++   variant->base = shader->base;
++   variant->output = *output;
++   if (!grate_compile_fs(context, variant, output)) {
++      grate_loge("cannot compile the dual-source variant of the "
++                 "fragment program\n");
++      FREE(variant);
++      return NULL;
++   }
++
++   variant->next_dual = shader->dual_variants;
++   shader->dual_variants = variant;
++   return variant;
++}
++
+ static void
+ grate_bind_fs_state(struct pipe_context *pcontext, void *so)
+ {
+@@ -470,6 +524,12 @@ grate_delete_fs_state(struct pipe_context *pcontext, void *so)
+    struct grate_fragment_shader_state *shader = so;
+    grate_trace();
+    FREE(shader->blob.commands);
++   while (shader->dual_variants) {
++      struct grate_fragment_shader_state *variant = shader->dual_variants;
++
++      shader->dual_variants = variant->next_dual;
++      grate_delete_fs_state(pcontext, variant);
++   }
+    while (shader->variants) {
+       struct grate_blend_variant *variant = shader->variants;
+ 
+diff --git a/src/gallium/drivers/grate/grate_program.h b/src/gallium/drivers/grate/grate_program.h
+index 2f38c945326..37896c24000 100644
+--- a/src/gallium/drivers/grate/grate_program.h
++++ b/src/gallium/drivers/grate/grate_program.h
+@@ -34,8 +34,20 @@ struct grate_fragment_shader_state {
+    struct grate_blend_variant *variants;
+    struct grate_fp_info info;
+ 
++   /* Dual-source blending: the programs of the passes, compiled from the
++    * same tokens (see grate_fragment_dual_variant()). */
++   struct grate_fp_output output;
++   struct grate_fragment_shader_state *dual_variants;
++   struct grate_fragment_shader_state *next_dual;
+ };
+ 
++struct grate_context;
++
++struct grate_fragment_shader_state *
++grate_fragment_dual_variant(struct grate_context *context,
++                            struct grate_fragment_shader_state *shader,
++                            const struct grate_fp_output *output);
++
+ const struct grate_shader_blob *
+ grate_fragment_blend_blob(struct grate_fragment_shader_state *shader,
+                           uint32_t key);
+diff --git a/src/gallium/drivers/grate/grate_screen.c b/src/gallium/drivers/grate/grate_screen.c
+index 6ee8601e5d5..d6b00ef585a 100755
+--- a/src/gallium/drivers/grate/grate_screen.c
++++ b/src/gallium/drivers/grate/grate_screen.c
+@@ -229,6 +229,7 @@ grate_screen_init_caps(struct grate_screen *screen)
+    // Bool values
+    caps->npot_textures = true; // not really, but mesa requires it for now!`
+    caps->blend_equation_separate = true;
++   caps->max_dual_source_render_targets = 1;
+    caps->vertex_color_unclamped = true;  // probably irrelevant for GLES2
+    caps->vertex_color_clamped = false; // probably irrelevant for GLES2
+    caps->mixed_framebuffer_sizes = true;
+diff --git a/src/gallium/drivers/grate/grate_state.c b/src/gallium/drivers/grate/grate_state.c
+index e04cdd34204..7df2c2c8c00 100644
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -275,10 +275,22 @@ grate_bind_blend_state(struct pipe_context *pcontext, void *so)
+    const struct pipe_rt_blend_state *rt = blend ? &blend->rt[0] : NULL;
+ 
+    ctx->blend_key = 0;
+-   if (rt && !blend->independent_blend_enable && !blend->logicop_enable)
+-      ctx->blend_key = grate_fp_blend_key(rt);
++   ctx->blend_dual = false;
++   if (rt && !blend->independent_blend_enable && !blend->logicop_enable) {
++      if (grate_fp_blend_is_dual(rt)) {
++         ctx->blend_dual = grate_fp_blend_dual_plan(rt, &ctx->dual_plan);
++         for (unsigned i = 0;
++              ctx->blend_dual && i < ctx->dual_plan.num_passes; i++) {
++            ctx->dual_keys[i] =
++               grate_fp_blend_key(&ctx->dual_plan.pass[i].rt);
++            ctx->blend_dual = ctx->dual_keys[i] != 0;
++         }
++      } else {
++         ctx->blend_key = grate_fp_blend_key(rt);
++      }
++   }
+ 
+-   if (rt && rt->blend_enable && !ctx->blend_key) {
++   if (rt && rt->blend_enable && !ctx->blend_key && !ctx->blend_dual) {
+       grate_loge("unsupported blend state: rgb func %u src %u dst %u, "
+                  "alpha func %u src %u dst %u, logicop %u\n",
+                  rt->rgb_func, rt->rgb_src_factor, rt->rgb_dst_factor,
+-- 
+2.56.0
+

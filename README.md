@@ -7,11 +7,11 @@ and measurement data live in a private working repo; this one holds only what is
 
 Kernel target: [libre-tegra/linux](https://codeberg.org/libre-tegra/linux) `v7.0.1-stable`
 (commit `bfffc6d6656e87f3de3aa4c09d852849081ef088`), the tree postmarketOS ships as
-`linux-postmarketos-grate`. Userspace: Grate Mesa 26.2.3.
+`linux-postmarketos-grate`. Userspace: Grate Mesa 26.2.6.
 
 ## Status
 
-Measured on one device, 2026-10-29 to 2026-11-03.
+Measured on one device, 2026-10-29 to 2026-11-05.
 
 | Area | State |
 |---|---|
@@ -20,7 +20,7 @@ Measured on one device, 2026-10-29 to 2026-11-03.
 | Audio (speakers) | works with patch 0001 |
 | Wi-Fi (Marvell 88W8797) | works with NetworkManager after patch 0025 |
 | Bluetooth | works alongside Wi-Fi (patches 0026–0028 and the combo firmware below); pairing and use of Bluetooth headphones confirmed |
-| 3D (Grate Mesa, GLES 2.0) | works: Weston and Phosh run accelerated (Mesa patches 0001–0019); shader compatibility is incomplete and Phosh is still somewhat slow |
+| 3D (Grate Mesa, GLES 2.0) | works: Weston, Phosh and the Catacomb panel (Epitaph) run accelerated (Mesa patches 0001–0030). Blending covers any source/destination factor pair of ZERO, ONE and the (inverse) source/destination colour and alpha, the equations ADD, SUBTRACT and REVERSE_SUBTRACT, separate RGB and alpha state and the colour mask; `GL_EXT_blend_func_extended` (dual-source) is drawn in two passes, which is what makes Epitaph's text and icons render. Limits: GLES 2.0 only (GTK4 and Firefox's WebRender need ES 3.0, so Firefox composites in software; WebGL 1 uses the GPU); maximum texture size 2048 (Epitaph's 4096 glyph atlas needs a one-line patch, not in this repo); a program that keeps values in the global registers runs with 4 pixels in flight, about 25x slower per pixel; constant-colour blend factors, SRC_ALPHA_SATURATE, MIN/MAX and logic ops are not supported; Phosh is still somewhat slow |
 | Front camera | raw Bayer capture works (patches 0003–0022); the rear camera has never answered |
 | H.264 decode, 2D engine | work for a subset, from userspace |
 | Microphone (on-board digital) | not working; patches 0023 and 0024 are written, the mic does not appear in Phosh settings |
@@ -47,7 +47,7 @@ Sub-series:
 
 - [`patches/camera/`](patches/camera/README.md): `0003`–`0022`, the OV9726 sensor driver and Tegra30 CSI/VI support ported to the grate host1x stack.
 - [`patches/upstream-csi-v7/`](patches/upstream-csi-v7/README.md): unmodified copy of the upstream series the camera patches are ported from (Svyatoslav Ryhel, v7, linux-media 2026-03-03). All credit for that work is the original author's.
-- [`patches/mesa/`](patches/mesa/README.md): `0001`–`0019` against `libre-tegra-mesa` branch `grate-26.2.3`.
+- [`patches/mesa/`](patches/mesa/README.md): `0001`–`0030` against `libre-tegra-mesa` (`0001`–`0019` were written on branch `grate-26.2.3`; all thirty are also commits on `grate-26.2.6` of [ThatzOkay/libre-tegra-mesa](https://github.com/ThatzOkay/libre-tegra-mesa)).
 - [`patches/gnome-session/`](patches/gnome-session/): two patches for the Phosh session (select GLES before the GTK probe; guard the X11 helper and empty EGL config results).
 
 ## Bluetooth/Wi-Fi combo firmware (not included)
