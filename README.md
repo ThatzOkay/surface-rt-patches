@@ -11,7 +11,7 @@ Kernel target: [libre-tegra/linux](https://codeberg.org/libre-tegra/linux) `v7.0
 
 ## Status
 
-Measured on one device, 2026-10-29 to 2026-11-03.
+Measured on one device, 2026-10-29 to 2026-11-05.
 
 | Area | State |
 |---|---|
@@ -21,9 +21,9 @@ Measured on one device, 2026-10-29 to 2026-11-03.
 | Wi-Fi (Marvell 88W8797) | works with NetworkManager after patch 0025 |
 | Bluetooth | works alongside Wi-Fi (patches 0026–0028 and the combo firmware below); pairing and use of Bluetooth headphones confirmed |
 | 3D (Grate Mesa, GLES 2.0) | works: Weston and Phosh run accelerated (Mesa patches 0001–0019); shader compatibility is incomplete and Phosh is still somewhat slow |
-| Front camera | raw Bayer capture works (patches 0003–0022); the rear camera has never answered |
+| Front camera | raw Bayer capture works (patches 0003–0022); the rear camera has never answered. Camera apps such as Snapshot show "no camera found": PipeWire's V4L2 plugin has no entry for the sensor's 10-bit Bayer format, so a debayering bridge or a libcamera pipeline would be needed |
 | H.264 decode, 2D engine | work for a subset, from userspace |
-| Microphone (on-board digital) | not working; patches 0023 and 0024 are written, the mic does not appear in Phosh settings |
+| Microphone (on-board digital) | works at the ALSA level: `arecord -D hw:1,0` records live samples on both channels (patches 0023, 0024 and 0030: the clock is on the codec's GPIO2, the data on GPIO5, and Tegra GPIO S3 must be held high as the microphone supply; tested on a freshly flashed image 2026-11-04). GNOME/Phosh list no input device yet because the card has no UCM2 profile |
 | HDMI output | works at 1920x1080@60 once GPIO PDD4 is driven high (confirmed at runtime with a userspace register write, with hotplug); patch 0029 does this from the devicetree and has not been booted yet |
 | Light, motion and temperature sensors | enumerate over I2C/IIO; cover response untested |
 
@@ -36,12 +36,13 @@ Apply in numeric order with `patch -p1` to the kernel tree above.
 | `0001-ASoC-wm8962-restore-SYSCLK_ENA-after-bclk-setup.patch` | Silent audio: a cold stream start clears the codec's `SYSCLK_ENA` bit and nothing set it again. |
 | `0002-ARM-dts-tegra30-surface-rt-keep-vdd_cover-always-on.patch` | Cover keyboard: its supply rail was switched off before the cover could be detected. |
 | `0023-ASoC-tegra_wm8962-do-not-dereference-a-missing-runtime-.patch` | Oops when unbinding the codec: the card's remove hook dereferenced a PCM runtime that is already gone. |
-| `0024-ARM-dts-tegra30-surface-rt-configure-the-WM8962-GPIOs-.patch` | Digital microphone: codec GPIO configuration and the `Digital Mic` route. Not validated. |
+| `0024-ARM-dts-tegra30-surface-rt-configure-the-WM8962-GPIOs-.patch` | Digital microphone: codec GPIO configuration and the `Digital Mic` route. Needs 0030: its clock pin (GPIO3) was a wrong guess. |
 | `0025-ARM-dts-tegra30-surface-rt-enable-WiFi-via-GPIO-D4.patch` | Wi-Fi power: PD4 as an output without tristate plus a fixed regulator as SDMMC3's `vmmc-supply`. |
 | `0026-ARM-dts-tegra30-surface-rt-configure-Bluetooth-UARTC-pins.patch` | Bluetooth: UARTC TX/RX/RTS/CTS pinmux. |
 | `0027-wifi-mwifiex-sdio-add-opt-in-legacy-scan.patch` | `mwifiex_sdio.force_legacy_scan=1`: needed for scanning with the combo firmware below. |
 | `0028-ARM-dts-tegra30-surface-rt-hold-Bluetooth-PD1-active.patch` | Bluetooth: PD1 as a kernel-owned output-low GPIO hog. |
 | `0029-ARM-dts-tegra30-surface-rt-enable-HDMI-via-GPIO-DD4.patch` | HDMI: PDD4 as a fixed regulator, the connector's `hdmi-pwr-supply`. Windows RT holds it high; with it low HPD stays low and DDC reads return zeros. Not yet booted. |
+| `0030-ARM-dts-tegra30-surface-rt-clock-the-digital-microphone-from-GPIO2.patch` | Digital microphone: DMICCLK on the codec's GPIO2 (releasing it from CLKOUT2), DMICDAT on GPIO5, and Tegra GPIO S3 held high as the microphone power (the only GPIO Windows changes while recording). Works with 0023 and 0024 (apply after 0024). |
 
 Sub-series:
 
