@@ -1,5 +1,35 @@
 # Mesa (grate) patches
 
+Patch [0020-grate-honor-draw-scissor-rectangles.patch](0020-grate-honor-draw-scissor-rectangles.patch)
+fixes ignored draw scissoring, used by Phoc for window damage clipping. A
+180-case imported-buffer/scanout alpha diagnostic improves from 120 failures
+on 0019 to zero on 0020. Phoc is confirmed to use 0020 after login. The reported
+coloured window border was separately identified as Phoc's focus frame and
+disabled with `gsettings set mobi.phosh.phoc focus-frame false`.
+Hardware results and rollback.
+
+Patch [0021-grate-trace-how-long-GPU-waits-block-and-why.patch](0021-grate-trace-how-long-GPU-waits-block-and-why.patch)
+is trace-only (no effect unless `GRATE_DRM_TRACE` is set): it logs every fence wait with its caller (queue drain, buffer
+wait, job wait) and how long it blocked, the pending job count at each drain, and a marker per context flush. Built to find out
+whether Phosh stalls on the GPU at every flush (0018) and for how long. Built and installed for the next login; results pending.
+
+Patch [0023-grate-sample-texture-coordinates-computed-by-the-shader.patch](0023-grate-sample-texture-coordinates-computed-by-the-shader.patch)
+lets `texture2D` take a coordinate the shader computed (Tabula's wallpaper remaps `0.5*v+0.5`), which used to abort in
+`emit_TEX`. Per-pixel values did not survive in the global registers or R4 and up between instructions once the program had a
+texture fetch (constants and uniforms did; cause unknown), so temporaries feeding the coordinate live in R0-R3. The Tabula-shaped
+test `tools/gpu/grate-texture-affine-coord-test.c` goes from an abort to 0/1024 bad pixels; the other fragment/texture tests are
+unchanged. Limit: values that must outlive the fetch cannot be allocated (`no row register survives to the texture fetch`).
+The register experiments and open bugs are in docs/grate-fragment-registers.md.
+
+Patch [0026-grate-expose-Z24S8-and-Z24X8-depth-buffers-as-Z16NL-plus-an-S8-stencil-plane.patch](0026-grate-expose-Z24S8-and-Z24X8-depth-buffers-as-Z16NL-plus-an-S8-stencil-plane.patch)
+offers d24 and d24/s8 EGL configs the way the Windows driver does D24S8: 16-bit non-linear depth (surface format Z16NL, slot 0) plus a
+separate S8 plane (slot 2) after it in the same buffer, with the stencil test/ops/reference programmed and separate clears for the planes.
+Tested on the tablet 2026-11-05: `grate-depth-probe 24` reports `GL_DEPTH_BITS` 24, the control draw passes and the curve is the Z16NL
+one (coarser than Z16 near z=1); `tools/gpu/grate-stencil-test.c` (clear value, REPLACE, INCR, write mask, two-sided, depth-only clear,
+zfail) passes all cases; the cube regression gives the same faces as before (5 with nodepth/always, 3 with GL_LESS). Epitaph, Tabula and
+Tzompantli (stock Alpine builds, without their former no-depth-stencil patches) start and draw on it. Limits: no sampling of Z24 textures; stencil is dropped with more than one
+colour buffer; `glColorMask` is still ignored by the driver (a stencil-only pass paints colour too).
+
 Against [`github.com/external-mirrors/libre-tegra-mesa`](https://github.com/external-mirrors/libre-tegra-mesa),
 branch `grate-26.2.3` — a current mirror of `codeberg.org/libre-tegra/mesa` (which 404s;
 the longer research notes are kept in a private repo). Not a

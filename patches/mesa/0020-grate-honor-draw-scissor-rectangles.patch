@@ -1,0 +1,72 @@
+From: Surface RT bring-up
+Subject: [PATCH 20] grate: honor draw scissor rectangles
+
+Phoc clips window draws to damage rectangles using glScissor. The callback
+previously ignored that state and emitted a full-framebuffer scissor, so
+each clipped draw overwrote pixels outside the damage region. Store the
+Gallium scissor, respect the rasterizer enable, clamp to the framebuffer,
+and skip empty intersections.
+
+--- a/src/gallium/drivers/grate/grate_context.h
++++ b/src/gallium/drivers/grate/grate_context.h
+@@ -51,6 +51,7 @@
+    struct pipe_sampler_view *sampler_views[16];
+    struct pipe_sampler_state *samplers[16];
+ 
++   struct pipe_scissor_state scissor;
+    uint32_t no_scissor[3];
+    uint32_t viewport[10];
+    uint32_t guardband[4];
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -110,8 +110,8 @@
+                          unsigned num_scissors,
+                          const struct pipe_scissor_state * scissors)
+ {
+-   assert(num_scissors == 1);
+-   grate_unimplemented();
++   assert(start_slot == 0 && num_scissors == 1);
++   grate_context(pcontext)->scissor = scissors[0];
+ }
+ 
+ static void
+@@ -640,7 +640,22 @@
+ emit_scissor(struct grate_context *context, uint32_t **ptrp)
+ {
+    struct grate_stream *stream = &context->gr3d->stream;
+-   grate_stream_push_words(stream, ptrp, context->no_scissor, 3, 0);
++   if (!context->rast->base.scissor) {
++      grate_stream_push_words(stream, ptrp, context->no_scissor, 3, 0);
++      return;
++   }
++
++   /* Gallium scissor coordinates already use the framebuffer's orientation;
++    * do not invert them again for a negative viewport Y scale.
++    */
++   const struct pipe_scissor_state *s = &context->scissor;
++   unsigned width = context->framebuffer.base.width;
++   unsigned height = context->framebuffer.base.height;
++   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_SU_SCISSOR_X, 2));
++   GRATE_PUSHBUF_WORD(*ptrp, TGR3D_SU_SCISSOR_X_MIN(MIN2(s->minx, width)) |
++                           TGR3D_SU_SCISSOR_X_MAX(MIN2(s->maxx, width)));
++   GRATE_PUSHBUF_WORD(*ptrp, TGR3D_SU_SCISSOR_Y_MIN(MIN2(s->miny, height)) |
++                           TGR3D_SU_SCISSOR_Y_MAX(MIN2(s->maxy, height)));
+ }
+ 
+ static void
+--- a/src/gallium/drivers/grate/grate_draw.c
++++ b/src/gallium/drivers/grate/grate_draw.c
+@@ -324,6 +324,13 @@
+    if (!indirect && (!draws[0].count || !info->instance_count))
+       return;
+ 
++   if (context->rast->base.scissor &&
++       (context->scissor.minx >= context->scissor.maxx ||
++        context->scissor.miny >= context->scissor.maxy ||
++        context->scissor.minx >= context->framebuffer.base.width ||
++        context->scissor.miny >= context->framebuffer.base.height))
++      return;
++
+    err = grate_stream_begin(stream, &ptr);
+    if (err < 0) {
+       grate_loge("grate_stream_begin() failed: %d\n", err);
