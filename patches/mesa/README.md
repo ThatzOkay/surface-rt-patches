@@ -51,6 +51,23 @@ icons on the tablet. Measured (1024x1024 draw): plain texture 9.7 ms, blended 16
 Patch [0030-grate-format-the-lines-added-since-the-fork-to-the-Mesa-style.patch](0030-grate-format-the-lines-added-since-the-fork-to-the-Mesa-style.patch)
 wraps the lines added by the earlier patches to 78 columns in the Mesa style (formatting only; `drm/` keeps its libdrm style).
 
+Patches 0031-0033 (2026-11-06) are on top of 0030 and come from running Firefox ESR (WebRender) on the tablet, which aborted on instructions the fragment
+compiler did not know. A test program checks 21 expressions against libm on the tablet, all within 1/255.
+
+Patch [0031-grate-compile-POW-EX2-LG2-RSQ-and-SQRT-in-the-fragment-shader.patch](0031-grate-compile-POW-EX2-LG2-RSQ-and-SQRT-in-the-fragment-shader.patch)
+gives the fragment compiler the scalar SFU ops: RCP, RSQ, SQRT and LG2 are one op each, EX2 is PREEX2 then EX2 on the row PREEX2 wrote, POW is
+EX2(PREEX2(y * LG2(x))) with y in a row as the second factor of the LG2 multiplier. Firefox aborted on `TGSI_OPCODE_POW` before.
+
+Patch [0032-grate-skip-draws-while-no-vertex-or-fragment-shader-is-bound.patch](0032-grate-skip-draws-while-no-vertex-or-fragment-shader-is-bound.patch)
+skips a draw while no vertex or fragment shader is bound. A program the compilers refuse is never created, the state tracker binds nothing, and the next
+draw dereferenced the NULL pointer: Firefox's compositor died with a SIGSEGV and no message as soon as one WebRender shader was too big.
+
+Patch [0033-grate-compile-LRP-DP2-DP3-DP4-and-MIN-and-refuse-what-is-not-known.patch](0033-grate-compile-LRP-DP2-DP3-DP4-and-MIN-and-refuse-what-is-not-known.patch)
+adds LRP (GLSL `mix()`, in the vertex compiler too, because Mesa moves `mix()` of varyings there), DP2/DP3/DP4 and MIN to the fragment compiler, and makes both
+compilers refuse an instruction they do not know instead of calling `assert()`: the opcode is printed, the shader is not created and its draws are skipped
+(0032). Still refused: loops (BGNLOOP/IF/BRK), FRC and FLR (the SFU FRC op returned its operand unchanged), DP4 of a varying, LRP/DP of two different varyings, and
+shaders that run out of registers. Firefox's compositor can still die silently some seconds after start; the cause is not found yet.
+
 Against [`github.com/external-mirrors/libre-tegra-mesa`](https://github.com/external-mirrors/libre-tegra-mesa),
 branch `grate-26.2.3` — a current mirror of `codeberg.org/libre-tegra/mesa` (which 404s;
 the longer research notes are kept in a private repo). Not a
