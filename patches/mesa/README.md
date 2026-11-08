@@ -248,3 +248,12 @@ handling is checked against the CPU model and the old driver only; ALU immediate
 their descriptions (0024 scratch registers, 0027 "global registers are four lanes", 0031 SFU through the multipliers) are superseded; no compositor-level run
 (Weston, Phosh, Firefox) of the new driver yet.
 
+Patches 0035-0037 (2026-11-07/08) come from running a Qt 6 / Material application on the tablet:
+
+* [0035-grate-compile-MIN-SNE-DP2-and-CMP-in-the-vertex-prog.patch](0035-grate-compile-MIN-SNE-DP2-and-CMP-in-the-vertex-prog.patch): the vertex compiler refused MIN, SNE, DP2 and CMP.
+* [0036-grate-select-with-condition-flags-for-CMP-in-the-vertex-program.patch](0036-grate-select-with-condition-flags-for-CMP-in-the-vertex-program.patch):
+  0035 built CMP as a blend, which is wrong for very different values and NaN for infinity (visible as glitches). NVIDIA's compiler has no CMP: it sets per-lane
+  condition flags and predicates a write on them; 0036 does the same. Checked against the layout NVIDIA's compiler produced and with 15 test cases.
+* [0037-grate-sample-the-base-level-of-mipmapped-textures.patch](0037-grate-sample-the-base-level-of-mipmapped-textures.patch): a texture with a mipmap filter aborted the
+  application. The driver has memory for one level only, so it samples level 0; writes to higher levels went over level 0 and now go to scratch memory, and
+  `resource_copy_region` copies level 0 (it did nothing, which emptied textures that Mesa reallocates to add mipmap levels). Real mipmap levels are not implemented.
