@@ -1,5 +1,73 @@
 # Mesa (grate) patches
 
+Patch [0020-grate-honor-draw-scissor-rectangles.patch](0020-grate-honor-draw-scissor-rectangles.patch)
+fixes ignored draw scissoring, used by Phoc for window damage clipping. A
+180-case imported-buffer/scanout alpha diagnostic improves from 120 failures
+on 0019 to zero on 0020. Phoc is confirmed to use 0020 after login. The reported
+coloured window border was separately identified as Phoc's focus frame and
+disabled with `gsettings set mobi.phosh.phoc focus-frame false`.
+Hardware results and rollback.
+
+Patch [0021-grate-trace-how-long-GPU-waits-block-and-why.patch](0021-grate-trace-how-long-GPU-waits-block-and-why.patch)
+is trace-only (no effect unless `GRATE_DRM_TRACE` is set): it logs every fence wait with its caller (queue drain, buffer
+wait, job wait) and how long it blocked, the pending job count at each drain, and a marker per context flush. Built to find out
+whether Phosh stalls on the GPU at every flush (0018) and for how long. Built and installed for the next login; results pending.
+
+Patch [0023-grate-sample-texture-coordinates-computed-by-the-shader.patch](0023-grate-sample-texture-coordinates-computed-by-the-shader.patch)
+lets `texture2D` take a coordinate the shader computed (Tabula's wallpaper remaps `0.5*v+0.5`), which used to abort in
+`emit_TEX`. Per-pixel values did not survive in the global registers or R4 and up between instructions once the program had a
+texture fetch (constants and uniforms did; cause unknown), so temporaries feeding the coordinate live in R0-R3. The Tabula-shaped
+test `tools/gpu/grate-texture-affine-coord-test.c` goes from an abort to 0/1024 bad pixels; the other fragment/texture tests are
+unchanged. Limit: values that must outlive the fetch cannot be allocated (`no row register survives to the texture fetch`).
+The register experiments and open bugs are in docs/grate-fragment-registers.md.
+
+Patch [0026-grate-expose-Z24S8-and-Z24X8-depth-buffers-as-Z16NL-plus-an-S8-stencil-plane.patch](0026-grate-expose-Z24S8-and-Z24X8-depth-buffers-as-Z16NL-plus-an-S8-stencil-plane.patch)
+offers d24 and d24/s8 EGL configs the way the Windows driver does D24S8: 16-bit non-linear depth (surface format Z16NL, slot 0) plus a
+separate S8 plane (slot 2) after it in the same buffer, with the stencil test/ops/reference programmed and separate clears for the planes.
+Tested on the tablet 2026-11-05: `grate-depth-probe 24` reports `GL_DEPTH_BITS` 24, the control draw passes and the curve is the Z16NL
+one (coarser than Z16 near z=1); `tools/gpu/grate-stencil-test.c` (clear value, REPLACE, INCR, write mask, two-sided, depth-only clear,
+zfail) passes all cases; the cube regression gives the same faces as before (5 with nodepth/always, 3 with GL_LESS). Epitaph, Tabula and
+Tzompantli (stock Alpine builds, without their former no-depth-stencil patches) start and draw on it. Limits: no sampling of Z24 textures; stencil is dropped with more than one
+colour buffer; `glColorMask` is still ignored by the driver (a stencil-only pass paints colour too).
+
+Patches 0027-0030 (2026-11-05) are on top of 0026 and are what made Epitaph's panel text and icons render (dual-source blending).
+
+Patch [0027-grate-keep-values-alive-across-fetches-add-SNE-and-RCP-drop-dead-code.patch](0027-grate-keep-values-alive-across-fetches-add-SNE-and-RCP-drop-dead-code.patch)
+fixes the fragment compiler, found with a ladder of small shaders around a texture fetch: a varying read after a fetch (tile-constant garbage), SNE, RCP through
+the SFU, a TEX coordinate copy and dead code. It also settles why global registers looked broken: R4 and up and the globals are storage of four lanes shared by every pixel in
+flight, so a program that needs one runs with `MAX_OUT 4` (about 25x slower per pixel, only that program). The earlier "MAX_OUT <= 8 is enough" was measured with flat values and
+is wrong.
+
+Patch [0028-grate-blend-with-any-factor-pair-and-equation-and-honour-the-colormask.patch](0028-grate-blend-with-any-factor-pair-and-equation-and-honour-the-colormask.patch)
+generates the blend epilogue from the blend state (`fp/blend.c`, table driven; the top of the file says how to add a factor or an equation): ADD, SUBTRACT, REVERSE_SUBTRACT,
+ten factors, separate rgb and alpha, and the colormask (also with blending off). 318 of 318 cases match a CPU reference. Not yet: constant colour factors, SRC_ALPHA_SATURATE, MIN/MAX,
+logic ops.
+
+Patch [0029-grate-dual-source-blending-in-two-passes.patch](0029-grate-dual-source-blending-in-two-passes.patch)
+implements `GL_EXT_blend_func_extended`. The epilogue cannot hold src0, src1 and the destination at once, so a draw is split into up to two single-source blend passes
+(`dst * Fd`, then `+ src0 * Fs`), exact for non-overlapping fragments such as text. Epitaph's text shader renders exactly in both glyph paths and the pulled-down panel shows its text and
+icons on the tablet. Measured (1024x1024 draw): plain texture 9.7 ms, blended 16 ms, dual source 339 ms.
+
+Patch [0030-grate-format-the-lines-added-since-the-fork-to-the-Mesa-style.patch](0030-grate-format-the-lines-added-since-the-fork-to-the-Mesa-style.patch)
+wraps the lines added by the earlier patches to 78 columns in the Mesa style (formatting only; `drm/` keeps its libdrm style).
+
+Patches 0031-0033 (2026-11-06) are on top of 0030 and come from running Firefox ESR (WebRender) on the tablet, which aborted on instructions the fragment
+compiler did not know. A test program checks 21 expressions against libm on the tablet, all within 1/255.
+
+Patch [0031-grate-compile-POW-EX2-LG2-RSQ-and-SQRT-in-the-fragment-shader.patch](0031-grate-compile-POW-EX2-LG2-RSQ-and-SQRT-in-the-fragment-shader.patch)
+gives the fragment compiler the scalar SFU ops: RCP, RSQ, SQRT and LG2 are one op each, EX2 is PREEX2 then EX2 on the row PREEX2 wrote, POW is
+EX2(PREEX2(y * LG2(x))) with y in a row as the second factor of the LG2 multiplier. Firefox aborted on `TGSI_OPCODE_POW` before.
+
+Patch [0032-grate-skip-draws-while-no-vertex-or-fragment-shader-is-bound.patch](0032-grate-skip-draws-while-no-vertex-or-fragment-shader-is-bound.patch)
+skips a draw while no vertex or fragment shader is bound. A program the compilers refuse is never created, the state tracker binds nothing, and the next
+draw dereferenced the NULL pointer: Firefox's compositor died with a SIGSEGV and no message as soon as one WebRender shader was too big.
+
+Patch [0033-grate-compile-LRP-DP2-DP3-DP4-and-MIN-and-refuse-what-is-not-known.patch](0033-grate-compile-LRP-DP2-DP3-DP4-and-MIN-and-refuse-what-is-not-known.patch)
+adds LRP (GLSL `mix()`, in the vertex compiler too, because Mesa moves `mix()` of varyings there), DP2/DP3/DP4 and MIN to the fragment compiler, and makes both
+compilers refuse an instruction they do not know instead of calling `assert()`: the opcode is printed, the shader is not created and its draws are skipped
+(0032). Still refused: loops (BGNLOOP/IF/BRK), FRC and FLR (the SFU FRC op returned its operand unchanged), DP4 of a varying, LRP/DP of two different varyings, and
+shaders that run out of registers. Firefox's compositor can still die silently some seconds after start; the cause is not found yet.
+
 Against [`github.com/external-mirrors/libre-tegra-mesa`](https://github.com/external-mirrors/libre-tegra-mesa),
 branch `grate-26.2.3` — a current mirror of `codeberg.org/libre-tegra/mesa` (which 404s;
 the longer research notes are kept in a private repo). Not a
@@ -160,3 +228,32 @@ median improves from 326 to 150 ms per 1,000 draws. These patches are active
 through a per-user Phosh override; the image archive remains at 0016. General
 multi-input temporary allocation is still incomplete.
 Results, rollback and failed experiment.
+
+Patch [0034-grate-use-the-register-rows-like-NVIDIA-s-compiler-n.patch](0034-grate-use-the-register-rows-like-NVIDIA-s-compiler-n.patch)
+(2026-11-07, on top of 0033) replaces the guessed handling of registers R4 and up and the globals 16-23, which had turned into a `MAX_OUT 4` rule
+(about six times slower for every program that touched them). The hardware keeps those registers per pixel when the program declares how many
+register rows it uses (`GLOBAL_PIX_ATTR.NUM_ROWS`, `MAX_QID` from the row count), which NVIDIA's driver does and ours did not. The patch follows what
+NVIDIA's compiler produces for the same GLSL (compiled on the tablet with the Android userland and replayed on this driver): R4-R11 for overflow
+temporaries, the step layout of a multi-row program (whole rounds, unit steps on multiples of the row count, output write on the first step of the last
+round, a bubble packet between dependent steps), no scratch registers in the output stage, the SFU in place on R0-R3 (one op per step) and a blend stage
+that fits the layout. Shaders the compiler used to refuse now compile.
+
+Checked against a CPU model of eight test shaders (worst error 1/255 also at 1024×768), against NVIDIA's compiled programs (30000 of 30000 pixels identical)
+and by running 21 self-checking tests with the previous and the new driver (identical output). Full-screen fill at 1024×768, Mpixel/s before → after:
+texture 90 → 140, texture with a coordinate transform 71 → 97, ALU-heavy shader 3.4 → 29, dual-source text 1.7 → 15.5.
+
+Known gaps, not done yet: NVIDIA's container link record (the fragment-input lane map) is not parsed and only a single `vec2` varying was compared; a
+program that needs more registers than R4–R15 is refused (no spill buffer); NVIDIA's streams can only be replayed for programs without uniforms, so uniform
+handling is checked against the CPU model and the old driver only; ALU immediates are not used; patches 0001–0033 were written without this knowledge and
+their descriptions (0024 scratch registers, 0027 "global registers are four lanes", 0031 SFU through the multipliers) are superseded; no compositor-level run
+(Weston, Phosh, Firefox) of the new driver yet.
+
+Patches 0035-0037 (2026-11-07/08) come from running a Qt 6 / Material application on the tablet:
+
+* [0035-grate-compile-MIN-SNE-DP2-and-CMP-in-the-vertex-prog.patch](0035-grate-compile-MIN-SNE-DP2-and-CMP-in-the-vertex-prog.patch): the vertex compiler refused MIN, SNE, DP2 and CMP.
+* [0036-grate-select-with-condition-flags-for-CMP-in-the-vertex-program.patch](0036-grate-select-with-condition-flags-for-CMP-in-the-vertex-program.patch):
+  0035 built CMP as a blend, which is wrong for very different values and NaN for infinity (visible as glitches). NVIDIA's compiler has no CMP: it sets per-lane
+  condition flags and predicates a write on them; 0036 does the same. Checked against the layout NVIDIA's compiler produced and with 15 test cases.
+* [0037-grate-sample-the-base-level-of-mipmapped-textures.patch](0037-grate-sample-the-base-level-of-mipmapped-textures.patch): a texture with a mipmap filter aborted the
+  application. The driver has memory for one level only, so it samples level 0; writes to higher levels went over level 0 and now go to scratch memory, and
+  `resource_copy_region` copies level 0 (it did nothing, which emptied textures that Mesa reallocates to add mipmap levels). Real mipmap levels are not implemented.

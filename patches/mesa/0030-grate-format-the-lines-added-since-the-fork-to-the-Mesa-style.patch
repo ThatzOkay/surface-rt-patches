@@ -1,0 +1,1890 @@
+From 67f472a24d96aace23347f3a164a2cb6a5569db3 Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Thu, 5 Nov 2026 23:39:44 +0100
+Subject: [PATCH 30/30] grate: format the lines added since the fork to the
+ Mesa style
+
+Wrap the lines added by the earlier grate patches to 78 columns, with the
+indentation, brace and return-type layout of src/.clang-format (which
+disables formatting by default; this used a copy with DisableFormat: false
+and ColumnLimit: 78, include sorting off). Only lines changed since
+4830fcbcc57 were formatted, so the fork's own code is untouched, and drm/
+is left alone because it follows its libdrm origin (4-space).
+
+No functional change: the regression, blend, ladder and dual-source tests
+give the same results before and after.
+---
+ src/gallium/drivers/grate/fp/tgsi.c        | 304 ++++++++++++++-------
+ src/gallium/drivers/grate/grate_bo.c       | 134 ++++-----
+ src/gallium/drivers/grate/grate_bo.h       |   5 +-
+ src/gallium/drivers/grate/grate_compiler.h |  24 +-
+ src/gallium/drivers/grate/grate_context.h  |   6 +-
+ src/gallium/drivers/grate/grate_draw.c     |  17 +-
+ src/gallium/drivers/grate/grate_program.c  |  71 +++--
+ src/gallium/drivers/grate/grate_program.h  |   4 +-
+ src/gallium/drivers/grate/grate_resource.c |  98 +++----
+ src/gallium/drivers/grate/grate_resource.h |  17 +-
+ src/gallium/drivers/grate/grate_screen.c   |   8 +-
+ src/gallium/drivers/grate/grate_state.c    | 216 +++++++++------
+ src/gallium/drivers/grate/grate_stream.c   |   2 +-
+ src/gallium/drivers/grate/vp/tgsi.c        |  45 +--
+ 14 files changed, 589 insertions(+), 362 deletions(-)
+ mode change 100755 => 100644 src/gallium/drivers/grate/grate_screen.c
+
+diff --git a/src/gallium/drivers/grate/fp/tgsi.c b/src/gallium/drivers/grate/fp/tgsi.c
+index 703c8b03983..5a9ad49c210 100644
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -124,7 +124,8 @@ allocate_scalar(struct grate_fp_shader *fp, unsigned kind)
+    }
+ 
+    if (!fp->allocation_failed)
+-      fprintf(stderr, "GRATE FRAG: scalar register bank exhausted (spilling unsupported)\n");
++      fprintf(stderr, "GRATE FRAG: scalar register bank exhausted (spilling "
++                      "unsupported)\n");
+    fp->allocation_failed = true;
+    return 31;
+ }
+@@ -195,17 +196,18 @@ allocate_coordinate_row(struct grate_fp_shader *fp, const uint8_t *clobber,
+       }
+    }
+    if (!fp->allocation_failed)
+-      fprintf(stderr, "GRATE FRAG: no row register survives to the texture fetch (spilling unsupported)\n");
++      fprintf(stderr, "GRATE FRAG: no row register survives to the texture "
++                      "fetch (spilling unsupported)\n");
+    fp->allocation_failed = true;
+    return 31;
+ }
+ 
+ static struct fp_alu_dst_operand
+-fp_alu_dst(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst, int subreg, bool saturate)
++fp_alu_dst(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
++           int subreg, bool saturate)
+ {
+    struct fp_alu_dst_operand ret = { 0 };
+ 
+-
+    if (dst->File == TGSI_FILE_OUTPUT) {
+       ret.index = 2; // HACK: r2+r3 to match hard-coded store shader for now
+ 
+@@ -216,9 +218,11 @@ fp_alu_dst(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst, int
+       ret.write_low_sub_reg = (o % 2) == 0;
+       ret.write_high_sub_reg = (o % 2) != 0;
+    } else {
+-      assert(dst->File == TGSI_FILE_TEMPORARY && dst->Index <= GRATE_FP_MAX_TEMPS);
++      assert(dst->File == TGSI_FILE_TEMPORARY &&
++             dst->Index <= GRATE_FP_MAX_TEMPS);
+       if (fp->temp_dst[dst->Index][subreg] < 0) {
+-         /* Internal interpolation staging lives only within this instruction. */
++         /* Internal interpolation staging lives only within this instruction.
++          */
+          assert(dst->Index == fp->num_temporaries);
+          fp->temp_dst[dst->Index][subreg] = allocate_scalar(fp, false);
+          fp->temp_src[dst->Index][subreg] = fp->temp_dst[dst->Index][subreg];
+@@ -226,7 +230,8 @@ fp_alu_dst(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst, int
+       int location = fp->temp_dst[dst->Index][subreg];
+       ret.index = location & 0x7f;
+       ret.write_low_sub_reg = !(location & TEMP_HIGH);
+-      ret.write_high_sub_reg = !(location & TEMP_FX10) || (location & TEMP_HIGH);
++      ret.write_high_sub_reg =
++         !(location & TEMP_FX10) || (location & TEMP_HIGH);
+    }
+ 
+    ret.saturate = saturate;
+@@ -257,15 +262,18 @@ static struct fp_alu_src_operand
+ fp_tgsi_src(struct grate_fp_shader *fp, const struct tgsi_src_register *src,
+             unsigned component, struct fp_mfu_instr *mfu)
+ {
+-   unsigned swizzle[] = {src->SwizzleX, src->SwizzleY, src->SwizzleZ, src->SwizzleW};
++   unsigned swizzle[] = {src->SwizzleX, src->SwizzleY, src->SwizzleZ,
++                         src->SwizzleW};
+    unsigned comp = swizzle[component];
+    struct fp_alu_src_operand value;
+ 
+    switch (src->File) {
+    case TGSI_FILE_INPUT:
+-      /* Interpolate the selected source channel, not the destination channel. */
++      /* Interpolate the selected source channel, not the destination channel.
++       */
+       assert(mfu);
+-      assert(mfu->var[comp].op == FP_VAR_OP_NOP || mfu->var[comp].tram_row == src->Index);
++      assert(mfu->var[comp].op == FP_VAR_OP_NOP ||
++             mfu->var[comp].tram_row == src->Index);
+       mfu->var[comp].op = FP_VAR_OP_FP20;
+       mfu->var[comp].tram_row = src->Index;
+       fp->info.max_tram_row = MAX2(fp->info.max_tram_row, src->Index + 1);
+@@ -273,8 +281,9 @@ fp_tgsi_src(struct grate_fp_shader *fp, const struct tgsi_src_register *src,
+       break;
+    case TGSI_FILE_IMMEDIATE: {
+       float imm = fp->immediates[src->Index][comp];
+-      value = imm == 1.0f ? fp_alu_src_one() :
+-              imm == 0.0f ? fp_alu_src_zero() : fp_constant(fp, -1, imm);
++      value = imm == 1.0f   ? fp_alu_src_one()
++              : imm == 0.0f ? fp_alu_src_zero()
++                            : fp_constant(fp, -1, imm);
+       break;
+    }
+    case TGSI_FILE_CONSTANT:
+@@ -287,7 +296,8 @@ fp_tgsi_src(struct grate_fp_shader *fp, const struct tgsi_src_register *src,
+       assert(reg >= 0 || fp->allocation_failed);
+       value = fp_alu_src_row(0);
+       value.index = reg >= 0 ? reg & 0x7f : 31;
+-      value.datatype = (reg & TEMP_FX10) ? FP_DATATYPE_FIXED10 : FP_DATATYPE_FP20;
++      value.datatype =
++         (reg & TEMP_FX10) ? FP_DATATYPE_FIXED10 : FP_DATATYPE_FP20;
+       value.sub_reg_select_high = !!(reg & TEMP_HIGH);
+       break;
+    default:
+@@ -306,7 +316,8 @@ setup_interpolation(struct fp_mfu_instr *mfu)
+    for (unsigned k = 0; k < 2; k++) {
+       mfu->mul[k].dst = FP_MFU_MUL_DST_BARYCENTRIC_WEIGHT;
+       mfu->mul[k].src[0] = FP_MFU_MUL_SRC_SFU_RESULT;
+-      mfu->mul[k].src[1] = k ? FP_MFU_MUL_SRC_BARYCENTRIC_COEF_1 : FP_MFU_MUL_SRC_BARYCENTRIC_COEF_0;
++      mfu->mul[k].src[1] = k ? FP_MFU_MUL_SRC_BARYCENTRIC_COEF_1
++                             : FP_MFU_MUL_SRC_BARYCENTRIC_COEF_0;
+    }
+ }
+ 
+@@ -320,7 +331,8 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
+    list_inithead(&inst->link);
+ 
+    struct fp_mfu_instr *mfu = NULL;
+-   if (src->File == TGSI_FILE_INPUT || (rhs && rhs->File == TGSI_FILE_INPUT) ||
++   if (src->File == TGSI_FILE_INPUT ||
++       (rhs && rhs->File == TGSI_FILE_INPUT) ||
+        (third && third->File == TGSI_FILE_INPUT)) {
+       mfu = CALLOC_STRUCT(fp_mfu_instr);
+       list_inithead(&mfu->link);
+@@ -332,8 +344,10 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
+    if (dst->File == TGSI_FILE_OUTPUT) {
+       for (unsigned s = 0; s < 3; s++) {
+          const struct tgsi_src_register *operand = operands[s];
+-         if (!operand || operand->File != TGSI_FILE_TEMPORARY) continue;
+-         unsigned swizzle[] = {operand->SwizzleX, operand->SwizzleY, operand->SwizzleZ, operand->SwizzleW};
++         if (!operand || operand->File != TGSI_FILE_TEMPORARY)
++            continue;
++         unsigned swizzle[] = {operand->SwizzleX, operand->SwizzleY,
++                               operand->SwizzleZ, operand->SwizzleW};
+          for (unsigned c = 0; c < 4; c++) {
+             int loc = fp->temp_src[operand->Index][swizzle[c]];
+             if ((dst->WriteMask & (1 << c)) && loc >= 0 && (loc & 0x7f) < 4)
+@@ -341,10 +355,12 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
+          }
+       }
+    }
+-   bool direct_pack = output_stage && opcode == TGSI_OPCODE_MOV &&
+-      dst->WriteMask == TGSI_WRITEMASK_XYZW && src->File == TGSI_FILE_TEMPORARY &&
+-      src->SwizzleX == TGSI_SWIZZLE_X && src->SwizzleY == TGSI_SWIZZLE_Y &&
+-      src->SwizzleZ == TGSI_SWIZZLE_Z && src->SwizzleW == TGSI_SWIZZLE_W;
++   bool direct_pack =
++      output_stage && opcode == TGSI_OPCODE_MOV &&
++      dst->WriteMask == TGSI_WRITEMASK_XYZW &&
++      src->File == TGSI_FILE_TEMPORARY && src->SwizzleX == TGSI_SWIZZLE_X &&
++      src->SwizzleY == TGSI_SWIZZLE_Y && src->SwizzleZ == TGSI_SWIZZLE_Z &&
++      src->SwizzleW == TGSI_SWIZZLE_W;
+    for (unsigned c = 0; direct_pack && c < 4; c++)
+       direct_pack = fp->temp_src[src->Index][c] == (int)c;
+    if (direct_pack)
+@@ -358,12 +374,14 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
+    if (output_stage) {
+       unsigned reg = 16;
+       for (unsigned c = 0; c < 4; c++) {
+-         if (!(dst->WriteMask & (1 << c))) continue;
++         if (!(dst->WriteMask & (1 << c)))
++            continue;
+          while (reg < 24 && fp->occupied[reg])
+             reg++;
+          if (reg == 24) {
+             if (!fp->allocation_failed)
+-               fprintf(stderr, "GRATE FRAG: scalar register bank exhausted (spilling unsupported)\n");
++               fprintf(stderr, "GRATE FRAG: scalar register bank exhausted "
++                               "(spilling unsupported)\n");
+             fp->allocation_failed = true;
+             break;
+          }
+@@ -374,14 +392,16 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
+    int alu_instrs = 0;
+    list_inithead(&alu->link);
+    for (int slot = 0; slot < 4; ++slot) {
+-      static const unsigned pack_order[] = {2,3,0,1};
++      static const unsigned pack_order[] = {2, 3, 0, 1};
+       int i = direct_pack ? pack_order[slot] : slot;
+       if ((dst->WriteMask & (1 << i)) == 0)
+          continue;
+ 
+       struct fp_alu_src_operand a = fp_tgsi_src(fp, src, i, mfu);
+-      struct fp_alu_src_operand b = rhs ? fp_tgsi_src(fp, rhs, i, mfu) : fp_alu_src_one();
+-      struct fp_alu_instr op = fp_alu_sMOV(fp_alu_dst(fp, dst, i, saturate), a);
++      struct fp_alu_src_operand b =
++         rhs ? fp_tgsi_src(fp, rhs, i, mfu) : fp_alu_src_one();
++      struct fp_alu_instr op =
++         fp_alu_sMOV(fp_alu_dst(fp, dst, i, saturate), a);
+       op.src[1] = b;
+       switch (opcode) {
+       case TGSI_OPCODE_ADD:
+@@ -401,7 +421,8 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
+          op.src[1] = fp_alu_src_one();
+          op.src[2] = b;
+          op.src[2].negate = !b.negate;
+-         op.condition = opcode == TGSI_OPCODE_SGE ? FP_CONDITION_GEQUAL : FP_CONDITION_EQUAL;
++         op.condition = opcode == TGSI_OPCODE_SGE ? FP_CONDITION_GEQUAL
++                                                  : FP_CONDITION_EQUAL;
+          break;
+       case TGSI_OPCODE_CMP:
+          op.op = FP_ALU_OP_CSEL;
+@@ -446,9 +467,11 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
+       for (unsigned c = 0; c < 4; c++) {
+          struct fp_alu_dst_operand discard = {.index = 31};
+          nop->slots[c] = fp_alu_sMOV(discard, fp_alu_src_zero());
+-         if (!(dst->WriteMask & (1 << c))) continue;
++         if (!(dst->WriteMask & (1 << c)))
++            continue;
+          struct fp_alu_src_operand value = {.index = scratch[c]};
+-         store->slots[slot++] = fp_alu_sMOV(fp_alu_dst(fp, dst, c, saturate), value);
++         store->slots[slot++] =
++            fp_alu_sMOV(fp_alu_dst(fp, dst, c, saturate), value);
+       }
+       list_addtail(&nop->link, &fp->alu_instructions);
+       list_addtail(&store->link, &fp->alu_instructions);
+@@ -470,9 +493,12 @@ emit_TEX(struct grate_fp_shader *fp, const struct tgsi_full_instruction *tgsi)
+    const struct tgsi_src_register *sampler = &tgsi->Src[1].Register;
+    const struct tgsi_dst_register *dst = &tgsi->Dst[0].Register;
+    assert(tgsi->Texture.Texture == TGSI_TEXTURE_2D);
+-   assert((coord->File == TGSI_FILE_INPUT && !coord->Negate && !coord->Absolute) ||
+-          coord->File == TGSI_FILE_TEMPORARY || coord->File == TGSI_FILE_IMMEDIATE);
+-   assert(coord->File != TGSI_FILE_INPUT || (coord->SwizzleX == 0 && coord->SwizzleY == 1));
++   assert((coord->File == TGSI_FILE_INPUT && !coord->Negate &&
++           !coord->Absolute) ||
++          coord->File == TGSI_FILE_TEMPORARY ||
++          coord->File == TGSI_FILE_IMMEDIATE);
++   assert(coord->File != TGSI_FILE_INPUT ||
++          (coord->SwizzleX == 0 && coord->SwizzleY == 1));
+    assert(sampler->File == TGSI_FILE_SAMPLER && sampler->Index < 16);
+ 
+    struct fp_instr *interp = CALLOC_STRUCT(fp_instr);
+@@ -518,14 +544,16 @@ emit_TEX(struct grate_fp_shader *fp, const struct tgsi_full_instruction *tgsi)
+    list_inithead(&alu->link);
+    unsigned slot = 0;
+    for (unsigned i = 0; i < 4; i++) {
+-      if (!(dst->WriteMask & (1 << i))) continue;
++      if (!(dst->WriteMask & (1 << i)))
++         continue;
+       unsigned channel = i;
+       struct fp_alu_src_operand src = {
+          .index = 2 + channel / 2,
+          .datatype = FP_DATATYPE_FIXED10,
+          .sub_reg_select_high = channel % 2,
+       };
+-      alu->slots[slot++] = fp_alu_sMOV(fp_alu_dst(fp, dst, i, tgsi->Instruction.Saturate), src);
++      alu->slots[slot++] =
++         fp_alu_sMOV(fp_alu_dst(fp, dst, i, tgsi->Instruction.Saturate), src);
+    }
+    sample->alu_sched.address = list_length(&fp->alu_instructions);
+    sample->alu_sched.num_instructions = 1;
+@@ -680,8 +708,10 @@ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *
+ {
+    bool saturate = inst->Instruction.Saturate != 0;
+    for (unsigned i = 0; i < inst->Instruction.NumSrcRegs; i++) {
+-      if (inst->Src[i].Register.File == TGSI_FILE_CONSTANT && inst->Src[i].Register.Dimension)
+-         assert(inst->Src[i].Dimension.Index == 0 && !inst->Src[i].Dimension.Indirect);
++      if (inst->Src[i].Register.File == TGSI_FILE_CONSTANT &&
++          inst->Src[i].Register.Dimension)
++         assert(inst->Src[i].Dimension.Index == 0 &&
++                !inst->Src[i].Dimension.Indirect);
+    }
+ 
+    switch (inst->Instruction.Opcode) {
+@@ -692,8 +722,8 @@ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *
+       emit_RCP(fp, inst);
+       break;
+    case TGSI_OPCODE_MOV:
+-      emit_vALU(fp, &inst->Dst[0].Register, saturate,
+-                    &inst->Src[0].Register, NULL, NULL, TGSI_OPCODE_MOV);
++      emit_vALU(fp, &inst->Dst[0].Register, saturate, &inst->Src[0].Register,
++                NULL, NULL, TGSI_OPCODE_MOV);
+       break;
+ 
+    case TGSI_OPCODE_ADD:
+@@ -704,7 +734,8 @@ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *
+       const struct tgsi_src_register *a = &inst->Src[0].Register;
+       const struct tgsi_src_register *b = &inst->Src[1].Register;
+       struct tgsi_src_register staged = {0};
+-      if (a->File == TGSI_FILE_INPUT && b->File == TGSI_FILE_INPUT && a->Index != b->Index) {
++      if (a->File == TGSI_FILE_INPUT && b->File == TGSI_FILE_INPUT &&
++          a->Index != b->Index) {
+          /* One MFU packet interpolates one vec4. Stage A in allocator-owned
+           * scratch scalars before loading B. */
+          assert(fp->num_temporaries < GRATE_FP_MAX_TEMPS);
+@@ -721,7 +752,8 @@ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *
+          staged.SwizzleW = TGSI_SWIZZLE_W;
+          a = &staged;
+       }
+-      emit_vALU(fp, &inst->Dst[0].Register, saturate, a, b, NULL, inst->Instruction.Opcode);
++      emit_vALU(fp, &inst->Dst[0].Register, saturate, a, b, NULL,
++                inst->Instruction.Opcode);
+ 
+       break;
+    }
+@@ -740,13 +772,15 @@ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *
+             needs_stage |= (*inputs[i])->File == TGSI_FILE_INPUT &&
+                            (*inputs[j])->File == TGSI_FILE_INPUT &&
+                            (*inputs[i])->Index != (*inputs[j])->Index;
+-         if (!needs_stage) continue;
++         if (!needs_stage)
++            continue;
+          assert(fp->num_temporaries < GRATE_FP_MAX_TEMPS && !staged.File);
+          struct tgsi_dst_register scratch = {0};
+          scratch.File = TGSI_FILE_TEMPORARY;
+          scratch.Index = fp->num_temporaries;
+          scratch.WriteMask = TGSI_WRITEMASK_XYZW;
+-         emit_vALU(fp, &scratch, false, *inputs[i], NULL, NULL, TGSI_OPCODE_MOV);
++         emit_vALU(fp, &scratch, false, *inputs[i], NULL, NULL,
++                   TGSI_OPCODE_MOV);
+          staged.File = TGSI_FILE_TEMPORARY;
+          staged.Index = scratch.Index;
+          staged.SwizzleX = TGSI_SWIZZLE_X;
+@@ -755,7 +789,8 @@ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *
+          staged.SwizzleW = TGSI_SWIZZLE_W;
+          *inputs[i] = &staged;
+       }
+-      emit_vALU(fp, &inst->Dst[0].Register, saturate, a, b, c, TGSI_OPCODE_CMP);
++      emit_vALU(fp, &inst->Dst[0].Register, saturate, a, b, c,
++                TGSI_OPCODE_CMP);
+       break;
+    }
+ 
+@@ -803,7 +838,8 @@ emit_direct_varying_product(struct grate_fp_shader *fp,
+                             unsigned count)
+ {
+    if (count != 1 || code->Instruction.Opcode != TGSI_OPCODE_MUL ||
+-       code->Instruction.NumDstRegs != 1 || code->Instruction.NumSrcRegs != 2 ||
++       code->Instruction.NumDstRegs != 1 ||
++       code->Instruction.NumSrcRegs != 2 ||
+        code->Dst[0].Register.File != TGSI_FILE_OUTPUT ||
+        code->Dst[0].Register.WriteMask != TGSI_WRITEMASK_XYZW)
+       return false;
+@@ -814,8 +850,8 @@ emit_direct_varying_product(struct grate_fp_shader *fp,
+        a->Indirect || b->Indirect)
+       return false;
+    unsigned swizzle[2][4] = {
+-      {a->SwizzleX,a->SwizzleY,a->SwizzleZ,a->SwizzleW},
+-      {b->SwizzleX,b->SwizzleY,b->SwizzleZ,b->SwizzleW},
++      {a->SwizzleX, a->SwizzleY, a->SwizzleZ, a->SwizzleW},
++      {b->SwizzleX, b->SwizzleY, b->SwizzleZ, b->SwizzleW},
+    };
+    fp->info.num_inputs = 8;
+    fp->info.max_tram_row = 8;
+@@ -824,7 +860,8 @@ emit_direct_varying_product(struct grate_fp_shader *fp,
+          unsigned row = c * 2 + operand;
+          unsigned export = operand ? b->Index : a->Index;
+          fp->info.inputs[row].src = LINK_SRC(export + 1) | (row << 9);
+-         fp->info.inputs[row].dst = LINK_DST(swizzle[operand][c], operand, LINK_DST_FP20);
++         fp->info.inputs[row].dst =
++            LINK_DST(swizzle[operand][c], operand, LINK_DST_FP20);
+       }
+       struct fp_instr *inst = CALLOC_STRUCT(fp_instr);
+       struct fp_mfu_instr *mfu = CALLOC_STRUCT(fp_mfu_instr);
+@@ -842,10 +879,13 @@ emit_direct_varying_product(struct grate_fp_shader *fp,
+       inst->alu_sched.num_instructions = 1;
+       struct fp_alu_src_operand va = fp_alu_src_row(0);
+       struct fp_alu_src_operand vb = fp_alu_src_row(1);
+-      va.negate = a->Negate; va.absolute_value = a->Absolute;
+-      vb.negate = b->Negate; vb.absolute_value = b->Absolute;
++      va.negate = a->Negate;
++      va.absolute_value = a->Absolute;
++      vb.negate = b->Negate;
++      vb.absolute_value = b->Absolute;
+       alu->slots[0] = fp_alu_sMOV(fp_alu_dst(fp, &code->Dst[0].Register, c,
+-                                           code->Instruction.Saturate), va);
++                                             code->Instruction.Saturate),
++                                  va);
+       alu->slots[0].src[1] = vb;
+       if (c == 3) {
+          inst->dw.enable = 1;
+@@ -1267,12 +1307,15 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+       tgsi_parse_token(tgsi);
+       switch (tgsi->FullToken.Token.Type) {
+       case TGSI_TOKEN_TYPE_IMMEDIATE: {
+-         const struct tgsi_full_immediate *imm = &tgsi->FullToken.FullImmediate;
+-         unsigned n = imm->Immediate.NrTokens - 1; /* number of 32-bit values: 1 to 4 */
++         const struct tgsi_full_immediate *imm =
++            &tgsi->FullToken.FullImmediate;
++         unsigned n =
++            imm->Immediate.NrTokens - 1; /* number of 32-bit values: 1 to 4 */
+ 
+          assert(fp->num_immediates < GRATE_FP_MAX_IMMEDIATES);
+          for (unsigned i = 0; i < 4; ++i)
+-            fp->immediates[fp->num_immediates][i] = i < n ? imm->u[i].Float : 0.0f;
++            fp->immediates[fp->num_immediates][i] =
++               i < n ? imm->u[i].Float : 0.0f;
+          fp->num_immediates++;
+          break;
+       }
+@@ -1283,13 +1326,17 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+ 
+       case TGSI_TOKEN_TYPE_INSTRUCTION:
+          if (tgsi->FullToken.FullInstruction.Instruction.Opcode != TGSI_OPCODE_END)
+-            util_dynarray_append_typed(&instructions, struct tgsi_full_instruction, tgsi->FullToken.FullInstruction);
++            util_dynarray_append_typed(&instructions,
++                                       struct tgsi_full_instruction,
++                                       tgsi->FullToken.FullInstruction);
+          break;
+       }
+    }
+ 
+-   if (emit_direct_varying_product(fp, instructions.data,
+-            util_dynarray_num_elements(&instructions, struct tgsi_full_instruction))) {
++   if (emit_direct_varying_product(
++          fp, instructions.data,
++          util_dynarray_num_elements(&instructions,
++                                     struct tgsi_full_instruction))) {
+       util_dynarray_fini(&instructions);
+       return;
+    }
+@@ -1302,10 +1349,12 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+    int output_temps[16];
+    unsigned output_masks[16] = {0};
+    memset(output_temps, -1, sizeof(output_temps));
+-   util_dynarray_foreach(&instructions, struct tgsi_full_instruction, instruction) {
++   util_dynarray_foreach (&instructions, struct tgsi_full_instruction,
++                          instruction) {
+       for (unsigned d = 0; d < instruction->Instruction.NumDstRegs; d++) {
+          struct tgsi_dst_register *dst = &instruction->Dst[d].Register;
+-         if (dst->File != TGSI_FILE_OUTPUT) continue;
++         if (dst->File != TGSI_FILE_OUTPUT)
++            continue;
+          unsigned index = dst->Index;
+          assert(index < 16);
+          if (output_temps[index] < 0)
+@@ -1343,11 +1392,13 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+                                  store);
+    }
+    assert(fp->num_temporaries < GRATE_FP_MAX_TEMPS);
+-   unsigned count = util_dynarray_num_elements(&instructions, struct tgsi_full_instruction);
++   unsigned count =
++      util_dynarray_num_elements(&instructions, struct tgsi_full_instruction);
+    struct tgsi_full_instruction *code = instructions.data;
+    count = forward_tex_coord(code, count);
+    count = eliminate_dead_code(code, count);
+-   uint8_t (*live_after)[GRATE_FP_MAX_TEMPS] = calloc(count + 1, sizeof(*live_after));
++   uint8_t (*live_after)[GRATE_FP_MAX_TEMPS] =
++      calloc(count + 1, sizeof(*live_after));
+    assert(live_after);
+    int last_fetch = -1;
+    for (int n = (int)count - 1; n >= 0; n--) {
+@@ -1365,7 +1416,8 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+          if (reg->File == TGSI_FILE_INPUT && last_fetch < 0)
+             last_fetch = n;
+          if (reg->File == TGSI_FILE_TEMPORARY)
+-            live_after[n][reg->Index] |= tgsi_util_get_inst_usage_mask(inst, src);
++            live_after[n][reg->Index] |=
++               tgsi_util_get_inst_usage_mask(inst, src);
+       }
+    }
+    /* Rows each instruction overwrites, and where the last sampled computed
+@@ -1379,13 +1431,18 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+       has_fetch |= code[n].Instruction.Opcode == TGSI_OPCODE_TEX;
+    for (unsigned n = 0; n < count; n++) {
+       const struct tgsi_full_instruction *inst = &code[n];
+-      unsigned write_mask = inst->Instruction.NumDstRegs ? inst->Dst[0].Register.WriteMask : 0;
++      unsigned write_mask =
++         inst->Instruction.NumDstRegs ? inst->Dst[0].Register.WriteMask : 0;
+       for (unsigned src = 0; src < inst->Instruction.NumSrcRegs; src++) {
+          const struct tgsi_src_register *reg = &inst->Src[src].Register;
+-         if (reg->File != TGSI_FILE_INPUT) continue;
+-         unsigned swizzle[] = {reg->SwizzleX, reg->SwizzleY, reg->SwizzleZ, reg->SwizzleW};
++         if (reg->File != TGSI_FILE_INPUT)
++            continue;
++         unsigned swizzle[] = {reg->SwizzleX, reg->SwizzleY, reg->SwizzleZ,
++                               reg->SwizzleW};
+          for (unsigned c = 0; c < 4; c++)
+-            if (inst->Instruction.Opcode == TGSI_OPCODE_TEX ? c < 2 : (write_mask & (1 << c)))
++            if (inst->Instruction.Opcode == TGSI_OPCODE_TEX
++                   ? c < 2
++                   : (write_mask & (1 << c)))
+                clobber[n] |= 1 << swizzle[c];
+       }
+       if (inst->Instruction.Opcode == TGSI_OPCODE_TEX) {
+@@ -1405,12 +1462,16 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+       int input = -1;
+       for (unsigned src = 0; src < inst->Instruction.NumSrcRegs; src++) {
+          const struct tgsi_src_register *reg = &inst->Src[src].Register;
+-         if (reg->File != TGSI_FILE_INPUT) continue;
+-         if (input >= 0 && input != reg->Index) single_input = false;
++         if (reg->File != TGSI_FILE_INPUT)
++            continue;
++         if (input >= 0 && input != reg->Index)
++            single_input = false;
+          input = reg->Index;
+       }
+-      fp->late_rows = (int)n > last_fetch || ((int)n == last_fetch && single_input);
+-      fp->texture_rows = (int)n == last_fetch && inst->Instruction.Opcode == TGSI_OPCODE_TEX;
++      fp->late_rows =
++         (int)n > last_fetch || ((int)n == last_fetch && single_input);
++      fp->texture_rows =
++         (int)n == last_fetch && inst->Instruction.Opcode == TGSI_OPCODE_TEX;
+       memset(fp->claimed, 0, sizeof(fp->claimed));
+       memset(fp->reusable, 0, sizeof(fp->reusable));
+       memcpy(fp->temp_dst, fp->temp_src, sizeof(fp->temp_dst));
+@@ -1420,21 +1481,32 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+                        inst->Instruction.Opcode == TGSI_OPCODE_SEQ;
+       for (unsigned d = 0; d < inst->Instruction.NumDstRegs; d++) {
+          const struct tgsi_dst_register *dst = &inst->Dst[d].Register;
+-         if (dst->File != TGSI_FILE_TEMPORARY) continue;
++         if (dst->File != TGSI_FILE_TEMPORARY)
++            continue;
+          for (unsigned c = 0; c < 4; c++) {
+-            if (!(dst->WriteMask & (1 << c))) continue;
+-            unsigned kind = predicate ? 2 : inst->Instruction.Opcode == TGSI_OPCODE_TEX ? 1 : 0;
+-            if (inst->Instruction.Opcode == TGSI_OPCODE_MOV || inst->Instruction.Opcode == TGSI_OPCODE_CMP) {
++            if (!(dst->WriteMask & (1 << c)))
++               continue;
++            unsigned kind = predicate                                     ? 2
++                            : inst->Instruction.Opcode == TGSI_OPCODE_TEX ? 1
++                                                                          : 0;
++            if (inst->Instruction.Opcode == TGSI_OPCODE_MOV ||
++                inst->Instruction.Opcode == TGSI_OPCODE_CMP) {
+                bool packed = true;
+-               unsigned first = inst->Instruction.Opcode == TGSI_OPCODE_CMP ? 1 : 0;
+-               for (unsigned src = first; src < inst->Instruction.NumSrcRegs; src++) {
+-                  const struct tgsi_src_register *operand = &inst->Src[src].Register;
+-                  unsigned swizzle[] = {operand->SwizzleX, operand->SwizzleY, operand->SwizzleZ, operand->SwizzleW};
+-                  packed &= operand->File == TGSI_FILE_TEMPORARY &&
+-                            fp->temp_src[operand->Index][swizzle[c]] >= 0 &&
+-                            (fp->temp_src[operand->Index][swizzle[c]] & TEMP_FX10);
++               unsigned first =
++                  inst->Instruction.Opcode == TGSI_OPCODE_CMP ? 1 : 0;
++               for (unsigned src = first; src < inst->Instruction.NumSrcRegs;
++                    src++) {
++                  const struct tgsi_src_register *operand =
++                     &inst->Src[src].Register;
++                  unsigned swizzle[] = {operand->SwizzleX, operand->SwizzleY,
++                                        operand->SwizzleZ, operand->SwizzleW};
++                  packed &=
++                     operand->File == TGSI_FILE_TEMPORARY &&
++                     fp->temp_src[operand->Index][swizzle[c]] >= 0 &&
++                     (fp->temp_src[operand->Index][swizzle[c]] & TEMP_FX10);
+                }
+-               if (packed) kind = 1;
++               if (packed)
++                  kind = 1;
+             }
+             memset(fp->reusable, 0, sizeof(fp->reusable));
+             bool simple = inst->Instruction.Opcode != TGSI_OPCODE_TEX;
+@@ -1442,27 +1514,45 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+                simple &= inst->Src[src].Register.File != TGSI_FILE_INPUT;
+             if (simple) {
+                for (unsigned reg = 0; reg < 24; reg++) {
+-                  if (reg >= 4 && reg < 16) continue;
++                  if (reg >= 4 && reg < 16)
++                     continue;
+                   unsigned needed = 0;
+-                  for (unsigned t = 0; t < fp->num_temporaries; t++) for (unsigned k = 0; k < 4; k++) {
+-                     int loc = fp->temp_src[t][k];
+-                     if (loc < 0 || (loc & 0x7f) != reg) continue;
+-                     unsigned mask = (loc & TEMP_FX10) ? ((loc & TEMP_HIGH) ? 2 : 1) : 3;
+-                     bool overwritten = false;
+-                     for (unsigned d2 = 0; d2 < inst->Instruction.NumDstRegs; d2++) {
+-                        const struct tgsi_dst_register *out = &inst->Dst[d2].Register;
+-                        overwritten |= out->File == TGSI_FILE_TEMPORARY && out->Index == t && (out->WriteMask & (1 << k));
++                  for (unsigned t = 0; t < fp->num_temporaries; t++)
++                     for (unsigned k = 0; k < 4; k++) {
++                        int loc = fp->temp_src[t][k];
++                        if (loc < 0 || (loc & 0x7f) != reg)
++                           continue;
++                        unsigned mask = (loc & TEMP_FX10)
++                                           ? ((loc & TEMP_HIGH) ? 2 : 1)
++                                           : 3;
++                        bool overwritten = false;
++                        for (unsigned d2 = 0;
++                             d2 < inst->Instruction.NumDstRegs; d2++) {
++                           const struct tgsi_dst_register *out =
++                              &inst->Dst[d2].Register;
++                           overwritten |= out->File == TGSI_FILE_TEMPORARY &&
++                                          out->Index == t &&
++                                          (out->WriteMask & (1 << k));
++                        }
++                        if (!overwritten && (live_after[n + 1][t] & (1 << k)))
++                           needed |= mask;
+                      }
+-                     if (!overwritten && (live_after[n + 1][t] & (1 << k))) needed |= mask;
+-                  }
+-                  for (unsigned src = 0; src < inst->Instruction.NumSrcRegs; src++) {
+-                     const struct tgsi_src_register *operand = &inst->Src[src].Register;
+-                     if (operand->File != TGSI_FILE_TEMPORARY) continue;
+-                     unsigned swizzle[] = {operand->SwizzleX, operand->SwizzleY, operand->SwizzleZ, operand->SwizzleW};
++                  for (unsigned src = 0; src < inst->Instruction.NumSrcRegs;
++                       src++) {
++                     const struct tgsi_src_register *operand =
++                        &inst->Src[src].Register;
++                     if (operand->File != TGSI_FILE_TEMPORARY)
++                        continue;
++                     unsigned swizzle[] = {
++                        operand->SwizzleX, operand->SwizzleY,
++                        operand->SwizzleZ, operand->SwizzleW};
+                      for (unsigned lane = c + 1; lane < 4; lane++) {
+                         int loc = fp->temp_src[operand->Index][swizzle[lane]];
+-                        if ((dst->WriteMask & (1 << lane)) && loc >= 0 && (loc & 0x7f) == reg)
+-                           needed |= (loc & TEMP_FX10) ? ((loc & TEMP_HIGH) ? 2 : 1) : 3;
++                        if ((dst->WriteMask & (1 << lane)) && loc >= 0 &&
++                            (loc & 0x7f) == reg)
++                           needed |= (loc & TEMP_FX10)
++                                        ? ((loc & TEMP_HIGH) ? 2 : 1)
++                                        : 3;
+                      }
+                   }
+                   fp->reusable[reg] = (~needed) & 3;
+@@ -1484,14 +1574,22 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+       if (grate_debug & GRATE_DEBUG_TGSI) {
+          fprintf(stderr, "ALLOC %u opcode %u", n, inst->Instruction.Opcode);
+          for (unsigned src = 0; src < inst->Instruction.NumSrcRegs; src++) {
+-            const struct tgsi_src_register *operand = &inst->Src[src].Register;
++            const struct tgsi_src_register *operand =
++               &inst->Src[src].Register;
+             if (operand->File == TGSI_FILE_TEMPORARY)
+-               fprintf(stderr, " src%u[%d,%d,%d,%d]", src, fp->temp_src[operand->Index][0],fp->temp_src[operand->Index][1],fp->temp_src[operand->Index][2],fp->temp_src[operand->Index][3]);
++               fprintf(stderr, " src%u[%d,%d,%d,%d]", src,
++                       fp->temp_src[operand->Index][0],
++                       fp->temp_src[operand->Index][1],
++                       fp->temp_src[operand->Index][2],
++                       fp->temp_src[operand->Index][3]);
+          }
+          for (unsigned d = 0; d < inst->Instruction.NumDstRegs; d++) {
+             const struct tgsi_dst_register *out = &inst->Dst[d].Register;
+             if (out->File == TGSI_FILE_TEMPORARY)
+-               fprintf(stderr, " dst[%d,%d,%d,%d]", fp->temp_dst[out->Index][0],fp->temp_dst[out->Index][1],fp->temp_dst[out->Index][2],fp->temp_dst[out->Index][3]);
++               fprintf(
++                  stderr, " dst[%d,%d,%d,%d]", fp->temp_dst[out->Index][0],
++                  fp->temp_dst[out->Index][1], fp->temp_dst[out->Index][2],
++                  fp->temp_dst[out->Index][3]);
+          }
+          fprintf(stderr, "\n");
+       }
+@@ -1504,7 +1602,8 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+                assert(reg >= 0 || fp->allocation_failed);
+                fp->temp_src[t][c] = reg;
+                if (reg >= 0 && reg != 31) {
+-                  unsigned mask = (reg & TEMP_FX10) ? ((reg & TEMP_HIGH) ? 2 : 1) : 3;
++                  unsigned mask =
++                     (reg & TEMP_FX10) ? ((reg & TEMP_HIGH) ? 2 : 1) : 3;
+                   fp->occupied[reg & 0x7f] |= mask;
+                }
+             } else {
+@@ -1518,5 +1617,4 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+    free(clobber);
+    free(live_after);
+    util_dynarray_fini(&instructions);
+-
+ }
+diff --git a/src/gallium/drivers/grate/grate_bo.c b/src/gallium/drivers/grate/grate_bo.c
+index db12ccfd324..3a5f9084eaa 100644
+--- a/src/gallium/drivers/grate/grate_bo.c
++++ b/src/gallium/drivers/grate/grate_bo.c
+@@ -164,48 +164,49 @@ grate_bo_get_handle(struct grate_bo *bo, uint32_t *handle)
+     return 0;
+ }
+ 
+-int grate_bo_wait(struct grate_bo *bo)
++int
++grate_bo_wait(struct grate_bo *bo)
+ {
+-    if (!bo->pending_channel)
+-        return 0;
+-    return drm_tegra_fence_wait(&bo->pending, 1000000000UL, "bo");
++   if (!bo->pending_channel)
++      return 0;
++   return drm_tegra_fence_wait(&bo->pending, 1000000000UL, "bo");
+ }
+ 
+ int grate_bo_map(struct grate_bo *bo, void **ptr)
+ {
+-    int wait_err = grate_bo_wait(bo);
+-    if (wait_err)
+-        return wait_err;
+-    struct grate_device *drm = bo->drm;
++   int wait_err = grate_bo_wait(bo);
++   if (wait_err)
++      return wait_err;
++   struct grate_device *drm = bo->drm;
+ 
+-    if (!bo->map) {
+-        struct drm_tegra_gem_mmap args;
+-        int err;
+-
+-        memset(&args, 0, sizeof(args));
+-        args.handle = bo->handle;
+-
+-        err = drmCommandWriteRead(drm->fd, DRM_TEGRA_GEM_MMAP, &args,
+-                                  sizeof(args));
+-        if (err < 0) {
+-            grate_bo_loge(bo, "failed get mapping offset err %d (%s)\n",
+-               err, strerror(-err));
+-            return -errno;
+-        }
+-
+-        bo->offset = args.offset;
+-
+-        bo->map = os_mmap(NULL, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED,
+-                           drm->fd, bo->offset);
+-        if (bo->map == MAP_FAILED) {
+-            grate_bo_loge(bo, "failed to map offset 0x%llX err %d (%s)\n",
+-               args.offset, -errno, strerror(errno));
+-            bo->map = NULL;
+-            return -errno;
+-        }
+-
+-        grate_bo_logd(bo, "success\n");
+-    }
++   if (!bo->map) {
++      struct drm_tegra_gem_mmap args;
++      int err;
++
++      memset(&args, 0, sizeof(args));
++      args.handle = bo->handle;
++
++      err = drmCommandWriteRead(drm->fd, DRM_TEGRA_GEM_MMAP, &args,
++                                sizeof(args));
++      if (err < 0) {
++         grate_bo_loge(bo, "failed get mapping offset err %d (%s)\n", err,
++                       strerror(-err));
++         return -errno;
++      }
++
++      bo->offset = args.offset;
++
++      bo->map = os_mmap(NULL, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED,
++                        drm->fd, bo->offset);
++      if (bo->map == MAP_FAILED) {
++         grate_bo_loge(bo, "failed to map offset 0x%llX err %d (%s)\n",
++                       args.offset, -errno, strerror(errno));
++         bo->map = NULL;
++         return -errno;
++      }
++
++      grate_bo_logd(bo, "success\n");
++   }
+ 
+     if (ptr)
+         *ptr = bo->map;
+@@ -233,26 +234,25 @@ int grate_bo_unmap(struct grate_bo *bo)
+ 
+ int grate_bo_export(struct grate_bo *bo, uint32_t flags)
+ {
+-    int wait_err = grate_bo_wait(bo);
+-    if (wait_err)
+-        return wait_err;
+-    int fd, err;
+-
+-    /* DRM_RDWR: the importer (e.g. the compositor) needs to be able to
+-     * write through this fd too, not just read it -- without it, CPU
+-     * access to an imported scanout buffer (cursor updates, clears) fails.
+-     * Ported from grate-surface-rt-48283c9.patch (github.com/grate-driver/
+-     * mesa#19), which added the same flag at the old drm_tegra_bo_to_dmabuf()
+-     * call site before that wrapper was folded into this file.
+-     */
+-    flags |= DRM_CLOEXEC | DRM_RDWR;
+-
+-    err = drmPrimeHandleToFD(bo->drm->fd, bo->handle, flags, &fd);
+-    if (err < 0) {
+-        grate_bo_loge(bo, "failed err %d strerror(%s)\n",
+-            err, strerror(-err));
+-        return err;
+-    }
++   int wait_err = grate_bo_wait(bo);
++   if (wait_err)
++      return wait_err;
++   int fd, err;
++
++   /* DRM_RDWR: the importer (e.g. the compositor) needs to be able to
++    * write through this fd too, not just read it -- without it, CPU
++    * access to an imported scanout buffer (cursor updates, clears) fails.
++    * Ported from grate-surface-rt-48283c9.patch (github.com/grate-driver/
++    * mesa#19), which added the same flag at the old drm_tegra_bo_to_dmabuf()
++    * call site before that wrapper was folded into this file.
++    */
++   flags |= DRM_CLOEXEC | DRM_RDWR;
++
++   err = drmPrimeHandleToFD(bo->drm->fd, bo->handle, flags, &fd);
++   if (err < 0) {
++      grate_bo_loge(bo, "failed err %d strerror(%s)\n", err, strerror(-err));
++      return err;
++   }
+ 
+     return fd;
+ }
+@@ -265,18 +265,19 @@ int grate_bo_export(struct grate_bo *bo, uint32_t flags)
+  * call site. Ported from grate-surface-rt-48283c9.patch (github.com/
+  * grate-driver/mesa#19); this file's own version of that patch's fix.
+  */
+-static off_t fd_get_size(int fd)
++static off_t
++fd_get_size(int fd)
+ {
+-    off_t size;
++   off_t size;
+ 
+-    size = lseek(fd, 0, SEEK_END);
+-    if (size <= 0)
+-        return -errno;
++   size = lseek(fd, 0, SEEK_END);
++   if (size <= 0)
++      return -errno;
+ 
+-    if (lseek(fd, 0, SEEK_SET) != 0)
+-        return -errno;
++   if (lseek(fd, 0, SEEK_SET) != 0)
++      return -errno;
+ 
+-    return size;
++   return size;
+ }
+ 
+ struct grate_bo*
+@@ -304,8 +305,9 @@ grate_bo_import(struct grate_device *drm, int fd)
+          grate_loge("fd_get_size err %d strerror(%s)\n", (int) size, strerror((int) -size));
+          goto error;
+       }
+-      if ((uint64_t) size > UINT32_MAX) {
+-         grate_loge("fd_get_size %lld overflows bo->size (uint32_t)\n", (long long) size);
++      if ((uint64_t)size > UINT32_MAX) {
++         grate_loge("fd_get_size %lld overflows bo->size (uint32_t)\n",
++                    (long long)size);
+          goto error;
+       }
+ 
+diff --git a/src/gallium/drivers/grate/grate_bo.h b/src/gallium/drivers/grate/grate_bo.h
+index 8b89318ed24..355c24efc03 100644
+--- a/src/gallium/drivers/grate/grate_bo.h
++++ b/src/gallium/drivers/grate/grate_bo.h
+@@ -39,10 +39,11 @@ struct grate_bo {
+     uint32_t size;
+     int32_t refcnt;
+     void *map;
+-    /* Last GPU use, including reads. The channel retains this BO until drain. */
++    /* Last GPU use, including reads. The channel retains this BO until drain.
++     */
+     struct drm_tegra_channel *pending_channel;
+     struct drm_tegra_fence pending;
+-    
++
+     /* List of channel mappings where made for this BO, for cleanup */
+     struct util_dynarray channel_maps;
+ };
+diff --git a/src/gallium/drivers/grate/grate_compiler.h b/src/gallium/drivers/grate/grate_compiler.h
+index a085ea88510..d291757358e 100644
+--- a/src/gallium/drivers/grate/grate_compiler.h
++++ b/src/gallium/drivers/grate/grate_compiler.h
+@@ -9,21 +9,27 @@
+ struct tgsi_parse_context;
+ 
+ /*
+- * Constant RAM layout of a vertex program. Immediates (TGSI_FILE_IMMEDIATE) come first: immediate i is vec4 slot i. The
+- * application's uniforms (TGSI_FILE_CONSTANT) follow: uniform k is vec4 slot num_immediates + k. Both are uploaded as one
+- * block starting at slot 0 (see emit_vs_uniforms()). A write to REG_TGR3D_VPE_CONST_OFFSET with a non-zero index was
+- * found not to move the upload position (2026-10-31, on hardware: data written after it still landed in slot 0), so
+- * everything must start at offset 0, and the layout has to be known when the program is compiled; this is why the
+- * immediates are put first and the uniforms moved up, and not the other way round.
++ * Constant RAM layout of a vertex program. Immediates (TGSI_FILE_IMMEDIATE)
++ * come first: immediate i is vec4 slot i. The application's uniforms
++ * (TGSI_FILE_CONSTANT) follow: uniform k is vec4 slot num_immediates + k.
++ * Both are uploaded as one block starting at slot 0 (see emit_vs_uniforms()).
++ * A write to REG_TGR3D_VPE_CONST_OFFSET with a non-zero index was found not
++ * to move the upload position (2026-10-31, on hardware: data written after it
++ * still landed in slot 0), so everything must start at offset 0, and the
++ * layout has to be known when the program is compiled; this is why the
++ * immediates are put first and the uniforms moved up, and not the other way
++ * round.
+  */
+ #define GRATE_VP_MAX_IMMEDIATES 32
+ 
+ struct grate_vp_shader {
+    struct list_head instructions;
+    uint16_t output_mask;
+-   uint32_t immediates[GRATE_VP_MAX_IMMEDIATES][4]; /* raw 32-bit words, slot i of the immediates */
++   uint32_t immediates[GRATE_VP_MAX_IMMEDIATES]
++                      [4]; /* raw 32-bit words, slot i of the immediates */
+    unsigned num_immediates;
+-   unsigned num_temps; /* TGSI temporaries declared; scratch temporaries start here */
++   unsigned num_temps; /* TGSI temporaries declared; scratch temporaries start
++                          here */
+ };
+ 
+ struct grate_fp_info {
+@@ -44,7 +50,7 @@ struct grate_fp_info {
+ };
+ 
+ #define GRATE_FP_MAX_IMMEDIATES 32
+-#define GRATE_FP_MAX_TEMPS 64
++#define GRATE_FP_MAX_TEMPS      64
+ 
+ struct grate_fp_shader {
+    unsigned num_temporaries;
+diff --git a/src/gallium/drivers/grate/grate_context.h b/src/gallium/drivers/grate/grate_context.h
+index ffb540106e2..2a2e0f9a1a6 100644
+--- a/src/gallium/drivers/grate/grate_context.h
++++ b/src/gallium/drivers/grate/grate_context.h
+@@ -14,7 +14,8 @@
+ 
+ #include "fp/blend.h"
+ 
+-/* Hardware surface slot of the stencil plane (slot 0 is depth, colour output i is slot i + 1). */
++/* Hardware surface slot of the stencil plane (slot 0 is depth, colour output
++ * i is slot i + 1). */
+ #define GRATE_STENCIL_SLOT 2
+ 
+ struct grate_framebuffer_state {
+@@ -24,7 +25,8 @@ struct grate_framebuffer_state {
+    uint32_t rt_params[REG_TGR3D_GLOBAL_SURFDESC_LENGTH];
+    uint32_t rt_offsets[REG_TGR3D_GLOBAL_SURFDESC_LENGTH];
+    uint32_t rt_mask;
+-   /* The bound depth buffer has a stencil plane, bound as surface STENCIL_SLOT. */
++   /* The bound depth buffer has a stencil plane, bound as surface
++    * STENCIL_SLOT. */
+    bool has_stencil;
+ };
+ 
+diff --git a/src/gallium/drivers/grate/grate_draw.c b/src/gallium/drivers/grate/grate_draw.c
+index 2e0995b879d..c582794521b 100644
+--- a/src/gallium/drivers/grate/grate_draw.c
++++ b/src/gallium/drivers/grate/grate_draw.c
+@@ -442,11 +442,18 @@ grate_draw_vbo(struct pipe_context *pcontext,
+     * Restore broadcast writes before emitting the remaining draw state.
+     */
+    if (context->drm->soc_id == DRM_TEGRA_SOC_T30) {
+-      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_GSHIM_WRITE_MASK, 1));
+-      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_GLOBAL_HORIZONTAL_SWATH_RENDERING, 1));
+-      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_GSHIM_WRITE_MASK, 2));
+-      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_GLOBAL_HORIZONTAL_SWATH_RENDERING, 3));
+-      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_GSHIM_WRITE_MASK, 3));
++      GRATE_PUSHBUF_WORD(ptr,
++                         host1x_opcode_imm(REG_TGR3D_GSHIM_WRITE_MASK, 1));
++      GRATE_PUSHBUF_WORD(
++         ptr,
++         host1x_opcode_imm(REG_TGR3D_GLOBAL_HORIZONTAL_SWATH_RENDERING, 1));
++      GRATE_PUSHBUF_WORD(ptr,
++                         host1x_opcode_imm(REG_TGR3D_GSHIM_WRITE_MASK, 2));
++      GRATE_PUSHBUF_WORD(
++         ptr,
++         host1x_opcode_imm(REG_TGR3D_GLOBAL_HORIZONTAL_SWATH_RENDERING, 3));
++      GRATE_PUSHBUF_WORD(ptr,
++                         host1x_opcode_imm(REG_TGR3D_GSHIM_WRITE_MASK, 3));
+    }
+ 
+    /* draw params */
+diff --git a/src/gallium/drivers/grate/grate_program.c b/src/gallium/drivers/grate/grate_program.c
+index 29310851b47..12084a8e7c8 100644
+--- a/src/gallium/drivers/grate/grate_program.c
++++ b/src/gallium/drivers/grate/grate_program.c
+@@ -181,7 +181,8 @@ create_blend_blob(const struct grate_shader_blob *source, unsigned fp_count,
+       return false;
+    struct util_dynarray result;
+    util_dynarray_init(&result, NULL);
+-#define BLEND_PUSH(value) util_dynarray_append_typed(&result, uint32_t, (value))
++#define BLEND_PUSH(value)                                                    \
++   util_dynarray_append_typed(&result, uint32_t, (value))
+    unsigned seen = 0;
+    for (unsigned i = 0; i < (unsigned)source->num_commands;) {
+       uint32_t command = source->commands[i++];
+@@ -189,27 +190,42 @@ create_blend_blob(const struct grate_shader_blob *source, unsigned fp_count,
+       unsigned reg = (command >> 16) & 0xfff;
+       unsigned count = command & 0xffff;
+       if (opcode == 4) {
+-         if (reg != REG_TGR3D_PSEQ_FLUSH) BLEND_PUSH(command);
++         if (reg != REG_TGR3D_PSEQ_FLUSH)
++            BLEND_PUSH(command);
+          continue;
+       }
+-      if ((opcode != 1 && opcode != 2) || count > (unsigned)source->num_commands - i)
++      if ((opcode != 1 && opcode != 2) ||
++          count > (unsigned)source->num_commands - i)
+          goto fail;
+       const uint32_t *values = source->commands + i;
+       i += count;
+-      if (opcode == 1 && reg == REG_TGR3D_PSEQ_COMMAND_EVEN(0) && count == 1) {
+-         BLEND_PUSH(command); BLEND_PUSH(0x20006000 | (fp_count + 1));
++      if (opcode == 1 && reg == REG_TGR3D_PSEQ_COMMAND_EVEN(0) &&
++          count == 1) {
++         BLEND_PUSH(command);
++         BLEND_PUSH(0x20006000 | (fp_count + 1));
+          continue;
+       }
+       if (opcode == 1 && reg == REG_TGR3D_PSEQ_DWR_IF_STATE && count == 1) {
+-         BLEND_PUSH(command); BLEND_PUSH(TGR3D_PSEQ_DWR_IF_STATE_COUNT(fp_count + 1));
++         BLEND_PUSH(command);
++         BLEND_PUSH(TGR3D_PSEQ_DWR_IF_STATE_COUNT(fp_count + 1));
+          continue;
+       }
+       unsigned extra = 0, last = 0, bit = 0;
+       if (opcode == 2) {
+          switch (reg) {
+-         case REG_TGR3D_PSEQ_INST_DATA: extra = 1; last = 0x00810008; bit = 1; break;
+-         case REG_TGR3D_AT_REMAP_DATA: extra = 1; bit = 2; break;
+-         case REG_TGR3D_TEX_INST_DATA: extra = 1; bit = 4; break;
++         case REG_TGR3D_PSEQ_INST_DATA:
++            extra = 1;
++            last = 0x00810008;
++            bit = 1;
++            break;
++         case REG_TGR3D_AT_REMAP_DATA:
++            extra = 1;
++            bit = 2;
++            break;
++         case REG_TGR3D_TEX_INST_DATA:
++            extra = 1;
++            bit = 4;
++            break;
+          case REG_TGR3D_ALU_REMAP_DATA:
+             extra = 1;
+             last = (alu_count << 2) | packets;
+@@ -219,20 +235,32 @@ create_blend_blob(const struct grate_shader_blob *source, unsigned fp_count,
+             extra = 8 * packets;
+             bit = 16;
+             break;
+-         case REG_TGR3D_ALU_P2CX_DATA: extra = 1; bit = 32; break;
+-         case REG_TGR3D_DW_INST_DATA: extra = 1; last = 0x00028005; bit = 64; break;
++         case REG_TGR3D_ALU_P2CX_DATA:
++            extra = 1;
++            bit = 32;
++            break;
++         case REG_TGR3D_DW_INST_DATA:
++            extra = 1;
++            last = 0x00028005;
++            bit = 64;
++            break;
+          }
+       }
+       if (bit) {
+-         if ((seen & bit) || count != (bit == 16 ? alu_count * 8 : fp_count)) goto fail;
++         if ((seen & bit) || count != (bit == 16 ? alu_count * 8 : fp_count))
++            goto fail;
+          seen |= bit;
+       }
+       BLEND_PUSH((command & 0xffff0000) | (count + extra));
+-      for (unsigned j = 0; j < count; j++) BLEND_PUSH(bit == 64 ? 0 : values[j]);
+-      for (unsigned j = 0; j < extra; j++) BLEND_PUSH(bit == 16 ? blend_words[j] : last);
+-      if (bit == 1) BLEND_PUSH(host1x_opcode_imm(REG_TGR3D_PSEQ_FLUSH, 0));
++      for (unsigned j = 0; j < count; j++)
++         BLEND_PUSH(bit == 64 ? 0 : values[j]);
++      for (unsigned j = 0; j < extra; j++)
++         BLEND_PUSH(bit == 16 ? blend_words[j] : last);
++      if (bit == 1)
++         BLEND_PUSH(host1x_opcode_imm(REG_TGR3D_PSEQ_FLUSH, 0));
+    }
+-   if (seen != 127) goto fail;
++   if (seen != 127)
++      goto fail;
+    util_dynarray_trim(&result);
+    output->commands = result.data;
+    output->num_commands = result.size / sizeof(uint32_t);
+@@ -281,17 +309,20 @@ static void
+ free_fragment_ir(struct grate_fp_shader *fp)
+ {
+    while (!list_is_empty(&fp->fp_instructions)) {
+-      struct fp_instr *inst = list_first_entry(&fp->fp_instructions, struct fp_instr, link);
++      struct fp_instr *inst =
++         list_first_entry(&fp->fp_instructions, struct fp_instr, link);
+       list_del(&inst->link);
+       FREE(inst);
+    }
+    while (!list_is_empty(&fp->mfu_instructions)) {
+-      struct fp_mfu_instr *inst = list_first_entry(&fp->mfu_instructions, struct fp_mfu_instr, link);
++      struct fp_mfu_instr *inst =
++         list_first_entry(&fp->mfu_instructions, struct fp_mfu_instr, link);
+       list_del(&inst->link);
+       FREE(inst);
+    }
+    while (!list_is_empty(&fp->alu_instructions)) {
+-      struct fp_alu_instr_packet *inst = list_first_entry(&fp->alu_instructions, struct fp_alu_instr_packet, link);
++      struct fp_alu_instr_packet *inst = list_first_entry(
++         &fp->alu_instructions, struct fp_alu_instr_packet, link);
+       list_del(&inst->link);
+       FREE(inst);
+    }
+@@ -390,7 +421,7 @@ grate_compile_fs(struct grate_context *context,
+    }
+ 
+    PUSH(host1x_opcode_nonincr(REG_TGR3D_TEX_INST_DATA, num_fp_instrs));
+-   list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link)
++   list_for_each_entry (struct fp_instr, instr, &fp.fp_instructions, link)
+       PUSH(instr->tex);
+ 
+    PUSH(host1x_opcode_nonincr(REG_TGR3D_ALU_REMAP_DATA, num_fp_instrs));
+diff --git a/src/gallium/drivers/grate/grate_program.h b/src/gallium/drivers/grate/grate_program.h
+index 37896c24000..23f33f48b6a 100644
+--- a/src/gallium/drivers/grate/grate_program.h
++++ b/src/gallium/drivers/grate/grate_program.h
+@@ -15,7 +15,9 @@ struct grate_vertex_shader_state {
+    struct pipe_shader_state base;
+    struct grate_shader_blob blob;
+    uint16_t output_mask;
+-   uint32_t immediates[GRATE_VP_MAX_IMMEDIATES][4]; /* uploaded with the uniforms, see emit_vs_uniforms() */
++   uint32_t
++      immediates[GRATE_VP_MAX_IMMEDIATES]
++                [4]; /* uploaded with the uniforms, see emit_vs_uniforms() */
+    unsigned num_immediates;
+ };
+ 
+diff --git a/src/gallium/drivers/grate/grate_resource.c b/src/gallium/drivers/grate/grate_resource.c
+index 014ca4f0b47..fdc353728ca 100644
+--- a/src/gallium/drivers/grate/grate_resource.c
++++ b/src/gallium/drivers/grate/grate_resource.c
+@@ -151,8 +151,9 @@ grate_pixel_format(enum pipe_format format)
+       return TGR3D_SURF_FORMAT_A4B4G4R4;
+    case PIPE_FORMAT_Z16_UNORM:
+       return TGR3D_SURF_FORMAT_Z16;
+-   /* The Tegra 3 has no 24-bit depth. Like the Windows driver, store D24 as 16-bit non-linear depth (the stencil
+-    * of Z24S8 lives in a separate S8 plane, see grate_resource). */
++   /* The Tegra 3 has no 24-bit depth. Like the Windows driver, store D24 as
++    * 16-bit non-linear depth (the stencil of Z24S8 lives in a separate S8
++    * plane, see grate_resource). */
+    case PIPE_FORMAT_Z24X8_UNORM:
+    case PIPE_FORMAT_X8Z24_UNORM:
+    case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+@@ -184,10 +185,12 @@ grate_format_is_emulated_z24(enum pipe_format format)
+    }
+ }
+ 
+-/* Z16NL is a float-like 16-bit code: 3 exponent bits, 13 mantissa bits. The Windows driver's decode table (it builds one
+- * so shaders can read the depth) turns a code into a 20-bit linear value: z20 = ((2^e - 1) << (20 - e)) | (m << max(6 - e, 0)),
+- * and the 16-bit linear depth is z20 >> 4. Inverted here: e is the number of leading ones of z20 (at most 7), m the 13 bits
+- * after the first zero.
++/* Z16NL is a float-like 16-bit code: 3 exponent bits, 13 mantissa bits. The
++ * Windows driver's decode table (it builds one so shaders can read the depth)
++ * turns a code into a 20-bit linear value: z20 = ((2^e - 1) << (20 - e)) | (m
++ * << max(6 - e, 0)), and the 16-bit linear depth is z20 >> 4. Inverted here:
++ * e is the number of leading ones of z20 (at most 7), m the 13 bits after the
++ * first zero.
+  */
+ uint16_t
+ grate_pack_z16nl(double depth)
+@@ -233,13 +236,15 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
+             resource->pitch = align(template->width0 * 2, 256);
+          else
+             resource->pitch = align(resource->pitch, 256);
+-      }
+-      else if (template->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SCANOUT))
++      } else if (template->bind &
++                 (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SCANOUT))
+          resource->pitch = align(resource->pitch, 32);
+ 
+       /* The kernel reflects BOTTOM_UP framebuffers at scanout. GBM/KMS
+        * buffers already use the display's normal row order. */
+-      flags = (template->bind & PIPE_BIND_SCANOUT) ? 0 : DRM_TEGRA_GEM_CREATE_BOTTOM_UP;
++      flags = (template->bind & PIPE_BIND_SCANOUT)
++                 ? 0
++                 : DRM_TEGRA_GEM_CREATE_BOTTOM_UP;
+    }
+ 
+    if (template->target != PIPE_BUFFER) {
+@@ -259,7 +264,8 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
+     * textures can be sampled later, so allocate a native NPOT-compatible
+     * stride rather than the framebuffer-only 32-byte alignment.
+     */
+-   if (template->target != PIPE_BUFFER && (template->bind & PIPE_BIND_SAMPLER_VIEW))
++   if (template->target != PIPE_BUFFER &&
++       (template->bind & PIPE_BIND_SAMPLER_VIEW))
+       resource->pitch = align(resource->pitch, 64);
+ 
+    size = resource->pitch * height;
+@@ -444,12 +450,9 @@ pack_color(enum pipe_format format, const float *rgba)
+ }
+ 
+ static void
+-fill(struct grate_stream *stream, uint32_t **ptrp,
+-           struct grate_resource *dst,
+-           unsigned base_offset, unsigned pitch,
+-           uint32_t fill_value, int blocksize,
+-           unsigned dstx, unsigned dsty,
+-           unsigned width, unsigned height)
++fill(struct grate_stream *stream, uint32_t **ptrp, struct grate_resource *dst,
++     unsigned base_offset, unsigned pitch, uint32_t fill_value, int blocksize,
++     unsigned dstx, unsigned dsty, unsigned width, unsigned height)
+ {
+    uint32_t value;
+    uint32_t *ptr = *ptrp;
+@@ -481,8 +484,9 @@ fill(struct grate_stream *stream, uint32_t **ptrp,
+    GRATE_PUSHBUF_WORD(ptr, 0x000000cc);      /* 0x020 - ropfade */
+ 
+    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_mask(0x2b, 0x09));
+-   grate_stream_push_reloc(stream, &ptr, dst->bo, base_offset);/* 0x02b - dstba */
+-   GRATE_PUSHBUF_WORD(ptr, pitch);           /* 0x02e - dstst */
++   grate_stream_push_reloc(stream, &ptr, dst->bo,
++                           base_offset); /* 0x02b - dstba */
++   GRATE_PUSHBUF_WORD(ptr, pitch);       /* 0x02e - dstst */
+ 
+    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_nonincr(0x35, 1));
+ 
+@@ -498,15 +502,16 @@ fill(struct grate_stream *stream, uint32_t **ptrp,
+    *ptrp = ptr;
+ }
+ 
+-/* Clears a depth/stencil surface. The emulated Z24 formats are two planes (Z16NL depth, S8 stencil), each filled on its
+- * own, so clearing only one of them leaves the other alone; every other format is one fill of the packed value.
+- * clear_flags is PIPE_CLEAR_DEPTH and/or PIPE_CLEAR_STENCIL.
++/* Clears a depth/stencil surface. The emulated Z24 formats are two planes
++ * (Z16NL depth, S8 stencil), each filled on its own, so clearing only one of
++ * them leaves the other alone; every other format is one fill of the packed
++ * value. clear_flags is PIPE_CLEAR_DEPTH and/or PIPE_CLEAR_STENCIL.
+  */
+ static void
+ clear_zs(struct grate_stream *stream, uint32_t **ptrp,
+          struct grate_resource *res, enum pipe_format format,
+-         unsigned clear_flags, double depth, unsigned stencil,
+-         unsigned x, unsigned y, unsigned width, unsigned height)
++         unsigned clear_flags, double depth, unsigned stencil, unsigned x,
++         unsigned y, unsigned width, unsigned height)
+ {
+    if (!grate_format_is_emulated_z24(format)) {
+       fill(stream, ptrp, res, 0, res->pitch,
+@@ -516,10 +521,12 @@ clear_zs(struct grate_stream *stream, uint32_t **ptrp,
+    }
+ 
+    if (clear_flags & PIPE_CLEAR_DEPTH)
+-      fill(stream, ptrp, res, 0, res->pitch, grate_pack_z16nl(depth), 2, x, y, width, height);
++      fill(stream, ptrp, res, 0, res->pitch, grate_pack_z16nl(depth), 2, x, y,
++           width, height);
+ 
+    if ((clear_flags & PIPE_CLEAR_STENCIL) && res->stencil_offset)
+-      fill(stream, ptrp, res, res->stencil_offset, res->stencil_pitch, stencil & 0xff, 1, x, y, width, height);
++      fill(stream, ptrp, res, res->stencil_offset, res->stencil_pitch,
++           stencil & 0xff, 1, x, y, width, height);
+ }
+ 
+ static void
+@@ -549,21 +556,21 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
+       int i;
+       for (i = 0; i < fb->nr_cbufs; ++i) {
+          struct pipe_surface *dst = &fb->cbufs[i];
+-         fill(stream, &ptr, 
+-                  grate_resource(dst->texture),
+-                  0, grate_resource(dst->texture)->pitch,
+-                  pack_color(dst->format, color->f),
+-                  util_format_get_blocksize(dst->format),
+-                  0, 0, fb->width, fb->height);
++         fill(stream, &ptr, grate_resource(dst->texture), 0,
++              grate_resource(dst->texture)->pitch,
++              pack_color(dst->format, color->f),
++              util_format_get_blocksize(dst->format), 0, 0, fb->width,
++              fb->height);
+       }
+    }
+ 
+    if (buffers & PIPE_CLEAR_DEPTH || buffers & PIPE_CLEAR_STENCIL) {
+       if (fb->zsbuf.texture) {
+-         /* TODO: handle the case where both are not set! (done for the Z24 formats, which have separate planes) */
+-         clear_zs(stream, &ptr, grate_resource(fb->zsbuf.texture), fb->zsbuf.format,
+-                  buffers & PIPE_CLEAR_DEPTHSTENCIL, depth, stencil,
+-                  0, 0, fb->width, fb->height);
++         /* TODO: handle the case where both are not set! (done for the Z24
++          * formats, which have separate planes) */
++         clear_zs(stream, &ptr, grate_resource(fb->zsbuf.texture),
++                  fb->zsbuf.format, buffers & PIPE_CLEAR_DEPTHSTENCIL, depth,
++                  stencil, 0, 0, fb->width, fb->height);
+       }
+    }
+    
+@@ -590,14 +597,12 @@ grate_clear_render_target(struct pipe_context *pipe,
+       grate_loge("grate_stream_begin() failed: %d\n", err);
+       return;
+    }
+-   
+-   fill(&context->gr2d->stream, &ptr,
+-        grate_resource(dst->texture),
+-        0, grate_resource(dst->texture)->pitch,
++
++   fill(&context->gr2d->stream, &ptr, grate_resource(dst->texture), 0,
++        grate_resource(dst->texture)->pitch,
+         pack_color(dst->format, color->f),
+-        util_format_get_blocksize(dst->format),
+-        dstx, dsty, width, height);
+-   
++        util_format_get_blocksize(dst->format), dstx, dsty, width, height);
++
+    grate_stream_end(stream, &ptr);
+    grate_stream_flush(stream, true);
+ }
+@@ -623,10 +628,11 @@ grate_clear_depth_stencil(struct pipe_context *pipe,
+       grate_loge("grate_stream_begin() failed: %d\n", err);
+       return;
+    }
+-   
+-   clear_zs(&context->gr2d->stream, &ptr, grate_resource(dst->texture), dst->format,
+-            clear_flags, depth, stencil, dstx, dsty, width, height);
+-   
++
++   clear_zs(&context->gr2d->stream, &ptr, grate_resource(dst->texture),
++            dst->format, clear_flags, depth, stencil, dstx, dsty, width,
++            height);
++
+    grate_stream_end(stream, &ptr);
+    grate_stream_flush(stream, true);
+ }
+diff --git a/src/gallium/drivers/grate/grate_resource.h b/src/gallium/drivers/grate/grate_resource.h
+index 6ac471fae9d..58d0f76fba3 100644
+--- a/src/gallium/drivers/grate/grate_resource.h
++++ b/src/gallium/drivers/grate/grate_resource.h
+@@ -10,9 +10,11 @@ struct grate_resource {
+    unsigned int pitch;
+    unsigned int tiled : 1;
+    unsigned int format : 5;
+-   /* Z24 depth/stencil formats: the GPU has no 24-bit depth. The depth plane is 16-bit non-linear (Z16NL, 2 bytes per
+-    * pixel, rows `pitch` apart); a stencil format adds an 8-bit plane after it (stencil_offset bytes from the start of
+-    * the buffer, rows `stencil_pitch` apart), which the GPU binds as its own surface. Both are 0 for every other format.
++   /* Z24 depth/stencil formats: the GPU has no 24-bit depth. The depth plane
++    * is 16-bit non-linear (Z16NL, 2 bytes per pixel, rows `pitch` apart); a
++    * stencil format adds an 8-bit plane after it (stencil_offset bytes from
++    * the start of the buffer, rows `stencil_pitch` apart), which the GPU
++    * binds as its own surface. Both are 0 for every other format.
+     */
+    unsigned int stencil_offset;
+    unsigned int stencil_pitch;
+@@ -27,13 +29,12 @@ grate_resource(struct pipe_resource *resource)
+ int
+ grate_pixel_format(enum pipe_format format);
+ 
+-/* A 24-bit depth format that is stored as Z16NL (+ a separate S8 plane when it has stencil). */
+-bool
+-grate_format_is_emulated_z24(enum pipe_format format);
++/* A 24-bit depth format that is stored as Z16NL (+ a separate S8 plane when
++ * it has stencil). */
++bool grate_format_is_emulated_z24(enum pipe_format format);
+ 
+ /* The 16-bit value Z16NL stores for a depth in [0, 1]. */
+-uint16_t
+-grate_pack_z16nl(double depth);
++uint16_t grate_pack_z16nl(double depth);
+ 
+ void
+ grate_context_resource_init(struct pipe_context *pcontext);
+diff --git a/src/gallium/drivers/grate/grate_screen.c b/src/gallium/drivers/grate/grate_screen.c
+old mode 100755
+new mode 100644
+index d6b00ef585a..72f72fb058d
+--- a/src/gallium/drivers/grate/grate_screen.c
++++ b/src/gallium/drivers/grate/grate_screen.c
+@@ -251,7 +251,7 @@ grate_screen_init_caps(struct grate_screen *screen)
+    caps->glsl_feature_level =
+    caps->glsl_feature_level_compatibility = 120; // no clue
+    caps->essl_feature_level = 100; // no clue
+-   caps->constant_buffer_offset_alignment = 4; // DWORD aligned, can do pure data GATHER 
++   caps->constant_buffer_offset_alignment = 4; // DWORD aligned, can do pure data GATHER
+    /* gr2d blits currently copy bytes without format conversion. */
+    caps->texture_transfer_modes = PIPE_TEXTURE_TRANSFER_DEFAULT;
+    caps->vendor_id = 0x10de;
+@@ -390,8 +390,10 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
+    if (target != PIPE_BUFFER && grate_pixel_format(format) < 0)
+       return false;
+ 
+-   /* The emulated Z24 formats are Z16NL (+ S8) underneath: no sampling, because a shader would have to decode Z16NL. */
+-   if (grate_format_is_emulated_z24(format) && (usage & PIPE_BIND_SAMPLER_VIEW))
++   /* The emulated Z24 formats are Z16NL (+ S8) underneath: no sampling,
++    * because a shader would have to decode Z16NL. */
++   if (grate_format_is_emulated_z24(format) &&
++       (usage & PIPE_BIND_SAMPLER_VIEW))
+       return false;
+ 
+    /* RGBA storage is needed for sampler uploads.  Advertising it as a render
+diff --git a/src/gallium/drivers/grate/grate_state.c b/src/gallium/drivers/grate/grate_state.c
+index 7df2c2c8c00..c40930d706c 100644
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -40,9 +40,10 @@ grate_set_constant_buffer(struct pipe_context *pcontext, enum mesa_shader_stage
+    util_copy_constant_buffer(&context->constant_buffer[shader], buffer);
+ }
+ 
+-static void grate_add_render_target(struct grate_context *context,
+-                                    const struct pipe_surface *ref,
+-                                    unsigned int slot, bool stencil_plane)
++static void
++grate_add_render_target(struct grate_context *context,
++                        const struct pipe_surface *ref, unsigned int slot,
++                        bool stencil_plane)
+ {
+    if (!ref->texture) {
+       fprintf(stderr, "%s: texture at %p null!", __func__, ref);
+@@ -56,22 +57,24 @@ static void grate_add_render_target(struct grate_context *context,
+    }
+    struct grate_resource *res = grate_resource(ref->texture);
+    uint32_t rt_params;
+-   
++
+    if (stencil_plane) {
+       /* The S8 plane that follows the depth plane in the same buffer. */
+-      rt_params  = TGR3D_GLOBAL_SURFDESC_SURF_FORMAT(TGR3D_SURF_FORMAT_S8);
++      rt_params = TGR3D_GLOBAL_SURFDESC_SURF_FORMAT(TGR3D_SURF_FORMAT_S8);
+       rt_params |= TGR3D_GLOBAL_SURFDESC_ARRAY_STRIDE(res->stencil_pitch);
+    } else {
+-      rt_params  = TGR3D_GLOBAL_SURFDESC_SURF_FORMAT(res->format);
++      rt_params = TGR3D_GLOBAL_SURFDESC_SURF_FORMAT(res->format);
+       rt_params |= TGR3D_GLOBAL_SURFDESC_ARRAY_STRIDE(res->pitch);
+    }
+    rt_params |= TGR3D_GLOBAL_SURFDESC_STRUCTURE(res->tiled);
+-   
++
+    context->framebuffer.rt_params[slot] = rt_params;
+    context->framebuffer.rt_bos[slot] = res->bo;
+-   context->framebuffer.rt_offsets[slot] = stencil_plane ? res->stencil_offset : 0;
++   context->framebuffer.rt_offsets[slot] =
++      stencil_plane ? res->stencil_offset : 0;
+    context->framebuffer.rt_mask |= 1u << slot;
+-   context->framebuffer.num_rts = MAX2(context->framebuffer.num_rts, slot + 1);
++   context->framebuffer.num_rts =
++      MAX2(context->framebuffer.num_rts, slot + 1);
+ }
+ 
+ static void
+@@ -91,19 +94,25 @@ grate_set_framebuffer_state(struct pipe_context *pcontext,
+     */
+    for (unsigned int i = 0; i < framebuffer->nr_cbufs; i++) {
+       if (framebuffer->cbufs[i].texture)
+-         grate_add_render_target(context, &framebuffer->cbufs[i], i + 1, false);
++         grate_add_render_target(context, &framebuffer->cbufs[i], i + 1,
++                                 false);
+    }
+    
+    if (framebuffer->zsbuf.texture) {
+       grate_add_render_target(context, &framebuffer->zsbuf, 0, false);
+ 
+       if (grate_resource(framebuffer->zsbuf.texture)->stencil_offset) {
+-         /* Windows puts colour output n > 0 at slot n + 4 to keep slot 2 for stencil; we use n + 1, so a second colour
+-          * buffer would share the slot. OpenGL ES 2 has one colour buffer: give up stencil rather than corrupt it. */
+-         if (framebuffer->nr_cbufs > GRATE_STENCIL_SLOT - 1 && framebuffer->cbufs[GRATE_STENCIL_SLOT - 1].texture) {
+-            fprintf(stderr, "GRATE: stencil is not available with more than one colour buffer\n");
++         /* Windows puts colour output n > 0 at slot n + 4 to keep slot 2 for
++          * stencil; we use n + 1, so a second colour buffer would share the
++          * slot. OpenGL ES 2 has one colour buffer: give up stencil rather
++          * than corrupt it. */
++         if (framebuffer->nr_cbufs > GRATE_STENCIL_SLOT - 1 &&
++             framebuffer->cbufs[GRATE_STENCIL_SLOT - 1].texture) {
++            fprintf(stderr, "GRATE: stencil is not available with more than "
++                            "one colour buffer\n");
+          } else {
+-            grate_add_render_target(context, &framebuffer->zsbuf, GRATE_STENCIL_SLOT, true);
++            grate_add_render_target(context, &framebuffer->zsbuf,
++                                    GRATE_STENCIL_SLOT, true);
+             context->framebuffer.has_stencil = true;
+          }
+       }
+@@ -205,9 +214,11 @@ grate_set_sampler_views(struct pipe_context *pctx, mesa_shader_stage shader,
+    assert(shader == MESA_SHADER_FRAGMENT);
+    assert(start_slot + num_views + unbind_num_trailing_slots <= 16);
+    for (unsigned i = 0; i < num_views; i++)
+-      pipe_sampler_view_reference(&ctx->sampler_views[start_slot + i], views ? views[i] : NULL);
++      pipe_sampler_view_reference(&ctx->sampler_views[start_slot + i],
++                                  views ? views[i] : NULL);
+    for (unsigned i = 0; i < unbind_num_trailing_slots; i++)
+-      pipe_sampler_view_reference(&ctx->sampler_views[start_slot + num_views + i], NULL);
++      pipe_sampler_view_reference(
++         &ctx->sampler_views[start_slot + num_views + i], NULL);
+ }
+ 
+ static void
+@@ -657,15 +668,18 @@ emit_render_targets(struct grate_context *context, uint32_t **ptrp)
+       if (!(fb->rt_mask & (1u << i)))
+          continue;
+ 
+-      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_SURFDESC(i), 1));
++      GRATE_PUSHBUF_WORD(*ptrp,
++                         host1x_opcode_incr(REG_TGR3D_GLOBAL_SURFDESC(i), 1));
+       GRATE_PUSHBUF_WORD(*ptrp, fb->rt_params[i]);
+-      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_SURFADDR(i), 1));
++      GRATE_PUSHBUF_WORD(*ptrp,
++                         host1x_opcode_incr(REG_TGR3D_GLOBAL_SURFADDR(i), 1));
+       grate_stream_push_reloc(stream, ptrp, fb->rt_bos[i], fb->rt_offsets[i]);
+    }
+ 
+    uint32_t enable = fb->rt_mask;
+    if (fb->base.zsbuf.texture && context->zsa &&
+-       (context->zsa->base.depth_enabled || (fb->has_stencil && context->zsa->base.stencil[0].enabled)))
++       (context->zsa->base.depth_enabled ||
++        (fb->has_stencil && context->zsa->base.stencil[0].enabled)))
+       enable |= TGR3D_DW_ST_ENABLE_Z_TEST(TGR3D_STATE_ENABLED);
+ 
+    GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_DW_ST_ENABLE, 1));
+@@ -689,9 +703,10 @@ emit_scissor(struct grate_context *context, uint32_t **ptrp)
+    unsigned height = context->framebuffer.base.height;
+    GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_SU_SCISSOR_X, 2));
+    GRATE_PUSHBUF_WORD(*ptrp, TGR3D_SU_SCISSOR_X_MIN(MIN2(s->minx, width)) |
+-                           TGR3D_SU_SCISSOR_X_MAX(MIN2(s->maxx, width)));
+-   GRATE_PUSHBUF_WORD(*ptrp, TGR3D_SU_SCISSOR_Y_MIN(MIN2(s->miny, height)) |
+-                           TGR3D_SU_SCISSOR_Y_MAX(MIN2(s->maxy, height)));
++                                TGR3D_SU_SCISSOR_X_MAX(MIN2(s->maxx, width)));
++   GRATE_PUSHBUF_WORD(*ptrp,
++                      TGR3D_SU_SCISSOR_Y_MIN(MIN2(s->miny, height)) |
++                         TGR3D_SU_SCISSOR_Y_MAX(MIN2(s->maxy, height)));
+ }
+ 
+ static void
+@@ -715,42 +730,57 @@ emit_zsa_state(struct grate_context *context, uint32_t **ptrp)
+    grate_stream_push_words(stream, ptrp, context->zsa->commands, context->zsa->num_commands, 0);
+ }
+ 
+-/* Gallium stencil op to the hardware's 3-bit code. Same order as the Windows driver's D3D mapping: zero, keep, replace,
+- * increment (clamp), decrement (clamp), invert, increment (wrap), decrement (wrap). */
++/* Gallium stencil op to the hardware's 3-bit code. Same order as the Windows
++ * driver's D3D mapping: zero, keep, replace, increment (clamp), decrement
++ * (clamp), invert, increment (wrap), decrement (wrap). */
+ static uint32_t
+ grate_stencil_op(enum pipe_stencil_op op)
+ {
+    switch (op) {
+-   case PIPE_STENCIL_OP_ZERO: return 0;
+-   case PIPE_STENCIL_OP_KEEP: return 1;
+-   case PIPE_STENCIL_OP_REPLACE: return 2;
+-   case PIPE_STENCIL_OP_INCR: return 3;
+-   case PIPE_STENCIL_OP_DECR: return 4;
+-   case PIPE_STENCIL_OP_INVERT: return 5;
+-   case PIPE_STENCIL_OP_INCR_WRAP: return 6;
+-   case PIPE_STENCIL_OP_DECR_WRAP: return 7;
+-   default: UNREACHABLE("unknown pipe_stencil_op");
++   case PIPE_STENCIL_OP_ZERO:
++      return 0;
++   case PIPE_STENCIL_OP_KEEP:
++      return 1;
++   case PIPE_STENCIL_OP_REPLACE:
++      return 2;
++   case PIPE_STENCIL_OP_INCR:
++      return 3;
++   case PIPE_STENCIL_OP_DECR:
++      return 4;
++   case PIPE_STENCIL_OP_INVERT:
++      return 5;
++   case PIPE_STENCIL_OP_INCR_WRAP:
++      return 6;
++   case PIPE_STENCIL_OP_DECR_WRAP:
++      return 7;
++   default:
++      UNREACHABLE("unknown pipe_stencil_op");
+    }
+ }
+ 
+-/* Stencil test and operations, emitted on every draw after grate_init_state()'s defaults. The test is disabled when the
+- * framebuffer has no stencil plane or the application does not use it. */
++/* Stencil test and operations, emitted on every draw after
++ * grate_init_state()'s defaults. The test is disabled when the framebuffer
++ * has no stencil plane or the application does not use it. */
+ static void
+ emit_stencil_state(struct grate_context *context, uint32_t **ptrp)
+ {
+-   const struct pipe_depth_stencil_alpha_state *zsa = context->zsa ? &context->zsa->base : NULL;
+-   bool enabled = context->framebuffer.has_stencil && zsa && zsa->stencil[0].enabled;
++   const struct pipe_depth_stencil_alpha_state *zsa =
++      context->zsa ? &context->zsa->base : NULL;
++   bool enabled =
++      context->framebuffer.has_stencil && zsa && zsa->stencil[0].enabled;
+ 
+    /* One-sided stencil uses the front state for both faces. */
+    const struct pipe_stencil_state *face[2] = {
+       zsa ? &zsa->stencil[0] : NULL,
+-      zsa ? (zsa->stencil[1].enabled ? &zsa->stencil[1] : &zsa->stencil[0]) : NULL,
++      zsa ? (zsa->stencil[1].enabled ? &zsa->stencil[1] : &zsa->stencil[0])
++          : NULL,
+    };
+ 
+    uint32_t test[2], op[2];
+    for (unsigned i = 0; i < 2; i++) {
+       if (enabled) {
+-         test[i] = face[i]->valuemask | (grate_compare_func(face[i]->func) << 8);
++         test[i] =
++            face[i]->valuemask | (grate_compare_func(face[i]->func) << 8);
+          op[i] = grate_stencil_op(face[i]->fail_op) |
+                  (grate_stencil_op(face[i]->zfail_op) << 3) |
+                  (grate_stencil_op(face[i]->zpass_op) << 6) |
+@@ -766,11 +796,13 @@ emit_stencil_state(struct grate_context *context, uint32_t **ptrp)
+                    TGR3D_QR_S_CTRL_S_ENABLE(enabled) |
+                    TGR3D_QR_S_CTRL_QRAST_FB_WRITE(TGR3D_STATE_ENABLED);
+ 
+-   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_QR_S_TEST_FRONT, 3));
++   GRATE_PUSHBUF_WORD(*ptrp,
++                      host1x_opcode_incr(REG_TGR3D_QR_S_TEST_FRONT, 3));
+    GRATE_PUSHBUF_WORD(*ptrp, test[0]);
+    GRATE_PUSHBUF_WORD(*ptrp, test[1]);
+    GRATE_PUSHBUF_WORD(*ptrp, ctrl);
+-   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_S_OPERATION_FRONT, 2));
++   GRATE_PUSHBUF_WORD(
++      *ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_S_OPERATION_FRONT, 2));
+    GRATE_PUSHBUF_WORD(*ptrp, op[0]);
+    GRATE_PUSHBUF_WORD(*ptrp, op[1]);
+ }
+@@ -788,19 +820,24 @@ emit_vs_uniforms(struct grate_context *context, uint32_t **ptrp)
+       user_words = constbuf->buffer_size / 4;
+    }
+ 
+-   /* one block from slot 0: the shader's immediates, then the application's uniforms; see grate_compiler.h */
++   /* one block from slot 0: the shader's immediates, then the application's
++    * uniforms; see grate_compiler.h */
+    unsigned len = num_imm * 4 + user_words;
+    if (len == 0)
+       return;
+ 
+    assert(len <= 256 * 4);
+ 
+-   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_imm(REG_TGR3D_VPE_CONST_OFFSET, 0));
+-   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_nonincr(REG_TGR3D_VPE_CONST_DATA, len));
++   GRATE_PUSHBUF_WORD(*ptrp,
++                      host1x_opcode_imm(REG_TGR3D_VPE_CONST_OFFSET, 0));
++   GRATE_PUSHBUF_WORD(*ptrp,
++                      host1x_opcode_nonincr(REG_TGR3D_VPE_CONST_DATA, len));
+    if (num_imm)
+-      grate_stream_push_words(stream, ptrp, context->vshader->immediates[0], num_imm * 4, 0);
++      grate_stream_push_words(stream, ptrp, context->vshader->immediates[0],
++                              num_imm * 4, 0);
+    if (user_words)
+-      grate_stream_push_words(stream, ptrp, constbuf->user_buffer, user_words, 0);
++      grate_stream_push_words(stream, ptrp, constbuf->user_buffer, user_words,
++                              0);
+ }
+ 
+ /* Tegra fragment constants are sign:1 exponent:6 mantissa:13 (bias 31).
+@@ -826,7 +863,8 @@ static void
+ emit_fs_uniforms(struct grate_context *context, uint32_t **ptrp)
+ {
+    const struct grate_fp_info *info = &context->fshader->info;
+-   const struct pipe_constant_buffer *cb = &context->constant_buffer[MESA_SHADER_FRAGMENT];
++   const struct pipe_constant_buffer *cb =
++      &context->constant_buffer[MESA_SHADER_FRAGMENT];
+    if (!info->num_constants)
+       return;
+    GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(0x820, info->num_constants));
+@@ -834,8 +872,11 @@ emit_fs_uniforms(struct grate_context *context, uint32_t **ptrp)
+       float value = info->constants[i].immediate;
+       int word = info->constants[i].word;
+       if (word >= 0) {
+-         assert(cb->user_buffer && ((unsigned)word + 1) * sizeof(float) <= cb->buffer_size);
+-         memcpy(&value, (const uint8_t *)cb->user_buffer + word * sizeof(float), sizeof(value));
++         assert(cb->user_buffer &&
++                ((unsigned)word + 1) * sizeof(float) <= cb->buffer_size);
++         memcpy(&value,
++                (const uint8_t *)cb->user_buffer + word * sizeof(float),
++                sizeof(value));
+       }
+       GRATE_PUSHBUF_WORD(*ptrp, fragment_fp20(value));
+    }
+@@ -909,8 +950,10 @@ emit_textures(struct grate_context *ctx, uint32_t **ptrp)
+          continue;
+       struct grate_resource *res = grate_resource(view->texture);
+       assert(view->target == PIPE_TEXTURE_2D && view->u.tex.first_level == 0);
+-      assert(view->u.tex.last_level == 0 && sampler->min_mip_filter == PIPE_TEX_MIPFILTER_NONE);
+-      unsigned row_bytes = res->b.width0 * util_format_get_blocksize(res->b.format);
++      assert(view->u.tex.last_level == 0 &&
++             sampler->min_mip_filter == PIPE_TEX_MIPFILTER_NONE);
++      unsigned row_bytes =
++         res->b.width0 * util_format_get_blocksize(res->b.format);
+       /* POT layout is tightly packed. NPOT layout rounds rows to 64 bytes,
+        * even when the logical dimensions themselves are powers of two.
+        */
+@@ -921,14 +964,20 @@ emit_textures(struct grate_context *ctx, uint32_t **ptrp)
+       bool native_layout = res->pitch == native_pitch ||
+                            (res->b.height0 == 1 && res->pitch >= row_bytes);
+       if (!native_layout)
+-         fprintf(stderr, "GRATE unsupported sampler layout: %s %ux%u pitch=%u native=%u\n",
+-                 util_format_name(res->b.format),res->b.width0,res->b.height0,res->pitch,native_pitch);
++         fprintf(
++            stderr,
++            "GRATE unsupported sampler layout: %s %ux%u pitch=%u native=%u\n",
++            util_format_name(res->b.format), res->b.width0, res->b.height0,
++            res->pitch, native_pitch);
+       assert(native_layout);
+       if (grate_debug & GRATE_DEBUG_TRACE)
+-         fprintf(stderr, "GRATE sampler: %s view %s swizzle=%u,%u,%u,%u size=%ux%u pitch=%u format=%u\n",
+-                 util_format_name(res->b.format), util_format_name(view->format),
+-                 view->swizzle_r,view->swizzle_g,view->swizzle_b,view->swizzle_a,
+-                 res->b.width0,res->b.height0,res->pitch,res->format);
++         fprintf(stderr,
++                 "GRATE sampler: %s view %s swizzle=%u,%u,%u,%u size=%ux%u "
++                 "pitch=%u format=%u\n",
++                 util_format_name(res->b.format),
++                 util_format_name(view->format), view->swizzle_r,
++                 view->swizzle_g, view->swizzle_b, view->swizzle_a,
++                 res->b.width0, res->b.height0, res->pitch, res->format);
+       /* Texture channels follow GL order, independently of the framebuffer
+        * store's BGRA packing. Use the view's format for reinterpretation. */
+       unsigned texture_format = grate_pixel_format(view->format);
+@@ -949,35 +998,48 @@ emit_textures(struct grate_context *ctx, uint32_t **ptrp)
+          break;
+       }
+       uint32_t lo = TGR3D_TEX_TEXDESC_LO_SURF_FORMAT(texture_format);
+-      if (sampler->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE) lo |= 2;
+-      else assert(sampler->wrap_s == PIPE_TEX_WRAP_REPEAT);
+-      if (sampler->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE) lo |= 1;
+-      else assert(sampler->wrap_t == PIPE_TEX_WRAP_REPEAT);
+-      if (sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR) lo |= TGR3D_TEX_TEXDESC_LO_LERP_MIN;
+-      if (sampler->mag_img_filter == PIPE_TEX_FILTER_LINEAR) lo |= TGR3D_TEX_TEXDESC_LO_LERP_MAG;
++      if (sampler->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE)
++         lo |= 2;
++      else
++         assert(sampler->wrap_s == PIPE_TEX_WRAP_REPEAT);
++      if (sampler->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE)
++         lo |= 1;
++      else
++         assert(sampler->wrap_t == PIPE_TEX_WRAP_REPEAT);
++      if (sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR)
++         lo |= TGR3D_TEX_TEXDESC_LO_LERP_MIN;
++      if (sampler->mag_img_filter == PIPE_TEX_FILTER_LINEAR)
++         lo |= TGR3D_TEX_TEXDESC_LO_LERP_MAG;
+       uint32_t hi = 0x80; /* base level only */
+       if (pot_layout) {
+          hi |= TGR3D_TEX_TEXDESC_HI_LOG2_WIDTH(util_logbase2(res->b.width0));
+-         hi |= TGR3D_TEX_TEXDESC_HI_LOG2_HEIGHT(util_logbase2(res->b.height0));
++         hi |=
++            TGR3D_TEX_TEXDESC_HI_LOG2_HEIGHT(util_logbase2(res->b.height0));
+       } else {
+          hi |= 0x40 | TGR3D_TEX_TEXDESC_HI_WIDTH(res->b.width0) |
+-                      TGR3D_TEX_TEXDESC_HI_HEIGHT(res->b.height0);
++               TGR3D_TEX_TEXDESC_HI_HEIGHT(res->b.height0);
+       }
+-      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_TEX_TEXADDR(i), 1));
++      GRATE_PUSHBUF_WORD(ptr,
++                         host1x_opcode_incr(REG_TGR3D_TEX_TEXADDR(i), 1));
+       grate_stream_push_reloc(stream, &ptr, res->bo, 0);
+-      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_TEX_TEXDESC_LO(i), 2));
++      GRATE_PUSHBUF_WORD(ptr,
++                         host1x_opcode_incr(REG_TGR3D_TEX_TEXDESC_LO(i), 2));
+       GRATE_PUSHBUF_WORD(ptr, lo);
+       GRATE_PUSHBUF_WORD(ptr, hi);
+       if (!pot_layout) {
+-         /* A non-power-of-two descriptor keeps its level range in NPOT_AUX. Left zero (as
+-          * grate_init_state() clears it), the sampler wraps coordinates at the next lower
+-          * power of two even inside [0,1]: a 1366x753 texture sampled with REPEAT, which is
+-          * what Catacomb composites its client buffers with, showed the left 1024 columns
+-          * and top 512 rows again beyond x=1024 and y=512. With BASE_LEVEL_ONLY set the
+-          * texture is addressed correctly across [0,1]; beyond 1.0 REPEAT then clamps to
+-          * the edge, so REPEAT is exact only for coordinates in [0,1] on such textures. */
+-         GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_TEX_TEXDESC_NPOT_AUX(i), 1));
+-         GRATE_PUSHBUF_WORD(ptr, TGR3D_TEX_TEXDESC_NPOT_AUX_BASE_LEVEL_ONLY(TGR3D_STATE_ENABLED));
++         /* A non-power-of-two descriptor keeps its level range in NPOT_AUX.
++          * Left zero (as grate_init_state() clears it), the sampler wraps
++          * coordinates at the next lower power of two even inside [0,1]: a
++          * 1366x753 texture sampled with REPEAT, which is what Catacomb
++          * composites its client buffers with, showed the left 1024 columns
++          * and top 512 rows again beyond x=1024 and y=512. With
++          * BASE_LEVEL_ONLY set the texture is addressed correctly across
++          * [0,1]; beyond 1.0 REPEAT then clamps to the edge, so REPEAT is
++          * exact only for coordinates in [0,1] on such textures. */
++         GRATE_PUSHBUF_WORD(
++            ptr, host1x_opcode_incr(REG_TGR3D_TEX_TEXDESC_NPOT_AUX(i), 1));
++         GRATE_PUSHBUF_WORD(ptr, TGR3D_TEX_TEXDESC_NPOT_AUX_BASE_LEVEL_ONLY(
++                                    TGR3D_STATE_ENABLED));
+       }
+    }
+    *ptrp = ptr;
+diff --git a/src/gallium/drivers/grate/grate_stream.c b/src/gallium/drivers/grate/grate_stream.c
+index b81c02efbc2..52430466281 100644
+--- a/src/gallium/drivers/grate/grate_stream.c
++++ b/src/gallium/drivers/grate/grate_stream.c
+@@ -71,7 +71,7 @@ grate_stream_create(struct grate_device *drm,
+    stream->status    = GRATE_STREAM_FREE;
+    stream->channel   = channel;
+    stream->num_words = words_num;
+-   
++
+    ret = drm_tegra_syncpoint_new(stream->channel, &stream->syncpt);
+    if (ret < 0) {
+       fprintf(stderr, "%s: drm_tegra_syncpoint_new() failed %d\n", __func__, ret);
+diff --git a/src/gallium/drivers/grate/vp/tgsi.c b/src/gallium/drivers/grate/vp/tgsi.c
+index e452c3dcc4e..1ce1213338a 100644
+--- a/src/gallium/drivers/grate/vp/tgsi.c
++++ b/src/gallium/drivers/grate/vp/tgsi.c
+@@ -242,14 +242,17 @@ tgsi_src_to_vp(struct grate_vp_shader *vp, const struct tgsi_src_register *src)
+       return attrib(src->Index, swizzle, negate, absolute);
+ 
+    case TGSI_FILE_CONSTANT:
+-      /* the application's uniforms follow the immediates, see grate_compiler.h */
+-      return uniform(vp->num_immediates + src->Index, swizzle, negate, absolute);
++      /* the application's uniforms follow the immediates, see
++       * grate_compiler.h */
++      return uniform(vp->num_immediates + src->Index, swizzle, negate,
++                     absolute);
+ 
+    case TGSI_FILE_TEMPORARY:
+       return src_temp(src->Index, swizzle, negate, absolute);
+ 
+    case TGSI_FILE_IMMEDIATE:
+-      /* the values are recorded in grate_tgsi_to_vp() and uploaded to the first slots, see grate_compiler.h */
++      /* the values are recorded in grate_tgsi_to_vp() and uploaded to the
++       * first slots, see grate_compiler.h */
+       assert(src->Index >= 0 && (unsigned)src->Index < vp->num_immediates);
+       return uniform(src->Index, swizzle, negate, absolute);
+ 
+@@ -328,22 +331,21 @@ tgsi_to_vp(struct grate_vp_shader *vp, const struct tgsi_full_instruction *inst)
+    }
+ }
+ 
+-/* A packed instruction has ONE attribute-fetch index and ONE uniform-fetch index
+- * shared by all its sources (see grate_vp_pack()). When an instruction reads a
+- * second, different attribute or uniform, copy that operand into a scratch
+- * temporary with a preceding MOV and read the temporary instead.
++/* A packed instruction has ONE attribute-fetch index and ONE uniform-fetch
++ * index shared by all its sources (see grate_vp_pack()). When an instruction
++ * reads a second, different attribute or uniform, copy that operand into a
++ * scratch temporary with a preceding MOV and read the temporary instead.
+  */
+ static bool
+ legalize_fetches(struct grate_vp_shader *vp, struct vp_instr *instr,
+                  struct list_head *out)
+ {
+-   struct vp_src_operand *srcs[4] = {
+-      &instr->vec.src[0], &instr->vec.src[1], &instr->vec.src[2],
+-      &instr->scalar.src
+-   };
++   struct vp_src_operand *srcs[4] = {&instr->vec.src[0], &instr->vec.src[1],
++                                     &instr->vec.src[2], &instr->scalar.src};
+    int attr_fetch = -1, uniform_fetch = -1;
+    unsigned next_temp = vp->num_temps;
+-   static const enum vp_swz identity[4] = { VP_SWZ_X, VP_SWZ_Y, VP_SWZ_Z, VP_SWZ_W };
++   static const enum vp_swz identity[4] = {VP_SWZ_X, VP_SWZ_Y, VP_SWZ_Z,
++                                           VP_SWZ_W};
+ 
+    for (unsigned i = 0; i < 4; ++i) {
+       struct vp_src_operand *src = srcs[i];
+@@ -363,7 +365,8 @@ legalize_fetches(struct grate_vp_shader *vp, struct vp_instr *instr,
+ 
+       /* the hardware has 63 usable temporaries (index 63 disables the write) */
+       if (next_temp >= 63) {
+-         fprintf(stderr, "GRATE VERTEX: out of temporaries while splitting operand fetches\n");
++         fprintf(stderr, "GRATE VERTEX: out of temporaries while splitting "
++                         "operand fetches\n");
+          return false;
+       }
+ 
+@@ -372,8 +375,8 @@ legalize_fetches(struct grate_vp_shader *vp, struct vp_instr *instr,
+       copy.negate = false;
+       copy.absolute = false;
+ 
+-      struct vp_instr *mov = emit_packed(emit_vMOV(dst_temp(next_temp, 0xf, false), copy),
+-                                         emit_sNOP());
++      struct vp_instr *mov = emit_packed(
++         emit_vMOV(dst_temp(next_temp, 0xf, false), copy), emit_sNOP());
+       list_addtail(&mov->link, out);
+ 
+       /* the consumer keeps the original swizzle, negate and absolute */
+@@ -395,18 +398,22 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi)
+       tgsi_parse_token(tgsi);
+       switch (tgsi->FullToken.Token.Type) {
+       case TGSI_TOKEN_TYPE_IMMEDIATE: {
+-         const struct tgsi_full_immediate *imm = &tgsi->FullToken.FullImmediate;
+-         unsigned n = imm->Immediate.NrTokens - 1; /* number of 32-bit values: 1 to 4 */
++         const struct tgsi_full_immediate *imm =
++            &tgsi->FullToken.FullImmediate;
++         unsigned n =
++            imm->Immediate.NrTokens - 1; /* number of 32-bit values: 1 to 4 */
+ 
+          assert(vp->num_immediates < GRATE_VP_MAX_IMMEDIATES);
+          for (unsigned i = 0; i < 4; ++i)
+-            vp->immediates[vp->num_immediates][i] = i < n ? imm->u[i].Uint : 0;
++            vp->immediates[vp->num_immediates][i] =
++               i < n ? imm->u[i].Uint : 0;
+          vp->num_immediates++;
+          break;
+       }
+ 
+       case TGSI_TOKEN_TYPE_DECLARATION: {
+-         const struct tgsi_full_declaration *decl = &tgsi->FullToken.FullDeclaration;
++         const struct tgsi_full_declaration *decl =
++            &tgsi->FullToken.FullDeclaration;
+          if (decl->Declaration.File == TGSI_FILE_TEMPORARY &&
+              decl->Range.Last + 1 > vp->num_temps)
+             vp->num_temps = decl->Range.Last + 1;
+-- 
+2.56.0
+

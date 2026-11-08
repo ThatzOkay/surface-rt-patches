@@ -1,0 +1,38 @@
+From d2d481be43afb5dce9335cb515e0936fd9a0375d Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Thu, 5 Nov 2026 14:30:00 +0100
+Subject: [PATCH] grate: set the NPOT_AUX level range so non-power-of-two textures sample correctly
+
+grate_init_state() zeroes TEX_TEXDESC_NPOT_AUX and nothing set it again. With
+it left at zero the sampler wraps coordinates at the next lower power of two
+even inside [0,1]: a 1366x753 texture sampled with GL_REPEAT (the sampler
+Catacomb composites its client buffers with) showed the left 1024 columns and
+top 512 rows again beyond x=1024 and y=512 on the wallpaper and the panel.
+Measured on the tablet for widths/heights 300, 600, 700, 1000, 1366, 753: the
+period was always the next lower power of two; power-of-two sizes were fine.
+
+Set BASE_LEVEL_ONLY in NPOT_AUX for every non-power-of-two texture unit. The
+texture is then addressed correctly across [0,1] with nearest and linear
+filtering and both wrap modes. Beyond 1.0 REPEAT clamps to the edge on such
+textures, so REPEAT stays exact only for coordinates inside [0,1].
+---
+--- pa/src/gallium/drivers/grate/grate_state.c
++++ pb/src/gallium/drivers/grate/grate_state.c
+@@ -893,6 +893,17 @@
+       GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_TEX_TEXDESC_LO(i), 2));
+       GRATE_PUSHBUF_WORD(ptr, lo);
+       GRATE_PUSHBUF_WORD(ptr, hi);
++      if (!pot_layout) {
++         /* A non-power-of-two descriptor keeps its level range in NPOT_AUX. Left zero (as
++          * grate_init_state() clears it), the sampler wraps coordinates at the next lower
++          * power of two even inside [0,1]: a 1366x753 texture sampled with REPEAT, which is
++          * what Catacomb composites its client buffers with, showed the left 1024 columns
++          * and top 512 rows again beyond x=1024 and y=512. With BASE_LEVEL_ONLY set the
++          * texture is addressed correctly across [0,1]; beyond 1.0 REPEAT then clamps to
++          * the edge, so REPEAT is exact only for coordinates in [0,1] on such textures. */
++         GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_TEX_TEXDESC_NPOT_AUX(i), 1));
++         GRATE_PUSHBUF_WORD(ptr, TGR3D_TEX_TEXDESC_NPOT_AUX_BASE_LEVEL_ONLY(TGR3D_STATE_ENABLED));
++      }
+    }
+    *ptrp = ptr;
+ }

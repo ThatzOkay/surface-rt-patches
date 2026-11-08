@@ -1,0 +1,210 @@
+From 8202107decb757c46587bd63df39a90e6e62c0b6 Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Sun, 8 Nov 2026 00:03:59 +0100
+Subject: [PATCH 3/3] grate: sample the base level of mipmapped textures
+
+A texture with a mipmap filter, or with more than one level, aborted the
+application in emit_textures() (last_level == 0 and no mipmap filter).
+The sampler is programmed for the base level only anyway, so sample
+that level and go on.
+
+Making that work needed two more things. A resource has the memory of
+one level, but transfer_map() ignored the level: glGenerateMipmap() and
+glTexImage2D() of a higher level were written over level 0. A transfer
+of a level above 0 now gets scratch memory. And Mesa reallocates a
+texture that gets mipmap levels and copies the image over with
+resource_copy_region(), which did nothing, so the texture came out
+empty. It now copies level 0 between linear resources with the CPU
+(the mapping waits for the GPU), and does nothing for other levels.
+
+Checked with tools/gpu/grate-texture-sample-test.c (TEXTURE_SAMPLE_MIPMAP=1
+sets a mipmap filter and calls glGenerateMipmap()): aborted before, now
+the base level is sampled. The other self-checking tests give the same
+output as before.
+---
+ src/gallium/drivers/grate/grate_resource.c | 83 ++++++++++++++++------
+ src/gallium/drivers/grate/grate_resource.h |  8 +++
+ src/gallium/drivers/grate/grate_screen.c   |  3 +-
+ src/gallium/drivers/grate/grate_state.c    |  6 +-
+ 4 files changed, 77 insertions(+), 23 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/grate_resource.c b/src/gallium/drivers/grate/grate_resource.c
+index fdc353728ca..cfc764efe27 100644
+--- a/src/gallium/drivers/grate/grate_resource.c
++++ b/src/gallium/drivers/grate/grate_resource.c
+@@ -4,6 +4,7 @@
+ #include "util/u_inlines.h"
+ #include "util/u_memory.h"
+ #include "util/u_pack_color.h"
++#include "util/u_surface.h"
+ #include "util/u_transfer.h"
+ #include "util/u_inlines.h"
+ 
+@@ -88,27 +89,42 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
+    if (usage & PIPE_MAP_DIRECTLY)
+       return NULL;
+ 
+-   ptrans = slab_alloc(&context->transfer_pool);
+-   if (!ptrans)
++   struct grate_transfer *gtrans = slab_zalloc(&context->transfer_pool);
++   if (!gtrans)
+       return NULL;
+-
+-   if (grate_bo_map(resource->bo, &ret))
+-      return NULL;
+-
+-   memset(ptrans, 0, sizeof(*ptrans));
++   ptrans = &gtrans->b;
++
++   if (level > 0) {
++      /* Only level 0 has memory (the sampler is programmed for the base
++       * level only). Give writes to the other levels, such as the ones of
++       * glGenerateMipmap(), scratch memory: they would land on level 0. */
++      unsigned stride =
++         align(box->width * util_format_get_blocksize(presource->format), 4);
++      gtrans->scratch = CALLOC(1, (size_t)stride * box->height * box->depth);
++      if (!gtrans->scratch) {
++         slab_free(&context->transfer_pool, gtrans);
++         return NULL;
++      }
++      ptrans->stride = stride;
++      ret = gtrans->scratch;
++   } else {
++      if (grate_bo_map(resource->bo, &ret)) {
++         slab_free(&context->transfer_pool, gtrans);
++         return NULL;
++      }
++      ptrans->stride = resource->pitch;
++      ret = (uint8_t *)ret + box->y * resource->pitch +
++            box->x * util_format_get_blocksize(presource->format);
++   }
+ 
+    pipe_resource_reference(&ptrans->resource, presource);
+-   ptrans->resource = presource;
+    ptrans->level = level;
+    ptrans->usage = usage;
+    ptrans->box = *box;
+-   ptrans->stride = resource->pitch;
+    ptrans->layer_stride = ptrans->stride;
+    *transfer = ptrans;
+ 
+-   return (uint8_t *)ret +
+-          box->y * resource->pitch +
+-          box->x * util_format_get_blocksize(presource->format);
++   return ret;
+ }
+ 
+ static void
+@@ -124,8 +140,12 @@ grate_resource_transfer_unmap(struct pipe_context *pcontext,
+                               struct pipe_transfer *transfer)
+ {
+    struct grate_context *context = grate_context(pcontext);
++   struct grate_transfer *gtrans = (struct grate_transfer *)transfer;
+ 
+-   grate_bo_unmap(grate_resource(transfer->resource)->bo);
++   if (gtrans->scratch)
++      FREE(gtrans->scratch);
++   else
++      grate_bo_unmap(grate_resource(transfer->resource)->bo);
+ 
+    pipe_resource_reference(&transfer->resource, NULL);
+    slab_free(&context->transfer_pool, transfer);
+@@ -350,15 +370,38 @@ grate_screen_resource_init(struct pipe_screen *pscreen)
+ 
+ static void
+ grate_resource_copy_region(struct pipe_context *pcontext,
+-                           struct pipe_resource *dst,
+-                           unsigned int dst_level,
++                           struct pipe_resource *pdst, unsigned int dst_level,
+                            unsigned int dstx, unsigned dsty,
+-                           unsigned int dstz,
+-                           struct pipe_resource *src,
+-                           unsigned int src_level,
+-                           const struct pipe_box *box)
++                           unsigned int dstz, struct pipe_resource *psrc,
++                           unsigned int src_level, const struct pipe_box *box)
+ {
+-   grate_unimplemented();
++   struct grate_resource *dst = grate_resource(pdst);
++   struct grate_resource *src = grate_resource(psrc);
++   void *dst_map, *src_map;
++
++   /* Only level 0 has memory, and the copy is done by the CPU on linear
++    * resources: this is what Mesa uses to carry the image over when it
++    * reallocates a texture to give it mipmap levels. */
++   if (dst_level > 0 || src_level > 0)
++      return;
++   if (dst->tiled || src->tiled ||
++       util_format_get_blocksize(pdst->format) !=
++          util_format_get_blocksize(psrc->format)) {
++      grate_unimplemented();
++      return;
++   }
++
++   /* the mapping waits for the GPU */
++   if (grate_bo_map(src->bo, &src_map) || grate_bo_map(dst->bo, &dst_map))
++      return;
++
++   util_copy_box(dst_map, pdst->format, dst->pitch, 0, dstx, dsty, dstz,
++                 box->width, box->height, box->depth, src_map, src->pitch, 0,
++                 box->x, box->y, box->z);
++
++   grate_bo_unmap(src->bo);
++   if (dst->bo != src->bo)
++      grate_bo_unmap(dst->bo);
+ }
+ 
+ static void
+diff --git a/src/gallium/drivers/grate/grate_resource.h b/src/gallium/drivers/grate/grate_resource.h
+index 58d0f76fba3..efac0438c25 100644
+--- a/src/gallium/drivers/grate/grate_resource.h
++++ b/src/gallium/drivers/grate/grate_resource.h
+@@ -20,6 +20,14 @@ struct grate_resource {
+    unsigned int stencil_pitch;
+ };
+ 
++/* A resource holds the memory of one level only. A transfer of a higher
++ * level gets scratch memory instead, so that it cannot overwrite level 0.
++ */
++struct grate_transfer {
++   struct pipe_transfer b;
++   void *scratch;
++};
++
+ static inline struct grate_resource *
+ grate_resource(struct pipe_resource *resource)
+ {
+diff --git a/src/gallium/drivers/grate/grate_screen.c b/src/gallium/drivers/grate/grate_screen.c
+index 72f72fb058d..8db36ad91dc 100644
+--- a/src/gallium/drivers/grate/grate_screen.c
++++ b/src/gallium/drivers/grate/grate_screen.c
+@@ -543,7 +543,8 @@ grate_screen_create(int fd)
+    grate_screen_init_shader_caps(screen);
+    grate_screen_init_caps(screen);
+ 
+-   slab_create_parent(&screen->transfer_pool, sizeof(struct pipe_transfer), 16);
++   slab_create_parent(&screen->transfer_pool, sizeof(struct grate_transfer),
++                      16);
+ 
+    return &screen->base;
+ }
+diff --git a/src/gallium/drivers/grate/grate_state.c b/src/gallium/drivers/grate/grate_state.c
+index c40930d706c..dc3bdbc6be9 100644
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -950,8 +950,10 @@ emit_textures(struct grate_context *ctx, uint32_t **ptrp)
+          continue;
+       struct grate_resource *res = grate_resource(view->texture);
+       assert(view->target == PIPE_TEXTURE_2D && view->u.tex.first_level == 0);
+-      assert(view->u.tex.last_level == 0 &&
+-             sampler->min_mip_filter == PIPE_TEX_MIPFILTER_NONE);
++      /* Only the base level is programmed (BASE_LEVEL_ONLY below), so a
++       * mipmapped texture, or a mipmap filter, samples level 0. This is
++       * what the descriptor does anyway; it only gives up the smoothing
++       * of minified textures, instead of aborting the application. */
+       unsigned row_bytes =
+          res->b.width0 * util_format_get_blocksize(res->b.format);
+       /* POT layout is tightly packed. NPOT layout rounds rows to 64 bytes,
+-- 
+2.56.0
+

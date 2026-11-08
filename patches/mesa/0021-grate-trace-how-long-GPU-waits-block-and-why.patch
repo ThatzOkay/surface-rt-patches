@@ -1,0 +1,168 @@
+From 9fb272f84e0419b8d59d96e5427bc4ae415d54ba Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Wed, 4 Nov 2026 13:40:12 +0100
+Subject: [PATCH] grate: trace how long GPU waits block, and why
+
+With GRATE_DRM_TRACE set, log every fence wait with its caller (queue drain, buffer
+map/export, job wait) and how long it blocked, plus the number of jobs pending at each
+drain and a marker for every context flush. Nothing changes when the variable is unset.
+For finding out whether Phosh stalls on the GPU once per frame (the synchronous flush
+from patch 0018) and how long each stall lasts.
+---
+ src/gallium/drivers/grate/drm/channel.c   |  5 ++++-
+ src/gallium/drivers/grate/drm/job.c       |  8 +++++---
+ src/gallium/drivers/grate/drm/syncpt.c    | 23 ++++++++++++++++++++---
+ src/gallium/drivers/grate/drm/tegra.h     |  7 ++++++-
+ src/gallium/drivers/grate/grate_bo.c      |  2 +-
+ src/gallium/drivers/grate/grate_context.c |  2 ++
+ 6 files changed, 38 insertions(+), 9 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/drm/channel.c b/src/gallium/drivers/grate/drm/channel.c
+index 143e3b82422..300874bcbd7 100644
+--- a/src/gallium/drivers/grate/drm/channel.c
++++ b/src/gallium/drivers/grate/drm/channel.c
+@@ -27,6 +27,7 @@
+ #endif
+ 
+ #include <errno.h>
++#include <stdio.h>
+ #include <string.h>
+ 
+ #include <sys/ioctl.h>
+@@ -133,7 +134,9 @@ int drm_tegra_channel_drain(struct drm_tegra_channel *channel)
+ {
+     if (!channel->pending_jobs)
+         return 0;
+-    int err = drm_tegra_fence_wait(&channel->pending, 1000000000UL);
++    if (drm_trace_level())
++        fprintf(stderr, "grate-drm: drain %u pending jobs\n", channel->pending_jobs);
++    int err = drm_tegra_fence_wait(&channel->pending, 1000000000UL, "drain");
+     if (err)
+         return err;
+     util_dynarray_foreach(&channel->pending_bos, struct grate_bo *, item) {
+diff --git a/src/gallium/drivers/grate/drm/job.c b/src/gallium/drivers/grate/drm/job.c
+index f371c6d134a..cab4a6f24b7 100644
+--- a/src/gallium/drivers/grate/drm/job.c
++++ b/src/gallium/drivers/grate/drm/job.c
+@@ -45,7 +45,7 @@
+  * GRATE_DRM_TRACE=1 logs every submit and wait to stderr; =2 also dumps the command words of each submit. For finding
+  * out whether the driver's jobs reach the kernel and complete (there is no other trace of draws).
+  */
+-static int
++int
+ drm_trace_level(void)
+ {
+     static int level = -1;
+@@ -338,11 +338,13 @@ drm_tegra_job_wait(struct drm_tegra_job *job, unsigned long timeout)
+     args.thresh = job->syncpt.fence;
+     args.timeout = ms;
+ 
++    unsigned long long t0 = drm_trace_level() ? drm_tegra_now_us() : 0;
++
+     err = ioctl(drm->fd, GRATE_CLASSIC_IOCTL_SYNCPT_WAIT, &args);
+ 
+     if (drm_trace_level())
+-        fprintf(stderr, "grate-drm: wait id %u thresh %u (%lu ms) -> %d\n", args.id, args.thresh, ms,
+-                err < 0 ? -errno : 0);
++        fprintf(stderr, "grate-drm: wait id %u thresh %u (%lu ms) -> %d, blocked %llu us\n", args.id, args.thresh, ms,
++                err < 0 ? -errno : 0, drm_tegra_now_us() - t0);
+ 
+     if (err < 0)
+         return -errno;
+diff --git a/src/gallium/drivers/grate/drm/syncpt.c b/src/gallium/drivers/grate/drm/syncpt.c
+index 734f12fc686..f1bd3637ac2 100644
+--- a/src/gallium/drivers/grate/drm/syncpt.c
++++ b/src/gallium/drivers/grate/drm/syncpt.c
+@@ -25,7 +25,9 @@
+ #endif
+ 
+ #include <errno.h>
++#include <stdio.h>
+ #include <string.h>
++#include <time.h>
+ 
+ #include <sys/ioctl.h>
+ 
+@@ -78,8 +80,17 @@ drm_tegra_syncpoint_free(struct drm_tegra_syncpoint *syncpt)
+ }
+ 
+ /* timeout is in nanoseconds relative to now; the classic ioctl takes milliseconds */
++unsigned long long
++drm_tegra_now_us(void)
++{
++    struct timespec ts;
++
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (unsigned long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
++}
++
+ int
+-drm_tegra_fence_wait(struct drm_tegra_fence *fence, unsigned long timeout)
++drm_tegra_fence_wait(struct drm_tegra_fence *fence, unsigned long timeout, const char *why)
+ {
+     struct grate_classic_syncpt_wait args;
+     int err;
+@@ -89,9 +100,15 @@ drm_tegra_fence_wait(struct drm_tegra_fence *fence, unsigned long timeout)
+     args.thresh = fence->value;
+     args.timeout = timeout / 1000000;
+ 
++    unsigned long long t0 = drm_trace_level() ? drm_tegra_now_us() : 0;
++
+     err = ioctl(fence->drm->fd, GRATE_CLASSIC_IOCTL_SYNCPT_WAIT, &args);
+     if (err < 0)
+-        return -errno;
++        err = -errno;
+ 
+-    return 0;
++    if (drm_trace_level())
++        fprintf(stderr, "grate-drm: fence wait (%s) id %u thresh %u -> %d, blocked %llu us\n", why, args.id, args.thresh,
++                err, drm_tegra_now_us() - t0);
++
++    return err;
+ }
+diff --git a/src/gallium/drivers/grate/drm/tegra.h b/src/gallium/drivers/grate/drm/tegra.h
+index 35cc61f5b7c..4bda9ec3fd0 100644
+--- a/src/gallium/drivers/grate/drm/tegra.h
++++ b/src/gallium/drivers/grate/drm/tegra.h
+@@ -102,6 +102,11 @@ int drm_tegra_pushbuf_sync_cond(struct drm_tegra_pushbuf *pushbuf,
+ int drm_tegra_syncpoint_new(struct drm_tegra_channel *channel,
+                             struct drm_tegra_syncpoint **syncptp);
+ int drm_tegra_syncpoint_free(struct drm_tegra_syncpoint *syncpt);
+-int drm_tegra_fence_wait(struct drm_tegra_fence *fence, unsigned long timeout);
++/* why names the caller in GRATE_DRM_TRACE output ("drain", "bo", ...); it has no other effect. */
++int drm_tegra_fence_wait(struct drm_tegra_fence *fence, unsigned long timeout, const char *why);
++
++/* GRATE_DRM_TRACE level (0 when unset) and a monotonic microsecond clock, for the trace output. */
++int drm_trace_level(void);
++unsigned long long drm_tegra_now_us(void);
+ 
+ #endif /* __DRM_TEGRA_H__ */
+diff --git a/src/gallium/drivers/grate/grate_bo.c b/src/gallium/drivers/grate/grate_bo.c
+index dbce1ddae05..db12ccfd324 100644
+--- a/src/gallium/drivers/grate/grate_bo.c
++++ b/src/gallium/drivers/grate/grate_bo.c
+@@ -168,7 +168,7 @@ int grate_bo_wait(struct grate_bo *bo)
+ {
+     if (!bo->pending_channel)
+         return 0;
+-    return drm_tegra_fence_wait(&bo->pending, 1000000000UL);
++    return drm_tegra_fence_wait(&bo->pending, 1000000000UL, "bo");
+ }
+ 
+ int grate_bo_map(struct grate_bo *bo, void **ptr)
+diff --git a/src/gallium/drivers/grate/grate_context.c b/src/gallium/drivers/grate/grate_context.c
+index 6322cb04297..9e8810c231d 100644
+--- a/src/gallium/drivers/grate/grate_context.c
++++ b/src/gallium/drivers/grate/grate_context.c
+@@ -91,6 +91,8 @@ grate_context_flush(struct pipe_context *pcontext,
+                     enum pipe_flush_flags flags)
+ {
+    struct grate_context *context = grate_context(pcontext);
++   if (drm_trace_level())
++      fprintf(stderr, "grate-drm: flush flags 0x%x\n", (unsigned)flags);
+    int err = drm_tegra_channel_drain(context->gr3d->stream.channel);
+    if (!err)
+       err = drm_tegra_channel_drain(context->gr2d->stream.channel);
+-- 
+2.56.0
+

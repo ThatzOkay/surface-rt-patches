@@ -1,0 +1,721 @@
+From 3ae27a7a9e8314fd18f53d2cbc3db948260dc64c Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Thu, 5 Nov 2026 23:29:55 +0100
+Subject: [PATCH 28/30] grate: blend with any factor pair and equation, and
+ honour the colormask
+
+The 3D unit has no blender: a blended program is the application's program
+plus one more sequencer instruction that reads the destination pixel into
+R0/R1 and a few ALU packets that combine it with the colour in R2/R3. The
+only epilogue was the premultiplied source-over one, built once per
+program; any other blend state was logged and drawn unblended.
+
+The epilogue is now generated from the blend state (fp/blend.c) and built
+on first use, one variant per state and program (struct grate_blend_variant):
+
+* equations ADD, SUBTRACT, REVERSE_SUBTRACT, separate for rgb and alpha;
+* factors ZERO, ONE, (INV_)SRC_COLOR, (INV_)SRC_ALPHA, (INV_)DST_COLOR,
+  (INV_)DST_ALPHA, separate for rgb and alpha;
+* the colormask, also with blending off.
+
+One ALU slot computes A * B + C, and C * D only when D is a half of the
+register C is in, so per position (B, G, R, A) either "dst * Fd + src"
+(source factor ONE or ZERO, one packet, the old epilogue) or
+"G = src * Fs" into a global, a nop packet, then "dst * Fd +/- G".
+
+Factors and equations are rows in tables (blend_factors[], blend_funcs[]);
+anything not in them makes grate_fp_blend_key() return 0 and the bind logs
+the whole state. See the comment at the top of blend.c for how to extend it.
+Not supported yet: constant colour factors, SRC_ALPHA_SATURATE, MIN/MAX,
+logic ops.
+---
+ src/gallium/drivers/grate/fp/blend.c      | 354 ++++++++++++++++++++++
+ src/gallium/drivers/grate/fp/blend.h      |  29 ++
+ src/gallium/drivers/grate/grate_context.h |   2 +-
+ src/gallium/drivers/grate/grate_program.c |  98 +++---
+ src/gallium/drivers/grate/grate_program.h |  16 +-
+ src/gallium/drivers/grate/grate_state.c   |  41 +--
+ src/gallium/drivers/grate/meson.build     |   2 +
+ 7 files changed, 489 insertions(+), 53 deletions(-)
+ create mode 100644 src/gallium/drivers/grate/fp/blend.c
+ create mode 100644 src/gallium/drivers/grate/fp/blend.h
+
+diff --git a/src/gallium/drivers/grate/fp/blend.c b/src/gallium/drivers/grate/fp/blend.c
+new file mode 100644
+index 00000000000..78c62ccce1b
+--- /dev/null
++++ b/src/gallium/drivers/grate/fp/blend.c
+@@ -0,0 +1,354 @@
++#include "util/macros.h"
++
++#include "blend.h"
++#include "fpir.h"
++
++/*
++ * The 3D unit has no blender. A blended fragment program is the application's
++ * program plus one more sequencer instruction that reads the destination
++ * pixel into R0/R1, and a few ALU packets that combine it with the colour the
++ * application left in R2/R3. Both hold FX10 values, two per register.
++ *
++ * The packets work on storage positions, not channels:
++ *
++ *    position  0    1    2    3
++ *    channel   B    G    R    A
++ *    register  R2   R2   R3   R3     (low, high, low, high half)
++ *
++ * and the same position in R0/R1 is the destination value. One ALU slot
++ * computes A * B + C, and optionally + C * D, but D has to be a half of the
++ * same register as C. That gives two shapes per position:
++ *
++ *    plain (source factor ONE or ZERO):
++ *       out = dst * Fd + src                       one packet
++ *    general:
++ *       G = src * Fs  (into global register 16 + position)
++ *       out = dst * Fd + G                         packet, nop, packet
++ *
++ * The nop is the latency gap the compiler's own output stage leaves between
++ * a computation and the instruction that stores it.
++ *
++ * To extend this:
++ *
++ *  - A factor built from values that can already be read (for example
++ *    INV_DST_ALPHA) is one row in blend_factors[].
++ *  - A new value (the blend constant from a uniform, the second fragment
++ *    output of dual-source blending) is a member of enum blend_value and a
++ *    case in blend_value_operand(); the epilogue also has to make that value
++ *    readable, which grate_program.c does by placing it in a register that
++ *    survives the destination read.
++ *  - A new equation is a row in blend_funcs[] if it is a signed sum of the
++ *    two products. MIN and MAX are different ALU ops and need their own
++ *    branch in grate_fp_blend_alu().
++ *
++ * Whatever is not in a table makes grate_fp_blend_key() return 0, and the
++ * caller logs the complete state, so nothing is drawn wrongly without a
++ * trace.
++ */
++
++enum blend_value {
++   BLEND_VALUE_ZERO,
++   BLEND_VALUE_ONE,
++   BLEND_VALUE_SRC_COLOR,
++   BLEND_VALUE_SRC_ALPHA,
++   BLEND_VALUE_DST_COLOR,
++   BLEND_VALUE_DST_ALPHA,
++};
++
++static const struct {
++   enum pipe_blendfactor factor;
++   enum blend_value value;
++   bool invert; /* the factor is 1 - value */
++} blend_factors[] = {
++   {PIPE_BLENDFACTOR_ZERO, BLEND_VALUE_ZERO, false},
++   {PIPE_BLENDFACTOR_ONE, BLEND_VALUE_ONE, false},
++   {PIPE_BLENDFACTOR_SRC_COLOR, BLEND_VALUE_SRC_COLOR, false},
++   {PIPE_BLENDFACTOR_INV_SRC_COLOR, BLEND_VALUE_SRC_COLOR, true},
++   {PIPE_BLENDFACTOR_SRC_ALPHA, BLEND_VALUE_SRC_ALPHA, false},
++   {PIPE_BLENDFACTOR_INV_SRC_ALPHA, BLEND_VALUE_SRC_ALPHA, true},
++   {PIPE_BLENDFACTOR_DST_COLOR, BLEND_VALUE_DST_COLOR, false},
++   {PIPE_BLENDFACTOR_INV_DST_COLOR, BLEND_VALUE_DST_COLOR, true},
++   {PIPE_BLENDFACTOR_DST_ALPHA, BLEND_VALUE_DST_ALPHA, false},
++   {PIPE_BLENDFACTOR_INV_DST_ALPHA, BLEND_VALUE_DST_ALPHA, true},
++};
++
++static const struct {
++   enum pipe_blend_func func;
++   bool negate_dst_term; /* result = src * Fs - dst * Fd */
++   bool negate_src_term; /* result = dst * Fd - src * Fs */
++} blend_funcs[] = {
++   {PIPE_BLEND_ADD, false, false},
++   {PIPE_BLEND_SUBTRACT, true, false},
++   {PIPE_BLEND_REVERSE_SUBTRACT, false, true},
++};
++
++/* Bit layout of the key. */
++#define KEY_VALID            (1u << 31)
++#define KEY_RGB_FUNC_SHIFT   0
++#define KEY_ALPHA_FUNC_SHIFT 3
++#define KEY_RGB_SRC_SHIFT    6
++#define KEY_RGB_DST_SHIFT    11
++#define KEY_ALPHA_SRC_SHIFT  16
++#define KEY_ALPHA_DST_SHIFT  21
++#define KEY_COLORMASK_SHIFT  26
++#define KEY_FUNC_MASK        0x7
++#define KEY_FACTOR_MASK      0x1f
++#define KEY_COLORMASK_MASK   0xf
++
++/* The colormask bit of each storage position: B, G, R, A. */
++static const unsigned position_mask_bit[4] = {0x4, 0x2, 0x1, 0x8};
++
++static struct fp_alu_src_operand
++src_zero(void)
++{
++   struct fp_alu_src_operand src = {
++      .index = 31,
++      .datatype = FP_DATATYPE_FIXED10,
++   };
++
++   return src;
++}
++
++static struct fp_alu_src_operand
++src_one(void)
++{
++   struct fp_alu_src_operand src = {
++      .index = 31,
++      .datatype = FP_DATATYPE_FIXED10,
++      .sub_reg_select_high = true,
++   };
++
++   return src;
++}
++
++/* Where a blend value of storage position p is read from. */
++static struct fp_alu_src_operand
++blend_value_operand(enum blend_value value, unsigned p)
++{
++   struct fp_alu_src_operand src = {.datatype = FP_DATATYPE_FIXED10};
++
++   switch (value) {
++   case BLEND_VALUE_ZERO:
++      return src_zero();
++   case BLEND_VALUE_ONE:
++      return src_one();
++   case BLEND_VALUE_SRC_COLOR:
++      src.index = 2 + p / 2;
++      src.sub_reg_select_high = p & 1;
++      return src;
++   case BLEND_VALUE_SRC_ALPHA:
++      src.index = 3;
++      src.sub_reg_select_high = true;
++      return src;
++   case BLEND_VALUE_DST_COLOR:
++      src.index = p / 2;
++      src.sub_reg_select_high = p & 1;
++      return src;
++   case BLEND_VALUE_DST_ALPHA:
++      src.index = 1;
++      src.sub_reg_select_high = true;
++      return src;
++   }
++   UNREACHABLE("invalid blend value");
++}
++
++/* Operand for a blend factor; false if the factor is not in the table. */
++static bool
++blend_factor_operand(enum pipe_blendfactor factor, unsigned p,
++                     struct fp_alu_src_operand *src)
++{
++   for (unsigned i = 0; i < ARRAY_SIZE(blend_factors); i++) {
++      if (blend_factors[i].factor != factor)
++         continue;
++
++      *src = blend_value_operand(blend_factors[i].value, p);
++      if (blend_factors[i].invert) {
++         /* 1 - x, as the premultiplied epilogue always did it */
++         src->minus_one = true;
++         src->negate = true;
++      }
++      return true;
++   }
++   return false;
++}
++
++static bool
++blend_func_supported(enum pipe_blend_func func)
++{
++   for (unsigned i = 0; i < ARRAY_SIZE(blend_funcs); i++) {
++      if (blend_funcs[i].func == func)
++         return true;
++   }
++   return false;
++}
++
++uint32_t
++grate_fp_blend_key(const struct pipe_rt_blend_state *rt)
++{
++   struct fp_alu_src_operand probe;
++
++   /* Without blending only the colormask matters, and only when it
++    * protects a channel: that is "src * 1 + dst * 0" with the protected
++    * channels kept.
++    */
++   if (!rt->blend_enable) {
++      if ((rt->colormask & KEY_COLORMASK_MASK) == KEY_COLORMASK_MASK)
++         return 0;
++
++      return KEY_VALID | PIPE_BLEND_ADD << KEY_RGB_FUNC_SHIFT |
++             PIPE_BLEND_ADD << KEY_ALPHA_FUNC_SHIFT |
++             PIPE_BLENDFACTOR_ONE << KEY_RGB_SRC_SHIFT |
++             PIPE_BLENDFACTOR_ZERO << KEY_RGB_DST_SHIFT |
++             PIPE_BLENDFACTOR_ONE << KEY_ALPHA_SRC_SHIFT |
++             PIPE_BLENDFACTOR_ZERO << KEY_ALPHA_DST_SHIFT |
++             (rt->colormask & KEY_COLORMASK_MASK) << KEY_COLORMASK_SHIFT;
++   }
++
++   if (!blend_func_supported(rt->rgb_func) ||
++       !blend_func_supported(rt->alpha_func))
++      return 0;
++
++   for (unsigned p = 0; p < 4; p++) {
++      bool alpha = p == 3;
++      enum pipe_blendfactor src =
++         alpha ? rt->alpha_src_factor : rt->rgb_src_factor;
++      enum pipe_blendfactor dst =
++         alpha ? rt->alpha_dst_factor : rt->rgb_dst_factor;
++
++      if (!blend_factor_operand(src, p, &probe) ||
++          !blend_factor_operand(dst, p, &probe))
++         return 0;
++   }
++
++   return KEY_VALID | rt->rgb_func << KEY_RGB_FUNC_SHIFT |
++          rt->alpha_func << KEY_ALPHA_FUNC_SHIFT |
++          rt->rgb_src_factor << KEY_RGB_SRC_SHIFT |
++          rt->rgb_dst_factor << KEY_RGB_DST_SHIFT |
++          rt->alpha_src_factor << KEY_ALPHA_SRC_SHIFT |
++          rt->alpha_dst_factor << KEY_ALPHA_DST_SHIFT |
++          (rt->colormask & KEY_COLORMASK_MASK) << KEY_COLORMASK_SHIFT;
++}
++
++unsigned
++grate_fp_blend_alu(uint32_t key,
++                   uint32_t words[GRATE_FP_BLEND_MAX_PACKETS * 8])
++{
++   struct fp_alu_instr packets[GRATE_FP_BLEND_MAX_PACKETS][4] = {{{0}}};
++   struct fp_alu_src_operand fs[4], fd[4];
++   enum pipe_blend_func func[4];
++   bool general = false;
++   unsigned num_packets;
++   unsigned colormask = (key >> KEY_COLORMASK_SHIFT) & KEY_COLORMASK_MASK;
++
++   if (!(key & KEY_VALID))
++      return 0;
++
++   for (unsigned p = 0; p < 4; p++) {
++      bool alpha = p == 3;
++      enum pipe_blendfactor src_factor =
++         (key >> (alpha ? KEY_ALPHA_SRC_SHIFT : KEY_RGB_SRC_SHIFT)) &
++         KEY_FACTOR_MASK;
++      enum pipe_blendfactor dst_factor =
++         (key >> (alpha ? KEY_ALPHA_DST_SHIFT : KEY_RGB_DST_SHIFT)) &
++         KEY_FACTOR_MASK;
++
++      func[p] = (key >> (alpha ? KEY_ALPHA_FUNC_SHIFT : KEY_RGB_FUNC_SHIFT)) &
++                KEY_FUNC_MASK;
++
++      /* A channel the colormask protects keeps the destination. */
++      if (!(colormask & position_mask_bit[p])) {
++         src_factor = PIPE_BLENDFACTOR_ZERO;
++         dst_factor = PIPE_BLENDFACTOR_ONE;
++         func[p] = PIPE_BLEND_ADD;
++      }
++
++      if (!blend_factor_operand(src_factor, p, &fs[p]) ||
++          !blend_factor_operand(dst_factor, p, &fd[p]))
++         return 0;
++
++      general |= src_factor != PIPE_BLENDFACTOR_ONE &&
++                 src_factor != PIPE_BLENDFACTOR_ZERO;
++   }
++
++   if (general) {
++      for (unsigned p = 0; p < 4; p++) {
++         /* G = src * Fs */
++         packets[0][p] = (struct fp_alu_instr){
++            .op = FP_ALU_OP_MAD,
++            .dst =
++               {
++                  .index = 16 + p,
++                  .write_low_sub_reg = true,
++                  .write_high_sub_reg = true,
++               },
++            .src =
++               {
++                  blend_value_operand(BLEND_VALUE_SRC_COLOR, p),
++                  fs[p],
++                  src_zero(),
++                  {.index = 0, .datatype = FP_DATATYPE_FIXED10},
++               },
++         };
++
++         /* nop */
++         packets[1][p] = (struct fp_alu_instr){
++            .op = FP_ALU_OP_MAD,
++            .dst = {.index = 31},
++            .src = {src_zero(), src_one(), src_zero(), src_one()},
++         };
++      }
++      num_packets = 3;
++   } else {
++      num_packets = 1;
++   }
++
++   for (unsigned p = 0; p < 4; p++) {
++      struct fp_alu_src_operand dst_term =
++         blend_value_operand(BLEND_VALUE_DST_COLOR, p);
++      struct fp_alu_src_operand src_term;
++      struct fp_alu_instr *out = &packets[num_packets - 1][p];
++
++      if (general) {
++         src_term = (struct fp_alu_src_operand){
++            .index = 16 + p,
++            .datatype = FP_DATATYPE_FP20,
++         };
++      } else if (fs[p].index == 31 && !fs[p].sub_reg_select_high) {
++         src_term = src_zero();
++      } else {
++         src_term = blend_value_operand(BLEND_VALUE_SRC_COLOR, p);
++      }
++
++      for (unsigned i = 0; i < ARRAY_SIZE(blend_funcs); i++) {
++         if (blend_funcs[i].func != func[p])
++            continue;
++         dst_term.negate = blend_funcs[i].negate_dst_term;
++         src_term.negate = blend_funcs[i].negate_src_term;
++      }
++
++      *out = (struct fp_alu_instr){
++         .op = FP_ALU_OP_MAD,
++         .dst =
++            {
++               .index = 2 + p / 2,
++               .write_low_sub_reg = !(p & 1),
++               .write_high_sub_reg = p & 1,
++               .saturate = true,
++            },
++         .src = {dst_term, fd[p], src_term, src_one()},
++      };
++
++      /* An rD on the same register as rC switches on the second product
++       * (see grate_fp_pack_alu()).
++       */
++      if (out->src[2].index == out->src[3].index)
++         out->src[3].index = 0;
++   }
++
++   for (unsigned i = 0; i < num_packets; i++) {
++      for (unsigned p = 0; p < 4; p++)
++         grate_fp_pack_alu(words + i * 8 + p * 2, &packets[i][p]);
++   }
++
++   return num_packets;
++}
+diff --git a/src/gallium/drivers/grate/fp/blend.h b/src/gallium/drivers/grate/fp/blend.h
+new file mode 100644
+index 00000000000..c34947d4c25
+--- /dev/null
++++ b/src/gallium/drivers/grate/fp/blend.h
+@@ -0,0 +1,29 @@
++#ifndef GRATE_FP_BLEND_H
++#define GRATE_FP_BLEND_H
++
++#include <stdint.h>
++
++#include "pipe/p_state.h"
++
++/* Blend epilogue of the fragment program, see blend.c. */
++
++#define GRATE_FP_BLEND_MAX_PACKETS 3
++
++/**
++ * Packs the blend state of render target 0 into a 32-bit key that names one
++ * epilogue. Returns 0 when nothing needs doing (blending off and every
++ * channel written), or when the state uses an equation or factor the
++ * epilogue cannot express yet.
++ */
++uint32_t grate_fp_blend_key(const struct pipe_rt_blend_state *rt);
++
++/**
++ * Builds the ALU packets of the epilogue for a key from
++ * grate_fp_blend_key(). Writes 8 words per packet to words and returns the
++ * number of packets (at most GRATE_FP_BLEND_MAX_PACKETS), or 0 for a key
++ * that is not valid.
++ */
++unsigned grate_fp_blend_alu(uint32_t key,
++                            uint32_t words[GRATE_FP_BLEND_MAX_PACKETS * 8]);
++
++#endif
+diff --git a/src/gallium/drivers/grate/grate_context.h b/src/gallium/drivers/grate/grate_context.h
+index edf8704804d..6ca414938e2 100644
+--- a/src/gallium/drivers/grate/grate_context.h
++++ b/src/gallium/drivers/grate/grate_context.h
+@@ -46,7 +46,7 @@ struct grate_context {
+    struct grate_vertexbuf_state vbs;
+    struct pipe_constant_buffer constant_buffer[PIPE_MAX_CONSTANT_BUFFERS]; // ??, stolen from other drivers but no idea
+ 
+-   bool premultiplied_blend;
++   uint32_t blend_key; /* grate_fp_blend_key(), 0 = not blending */
+ 
+    struct grate_zsa_state *zsa;
+    struct pipe_stencil_ref stencil_ref;
+diff --git a/src/gallium/drivers/grate/grate_program.c b/src/gallium/drivers/grate/grate_program.c
+index 47158732885..a4343f4459f 100644
+--- a/src/gallium/drivers/grate/grate_program.c
++++ b/src/gallium/drivers/grate/grate_program.c
+@@ -18,6 +18,7 @@
+ #include "grate_screen.h"
+ #include "grate_program.h"
+ #include "grate_compiler.h"
++#include "fp/blend.h"
+ #include "fp/fpir.h"
+ #include "vp/vpir.h"
+ 
+@@ -163,34 +164,21 @@ grate_delete_vs_state(struct pipe_context *pcontext, void *so)
+    FREE(so);
+ }
+ 
+-/* Keep the application shader intact and append a source-over stage.
+- * Its packed source is R2/R3; PSEQ reads colour target 1 into R0/R1.
++/**
++ * Keep the application shader intact and append the blend stage for key
++ * (see fp/blend.c). The stage is one more sequencer instruction, which
++ * reads the destination pixel into R0/R1, and its ALU packets.
+  */
+ static bool
+-create_premultiplied_blob(const struct grate_shader_blob *source,
+-                          unsigned fp_count, unsigned alu_count,
+-                          struct grate_shader_blob *output)
++create_blend_blob(const struct grate_shader_blob *source, unsigned fp_count,
++                  unsigned alu_count, uint32_t key,
++                  struct grate_shader_blob *output)
+ {
+-   if (fp_count >= 63 || alu_count >= 64)
++   uint32_t blend_words[GRATE_FP_BLEND_MAX_PACKETS * 8];
++   unsigned packets = grate_fp_blend_alu(key, blend_words);
++
++   if (!packets || fp_count >= 63 || alu_count + packets > 64)
+       return false;
+-   uint32_t blend_words[8];
+-   for (unsigned c = 0; c < 4; c++) {
+-      struct fp_alu_instr instruction = {
+-         .op = FP_ALU_OP_MAD,
+-         .dst = {.index = 2 + c / 2, .write_low_sub_reg = !(c & 1),
+-                 .write_high_sub_reg = c & 1, .saturate = true},
+-         .src = {
+-            {.index = c / 2, .datatype = FP_DATATYPE_FIXED10,
+-             .sub_reg_select_high = c & 1},
+-            {.index = 3, .datatype = FP_DATATYPE_FIXED10,
+-             .sub_reg_select_high = true, .minus_one = true, .negate = true},
+-            {.index = 2 + c / 2, .datatype = FP_DATATYPE_FIXED10,
+-             .sub_reg_select_high = c & 1},
+-            {.index = 31, .datatype = FP_DATATYPE_FIXED10, .sub_reg_select_high = true},
+-         },
+-      };
+-      grate_fp_pack_alu(blend_words + c * 2, &instruction);
+-   }
+    struct util_dynarray result;
+    util_dynarray_init(&result, NULL);
+ #define BLEND_PUSH(value) util_dynarray_append_typed(&result, uint32_t, (value))
+@@ -222,8 +210,15 @@ create_premultiplied_blob(const struct grate_shader_blob *source,
+          case REG_TGR3D_PSEQ_INST_DATA: extra = 1; last = 0x00810008; bit = 1; break;
+          case REG_TGR3D_AT_REMAP_DATA: extra = 1; bit = 2; break;
+          case REG_TGR3D_TEX_INST_DATA: extra = 1; bit = 4; break;
+-         case REG_TGR3D_ALU_REMAP_DATA: extra = 1; last = (alu_count << 2) | 1; bit = 8; break;
+-         case REG_TGR3D_ALU_INST_DATA: extra = 8; bit = 16; break;
++         case REG_TGR3D_ALU_REMAP_DATA:
++            extra = 1;
++            last = (alu_count << 2) | packets;
++            bit = 8;
++            break;
++         case REG_TGR3D_ALU_INST_DATA:
++            extra = 8 * packets;
++            bit = 16;
++            break;
+          case REG_TGR3D_ALU_P2CX_DATA: extra = 1; bit = 32; break;
+          case REG_TGR3D_DW_INST_DATA: extra = 1; last = 0x00028005; bit = 64; break;
+          }
+@@ -248,6 +243,40 @@ fail:
+    return false;
+ }
+ 
++/**
++ * The fragment program with the blend stage for key, built on first use.
++ * Returns NULL if it cannot be built.
++ */
++const struct grate_shader_blob *
++grate_fragment_blend_blob(struct grate_fragment_shader_state *shader,
++                          uint32_t key)
++{
++   struct grate_blend_variant *variant;
++
++   for (variant = shader->variants; variant; variant = variant->next) {
++      if (variant->key == key)
++         return &variant->blob;
++   }
++
++   variant = CALLOC_STRUCT(grate_blend_variant);
++   if (!variant)
++      return NULL;
++
++   variant->key = key;
++   if (!create_blend_blob(&shader->blob, shader->num_fp_instrs,
++                          shader->num_alu_instrs, key, &variant->blob)) {
++      grate_loge("cannot build the blend variant for key 0x%08x "
++                 "(fragment program too long for the blend stage?)\n",
++                 key);
++      FREE(variant);
++      return NULL;
++   }
++
++   variant->next = shader->variants;
++   shader->variants = variant;
++   return &variant->blob;
++}
++
+ static void
+ free_fragment_ir(struct grate_fp_shader *fp)
+ {
+@@ -423,13 +452,8 @@ grate_create_fs_state(struct pipe_context *pcontext,
+    so->blob.commands = buf.data;
+    so->info = fp.info;
+    free_fragment_ir(&fp);
+-   if (!create_premultiplied_blob(&so->blob, num_fp_instrs, num_alu_instrs,
+-                                 &so->premultiplied_blob)) {
+-      grate_loge("failed to build premultiplied fragment variant\n");
+-      FREE(so->blob.commands);
+-      FREE(so);
+-      return NULL;
+-   }
++   so->num_fp_instrs = num_fp_instrs;
++   so->num_alu_instrs = num_alu_instrs;
+    return so;
+ }
+ 
+@@ -446,7 +470,13 @@ grate_delete_fs_state(struct pipe_context *pcontext, void *so)
+    struct grate_fragment_shader_state *shader = so;
+    grate_trace();
+    FREE(shader->blob.commands);
+-   FREE(shader->premultiplied_blob.commands);
++   while (shader->variants) {
++      struct grate_blend_variant *variant = shader->variants;
++
++      shader->variants = variant->next;
++      FREE(variant->blob.commands);
++      FREE(variant);
++   }
+    FREE(shader);
+ }
+ 
+diff --git a/src/gallium/drivers/grate/grate_program.h b/src/gallium/drivers/grate/grate_program.h
+index c3342164a78..2f38c945326 100644
+--- a/src/gallium/drivers/grate/grate_program.h
++++ b/src/gallium/drivers/grate/grate_program.h
+@@ -19,13 +19,27 @@ struct grate_vertex_shader_state {
+    unsigned num_immediates;
+ };
+ 
++/* The fragment program with the blend stage for one blend state appended. */
++struct grate_blend_variant {
++   struct grate_blend_variant *next;
++   uint32_t key; /* see grate_fp_blend_key() */
++   struct grate_shader_blob blob;
++};
++
+ struct grate_fragment_shader_state {
+    struct pipe_shader_state base;
+    struct grate_shader_blob blob;
+-   struct grate_shader_blob premultiplied_blob;
++   unsigned num_fp_instrs;
++   unsigned num_alu_instrs;
++   struct grate_blend_variant *variants;
+    struct grate_fp_info info;
++
+ };
+ 
++const struct grate_shader_blob *
++grate_fragment_blend_blob(struct grate_fragment_shader_state *shader,
++                          uint32_t key);
++
+ void
+ grate_context_program_init(struct pipe_context *pcontext);
+ 
+diff --git a/src/gallium/drivers/grate/grate_state.c b/src/gallium/drivers/grate/grate_state.c
+index 51698b7ee52..e04cdd34204 100644
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -17,6 +17,7 @@
+ #include "grate_program.h"
+ #include "grate_resource.h"
+ #include "grate_state.h"
++#include "fp/blend.h"
+ 
+ #include "host1x01_hardware.h"
+ 
+@@ -271,17 +272,19 @@ grate_bind_blend_state(struct pipe_context *pcontext, void *so)
+ {
+    const struct pipe_blend_state *blend = so;
+    struct grate_context *ctx = grate_context(pcontext);
+-   ctx->premultiplied_blend = blend && !blend->independent_blend_enable &&
+-      !blend->logicop_enable && blend->rt[0].blend_enable &&
+-      blend->rt[0].rgb_func == PIPE_BLEND_ADD &&
+-      blend->rt[0].alpha_func == PIPE_BLEND_ADD &&
+-      blend->rt[0].rgb_src_factor == PIPE_BLENDFACTOR_ONE &&
+-      blend->rt[0].alpha_src_factor == PIPE_BLENDFACTOR_ONE &&
+-      blend->rt[0].rgb_dst_factor == PIPE_BLENDFACTOR_INV_SRC_ALPHA &&
+-      blend->rt[0].alpha_dst_factor == PIPE_BLENDFACTOR_INV_SRC_ALPHA &&
+-      blend->rt[0].colormask == 0xf;
+-   if (blend && blend->rt[0].blend_enable && !ctx->premultiplied_blend)
+-      grate_loge("unsupported blend state (source-over with premultiplied RGBA required)\n");
++   const struct pipe_rt_blend_state *rt = blend ? &blend->rt[0] : NULL;
++
++   ctx->blend_key = 0;
++   if (rt && !blend->independent_blend_enable && !blend->logicop_enable)
++      ctx->blend_key = grate_fp_blend_key(rt);
++
++   if (rt && rt->blend_enable && !ctx->blend_key) {
++      grate_loge("unsupported blend state: rgb func %u src %u dst %u, "
++                 "alpha func %u src %u dst %u, logicop %u\n",
++                 rt->rgb_func, rt->rgb_src_factor, rt->rgb_dst_factor,
++                 rt->alpha_func, rt->alpha_src_factor, rt->alpha_dst_factor,
++                 blend->logicop_enable);
++   }
+ }
+ 
+ static void
+@@ -827,7 +830,8 @@ emit_fs_uniforms(struct grate_context *context, uint32_t **ptrp)
+ }
+ 
+ static void
+-emit_shader(struct grate_stream *stream, uint32_t **ptrp, struct grate_shader_blob *blob)
++emit_shader(struct grate_stream *stream, uint32_t **ptrp,
++            const struct grate_shader_blob *blob)
+ {
+    grate_stream_push_words(stream, ptrp, blob->commands, blob->num_commands, 0);
+ }
+@@ -839,12 +843,15 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
+    uint32_t cull_face_linker_setup;
+ 
+    emit_shader(stream, ptrp, &context->vshader->blob);
+-   if (context->premultiplied_blend) {
+-      assert(context->framebuffer.base.nr_cbufs == 1);
+-      emit_shader(stream, ptrp, &context->fshader->premultiplied_blob);
+-   } else {
+-      emit_shader(stream, ptrp, &context->fshader->blob);
++   const struct grate_shader_blob *fragment = &context->fshader->blob;
++
++   if (context->blend_key && context->framebuffer.base.nr_cbufs == 1) {
++      const struct grate_shader_blob *blended =
++         grate_fragment_blend_blob(context->fshader, context->blend_key);
++      if (blended)
++         fragment = blended;
+    }
++   emit_shader(stream, ptrp, fragment);
+ 
+    cull_face_linker_setup = TGR3D_SU_PARAM_SUBPIX_XOFF(0x38) |
+                             TGR3D_SU_PARAM_SUBPIX_YOFF(0x38) |
+diff --git a/src/gallium/drivers/grate/meson.build b/src/gallium/drivers/grate/meson.build
+index 9f3c5370578..680ccdd069e 100644
+--- a/src/gallium/drivers/grate/meson.build
++++ b/src/gallium/drivers/grate/meson.build
+@@ -25,6 +25,8 @@ files_libgrate = files(
+   'drm/pushbuf.c',
+   'drm/syncpt.c',
+   'drm/tegra.h',
++  'fp/blend.c',
++  'fp/blend.h',
+   'fp/fpir.h',
+   'fp/pack.c',
+   'fp/tgsi.c',
+-- 
+2.56.0
+
