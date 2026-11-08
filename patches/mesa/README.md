@@ -228,3 +228,23 @@ median improves from 326 to 150 ms per 1,000 draws. These patches are active
 through a per-user Phosh override; the image archive remains at 0016. General
 multi-input temporary allocation is still incomplete.
 Results, rollback and failed experiment.
+
+Patch [0034-grate-use-the-register-rows-like-NVIDIA-s-compiler-n.patch](0034-grate-use-the-register-rows-like-NVIDIA-s-compiler-n.patch)
+(2026-11-07, on top of 0033) replaces the guessed handling of registers R4 and up and the globals 16-23, which had turned into a `MAX_OUT 4` rule
+(about six times slower for every program that touched them). The hardware keeps those registers per pixel when the program declares how many
+register rows it uses (`GLOBAL_PIX_ATTR.NUM_ROWS`, `MAX_QID` from the row count), which NVIDIA's driver does and ours did not. The patch follows what
+NVIDIA's compiler produces for the same GLSL (compiled on the tablet with the Android userland and replayed on this driver): R4-R11 for overflow
+temporaries, the step layout of a multi-row program (whole rounds, unit steps on multiples of the row count, output write on the first step of the last
+round, a bubble packet between dependent steps), no scratch registers in the output stage, the SFU in place on R0-R3 (one op per step) and a blend stage
+that fits the layout. Shaders the compiler used to refuse now compile.
+
+Checked against a CPU model of eight test shaders (worst error 1/255 also at 1024×768), against NVIDIA's compiled programs (30000 of 30000 pixels identical)
+and by running 21 self-checking tests with the previous and the new driver (identical output). Full-screen fill at 1024×768, Mpixel/s before → after:
+texture 90 → 140, texture with a coordinate transform 71 → 97, ALU-heavy shader 3.4 → 29, dual-source text 1.7 → 15.5.
+
+Known gaps, not done yet: NVIDIA's container link record (the fragment-input lane map) is not parsed and only a single `vec2` varying was compared; a
+program that needs more registers than R4–R15 is refused (no spill buffer); NVIDIA's streams can only be replayed for programs without uniforms, so uniform
+handling is checked against the CPU model and the old driver only; ALU immediates are not used; patches 0001–0033 were written without this knowledge and
+their descriptions (0024 scratch registers, 0027 "global registers are four lanes", 0031 SFU through the multipliers) are superseded; no compositor-level run
+(Weston, Phosh, Firefox) of the new driver yet.
+
