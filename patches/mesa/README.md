@@ -303,3 +303,10 @@ preserves uploads of only referenced components, and refuses physical-bank
 exhaustion without aborting. The 32 scalar FP20 slots still share uniforms
 and immediates. Exact Qt and sparse fixtures were checked against NVIDIA's
 compiler and Tegra pixel results; the system library is unchanged.
+
+Step 5, patch [0045](0045-grate-compile-DDX-and-DDY-in-the-fragment-program.patch) (after 0044):
+`dFdx`, `dFdy` and `fwidth`. Values are exchanged inside the 2x2 pixel quad through the write port r32 and read back as
+r32/r40/r48/r56 (top left, top right, bottom left, bottom right); the derivatives are coarse, `r40 - r32` and `r48 - r32`.
+Constant slots 0, 8, 16 and 24 are left free for programs with derivatives, which also get three register rows, and the
+result scale field is packed now. Checked with a self-checking test (4 tests, worst error 1/255) and 24 other
+self-checking tests, which are unchanged.
