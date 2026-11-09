@@ -1,0 +1,118 @@
+From 3eb63bf76d553813d1b31d49cda4d42cbcd561ba Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Mon, 9 Nov 2026 21:59:55 +0100
+Subject: [PATCH] grate: raise logical fragment uniform limit with safe bank
+ exhaustion
+
+Advertise 256 logical float components while retaining the shared
+32-slot FP20 bank. The existing component map uploads only referenced
+words and immediates. Refuse physical-bank overflow and indirect uniform
+addressing without asserting or writing past the constant table.
+
+Checked against NVIDIA compilation of exact sparse and Qt fixtures,
+actual constant uploads, and an independent CPU model. Qt and sparse
+pixel checks pass within 1/255 at 200x150 and 1024x768. The regression
+suite has 27 successful tests and one expected skip; longer interleaved
+benchmarks reproduce no slowdown. ASan/UBSan allocator/upload tests pass.
+---
+ src/gallium/drivers/grate/fp/tgsi.c        | 18 ++++++++++++++++--
+ src/gallium/drivers/grate/grate_compiler.h |  6 +++++-
+ src/gallium/drivers/grate/grate_screen.c   |  7 ++++++-
+ src/gallium/drivers/grate/grate_state.c    |  3 +++
+ 4 files changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/fp/tgsi.c b/src/gallium/drivers/grate/fp/tgsi.c
+index d8c9ff9b8dd..f0dbac09c4f 100644
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -437,7 +437,14 @@ fp_constant(struct grate_fp_shader *fp, int word, float immediate)
+           (word >= 0 || fp->info.constants[i].immediate == immediate))
+          break;
+    }
+-   assert(i < 32);
++   if (i >= ARRAY_SIZE(fp->info.constants)) {
++      if (!fp->allocation_failed)
++         fprintf(stderr, "GRATE FRAG: scalar constant bank exhausted\n");
++      fp->allocation_failed = true;
++      /* Spilling temporaries cannot make more constant registers. */
++      fp->register_pressure = false;
++      return fp_alu_src_zero();
++   }
+    if (i == fp->info.num_constants) {
+       fp->info.constants[i].word = word;
+       fp->info.constants[i].immediate = immediate;
+@@ -476,7 +483,14 @@ fp_tgsi_src(struct grate_fp_shader *fp, const struct tgsi_src_register *src,
+       break;
+    }
+    case TGSI_FILE_CONSTANT:
+-      assert(!src->Indirect);
++      if (src->Indirect) {
++         if (!fp->allocation_failed)
++            fprintf(stderr,
++                    "GRATE FRAG: indirect uniform indexing unsupported\n");
++         fp->allocation_failed = true;
++         fp->register_pressure = false;
++         return fp_alu_src_zero();
++      }
+       value = fp_constant(fp, src->Index * 4 + comp, 0.0f);
+       break;
+    case TGSI_FILE_TEMPORARY:
+diff --git a/src/gallium/drivers/grate/grate_compiler.h b/src/gallium/drivers/grate/grate_compiler.h
+index 978397148de..af4510f50eb 100644
+--- a/src/gallium/drivers/grate/grate_compiler.h
++++ b/src/gallium/drivers/grate/grate_compiler.h
+@@ -23,6 +23,10 @@ struct tgsi_full_instruction;
+  */
+ #define GRATE_VP_MAX_IMMEDIATES 32
+ 
++/* Logical uniforms are compacted into the scalar FP20 constant bank. */
++#define GRATE_FP_MAX_CONSTANTS 32
++#define GRATE_FP_UNIFORM_COMPONENTS 256
++
+ struct grate_vp_shader {
+    struct list_head instructions;
+    uint16_t output_mask;
+@@ -47,7 +51,7 @@ struct grate_fp_info {
+    struct {
+       int word; /* -1 for an immediate */
+       float immediate;
+-   } constants[32];
++   } constants[GRATE_FP_MAX_CONSTANTS];
+    unsigned num_constants;
+    /* Register rows (groups of four registers R4k..R4k+3) the program needs,
+     * 1 to 4: GLOBAL_PIX_ATTR.NUM_ROWS + 1. Set by grate_tgsi_to_fp(). */
+diff --git a/src/gallium/drivers/grate/grate_screen.c b/src/gallium/drivers/grate/grate_screen.c
+index 1fadfb7d8dd..9ad1aef0f2b 100644
+--- a/src/gallium/drivers/grate/grate_screen.c
++++ b/src/gallium/drivers/grate/grate_screen.c
+@@ -342,7 +342,12 @@ grate_screen_init_shader_caps(struct grate_screen *screen)
+    caps->max_tex_indirections = 128;
+    caps->max_inputs = 16;
+    caps->max_outputs = 16;
+-   caps->max_const_buffer0_size = 32 * sizeof(float);
++   /* Uniform declarations may be much larger than the set of scalar words
++    * referenced by a program. fp_constant() compacts that set and rejects
++    * programs that cannot share the physical bank with their immediates.
++    */
++   caps->max_const_buffer0_size =
++      GRATE_FP_UNIFORM_COMPONENTS * sizeof(float);
+    caps->max_const_buffers = 1;
+    caps->max_temps = 16; // scalars
+    caps->max_texture_samplers = 16;
+diff --git a/src/gallium/drivers/grate/grate_state.c b/src/gallium/drivers/grate/grate_state.c
+index ff5063859c6..c619bd9eb3c 100644
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -881,6 +881,9 @@ emit_fs_uniforms(struct grate_context *context, uint32_t **ptrp)
+       &context->constant_buffer[MESA_SHADER_FRAGMENT];
+    if (!info->num_constants)
+       return;
++   /* The advertised uniform buffer is logical storage. Only referenced
++    * scalar words occupy the physical bank, alongside shader immediates.
++    */
+    GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(0x820, info->num_constants));
+    for (unsigned i = 0; i < info->num_constants; i++) {
+       float value = info->constants[i].immediate;
+-- 
+2.56.0
+

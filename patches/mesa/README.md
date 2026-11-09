@@ -295,3 +295,11 @@ Step 3 (2026-11-09), patches 0042–0043, applies after 0041:
 The full suite has 27 successful tests and one expected 3D texture skip;
 interleaved benchmarks show no material slowdown. These changes have not
 been installed or added to the image bundle.
+
+Step 4, patch [0044](0044-grate-raise-logical-fragment-uniform-limit-with-safe-bank-exhaustion.patch) (after 0043):
+fragment uniform compaction and logical limits.
+It raises the logical fragment uniform limit to 256 floats (64 vec4),
+preserves uploads of only referenced components, and refuses physical-bank
+exhaustion without aborting. The 32 scalar FP20 slots still share uniforms
+and immediates. Exact Qt and sparse fixtures were checked against NVIDIA's
+compiler and Tegra pixel results; the system library is unchanged.
