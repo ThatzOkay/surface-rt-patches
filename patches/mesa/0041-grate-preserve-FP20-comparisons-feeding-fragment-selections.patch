@@ -1,0 +1,103 @@
+From 09507c47132185f9ebf13da2de0a8d2c1fe16fa9 Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Mon, 9 Nov 2026 15:37:22 +0100
+Subject: [PATCH] grate: preserve FP20 comparisons feeding fragment selections
+
+NVIDIA selects directly on the sign of an FP20 difference. A boolean
+SLT result introduces a comparison rounding boundary: selecting two
+textures at tc.x > 0.5 chose the wrong arm in two columns at 1024x768.
+
+When a scalar SLT result is used only as the negated condition of CMP,
+keep a-b in an FP20 temporary and select directly on its sign. Leave
+other consumers and comparisons unchanged, and respect redefinitions.
+
+NVIDIA replay and the CPU model agree on every pixel of the texture
+selection fixture. The candidate now matches all 786432 pixels exactly;
+the previous driver mismatches 1536. Arithmetic branches and bounded
+loops also pass within 1/255 away from nearest-sampling boundaries.
+The existing GPU suite passes 24 tests with one expected 3D texture
+skip against the previous driver.
+---
+ src/gallium/drivers/grate/fp/tgsi.c | 59 +++++++++++++++++++++++++++++
+ 1 file changed, 59 insertions(+)
+
+diff --git a/src/gallium/drivers/grate/fp/tgsi.c b/src/gallium/drivers/grate/fp/tgsi.c
+index dff934a5af2..d8c9ff9b8dd 100644
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -1754,6 +1754,64 @@ scalarize_for_spilling(struct util_dynarray *instructions)
+    *instructions = out;
+ }
+ 
++/* NVIDIA selects on the sign of an FP20 difference. Avoid rounding that
++ * difference through a boolean predicate when SLT only feeds selections. */
++static void
++lower_select_comparisons(struct util_dynarray *instructions)
++{
++   struct tgsi_full_instruction *code = instructions->data;
++   unsigned count =
++      util_dynarray_num_elements(instructions, struct tgsi_full_instruction);
++
++   for (unsigned n = 0; n < count; n++) {
++      struct tgsi_full_instruction *cmp = &code[n];
++      struct tgsi_dst_register *dst = &cmp->Dst[0].Register;
++      if (cmp->Instruction.Opcode != TGSI_OPCODE_SLT ||
++          cmp->Instruction.Saturate || dst->File != TGSI_FILE_TEMPORARY ||
++          !util_is_power_of_two_nonzero(dst->WriteMask))
++         continue;
++      unsigned component = util_logbase2(dst->WriteMask);
++      bool valid = true, used = false;
++      unsigned end = count;
++      for (unsigned m = n + 1; m < count && valid; m++) {
++         struct tgsi_full_instruction *inst = &code[m];
++         for (unsigned i = 0; i < inst->Instruction.NumSrcRegs; i++) {
++            const struct tgsi_src_register *src = &inst->Src[i].Register;
++            if (src->File != TGSI_FILE_TEMPORARY || src->Index != dst->Index)
++               continue;
++            used = true;
++            valid &= inst->Instruction.Opcode == TGSI_OPCODE_CMP && i == 0 &&
++                     src->Negate && !src->Indirect && !src->Dimension &&
++                     src->SwizzleX == component &&
++                     src->SwizzleY == component &&
++                     src->SwizzleZ == component && src->SwizzleW == component;
++         }
++         for (unsigned i = 0; i < inst->Instruction.NumDstRegs; i++) {
++            const struct tgsi_dst_register *write = &inst->Dst[i].Register;
++            if (write->File == dst->File && write->Index == dst->Index &&
++                (write->WriteMask & dst->WriteMask)) {
++               end = m + 1;
++               m = count;
++               break;
++            }
++         }
++      }
++      if (!valid || !used)
++         continue;
++      /* SLT(a,b) is true exactly when a-b is negative. */
++      cmp->Instruction.Opcode = TGSI_OPCODE_ADD;
++      cmp->Src[1].Register.Negate = !cmp->Src[1].Register.Negate;
++      for (unsigned m = n + 1; m < end; m++) {
++         struct tgsi_src_register *src = &code[m].Src[0].Register;
++         if (code[m].Instruction.Opcode == TGSI_OPCODE_CMP &&
++             src->File == dst->File && src->Index == dst->Index) {
++            src->Negate = false;
++            src->Absolute = false;
++         }
++      }
++   }
++}
++
+ void
+ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+                  const struct grate_fp_output *output, bool spilling)
+@@ -1824,6 +1882,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+    }
+ 
+    lower_sne(fp, &instructions);
++   lower_select_comparisons(&instructions);
+ 
+    /* Fragment output values stay virtual until all shader operations have
+     * consumed the sampled pixel. Early masked DW stores alias R2/R3 and
+-- 
+2.56.0
+
