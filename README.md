@@ -23,7 +23,7 @@ Measured on one device, 2026-10-29 to 2026-11-05.
 | 3D (Grate Mesa, GLES 2.0) | works: Weston, Phosh and the Catacomb panel (Epitaph) run accelerated (Mesa patches 0001–0037). Blending covers any source/destination factor pair of ZERO, ONE and the (inverse) source/destination colour and alpha, the equations ADD, SUBTRACT and REVERSE_SUBTRACT, separate RGB and alpha state and the colour mask; `GL_EXT_blend_func_extended` (dual-source) is drawn in two passes, which is what makes Epitaph's text and icons render. Limits: GLES 2.0 only (GTK4 and Firefox's WebRender need ES 3.0, so Firefox composites in software; WebGL 1 uses the GPU); maximum texture size 2048 (Epitaph's 4096 glyph atlas needs a one-line patch, not in this repo); register rows are declared like NVIDIA's compiler does (patch 0034): programs with many live values run at full speed (an ALU-heavy shader 3.4 → 29 Mpixel/s, a plain texture draw 90 → 140); constant-colour blend factors, SRC_ALPHA_SATURATE, MIN/MAX and logic ops are not supported; Phosh is still somewhat slow |
 | Front camera | raw Bayer capture works (patches 0003–0022); the rear camera has never answered |
 | H.264 decode, 2D engine | work for a subset, from userspace |
-| Microphone (on-board digital) | not working; patches 0023 and 0024 are written, the mic does not appear in Phosh settings |
+| Microphone (on-board digital) | works with `arecord` (patches 0023, 0024 and 0030); no input device in GNOME/PipeWire yet (needs a UCM2 profile). The clock is on the codec's GPIO2 and Tegra GPIO S3 powers the microphones |
 | HDMI output | works at 1920x1080@60 once GPIO PDD4 is driven high (confirmed at runtime with a userspace register write, with hotplug); patch 0029 does this from the devicetree and has not been booted yet |
 | Light, motion and temperature sensors | enumerate over I2C/IIO; cover response untested |
 
@@ -36,7 +36,7 @@ Apply in numeric order with `patch -p1` to the kernel tree above.
 | `0001-ASoC-wm8962-restore-SYSCLK_ENA-after-bclk-setup.patch` | Silent audio: a cold stream start clears the codec's `SYSCLK_ENA` bit and nothing set it again. |
 | `0002-ARM-dts-tegra30-surface-rt-keep-vdd_cover-always-on.patch` | Cover keyboard: its supply rail was switched off before the cover could be detected. |
 | `0023-ASoC-tegra_wm8962-do-not-dereference-a-missing-runtime-.patch` | Oops when unbinding the codec: the card's remove hook dereferenced a PCM runtime that is already gone. |
-| `0024-ARM-dts-tegra30-surface-rt-configure-the-WM8962-GPIOs-.patch` | Digital microphone: codec GPIO configuration and the `Digital Mic` route. Not validated. |
+| `0024-ARM-dts-tegra30-surface-rt-configure-the-WM8962-GPIOs-.patch` | Digital microphone: codec GPIO configuration and the `Digital Mic` route. Its GPIO guess was wrong; 0030 corrects it. |
 | `0025-ARM-dts-tegra30-surface-rt-enable-WiFi-via-GPIO-D4.patch` | Wi-Fi power: PD4 as an output without tristate plus a fixed regulator as SDMMC3's `vmmc-supply`. |
 | `0026-ARM-dts-tegra30-surface-rt-configure-Bluetooth-UARTC-pins.patch` | Bluetooth: UARTC TX/RX/RTS/CTS pinmux. |
 | `0027-wifi-mwifiex-sdio-add-opt-in-legacy-scan.patch` | `mwifiex_sdio.force_legacy_scan=1`: needed for scanning with the combo firmware below. |
