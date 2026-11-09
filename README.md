@@ -48,7 +48,7 @@ Sub-series:
 
 - [`patches/camera/`](patches/camera/README.md): `0003`–`0022`, the OV9726 sensor driver and Tegra30 CSI/VI support ported to the grate host1x stack.
 - [`patches/upstream-csi-v7/`](patches/upstream-csi-v7/README.md): unmodified copy of the upstream series the camera patches are ported from (Svyatoslav Ryhel, v7, linux-media 2026-03-03). All credit for that work is the original author's.
-- [`patches/mesa/`](patches/mesa/README.md): `0001`–`0041` against `libre-tegra-mesa` (`0001`–`0019` were written on branch `grate-26.2.3`; `0001`–`0037` are also commits on `grate-26.2.6` of [ThatzOkay/libre-tegra-mesa](https://github.com/ThatzOkay/libre-tegra-mesa)).
+- [`patches/mesa/`](patches/mesa/README.md): `0001`–`0043` against `libre-tegra-mesa` (`0001`–`0019` were written on branch `grate-26.2.3`; `0001`–`0037` are also commits on `grate-26.2.6` of [ThatzOkay/libre-tegra-mesa](https://github.com/ThatzOkay/libre-tegra-mesa)).
 - [`patches/gnome-session/`](patches/gnome-session/): two patches for the Phosh session (select GLES before the GTK probe; guard the X11 helper and empty EGL config results).
 
 ## Bluetooth/Wi-Fi combo firmware (not included)

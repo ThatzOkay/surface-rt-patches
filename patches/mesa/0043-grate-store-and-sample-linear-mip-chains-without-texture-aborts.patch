@@ -1,0 +1,566 @@
+From 03c9b2cacd41f9bd1e5f30423b40ca2a21bb45ac Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Mon, 9 Nov 2026 21:08:58 +0100
+Subject: [PATCH 43/43] grate: store and sample linear mip chains without
+ texture aborts
+
+Allocate real mip levels and use their pitches and offsets for maps,
+copies, clears, render targets and blits. Program mip filtering and LOD
+bounds using NVIDIA's T30 layout and sampler encoding. Handle mirrored
+repeat, repack non-native imported strides, and reject unsupported views
+without aborting.
+
+Checked against original NVIDIA ARM replay: 63 resource cases and 328
+exact descriptor matches. Tegra passes 219 mipmap cases and all nine
+wrap combinations. The full suite has 27 successful tests and one
+expected skip; interleaved benchmarks show no material slowdown.
+---
+ src/gallium/drivers/grate/grate_context.h  |   1 +
+ src/gallium/drivers/grate/grate_draw.c     |   3 +
+ src/gallium/drivers/grate/grate_resource.c | 128 +++++++++++------
+ src/gallium/drivers/grate/grate_resource.h |  10 +-
+ src/gallium/drivers/grate/grate_state.c    | 154 +++++++++++++++------
+ src/gallium/drivers/grate/grate_state.h    |   3 +
+ 6 files changed, 206 insertions(+), 93 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/grate_context.h b/src/gallium/drivers/grate/grate_context.h
+index 949e6e7e7f1..f006e0d4def 100644
+--- a/src/gallium/drivers/grate/grate_context.h
++++ b/src/gallium/drivers/grate/grate_context.h
+@@ -69,6 +69,7 @@ struct grate_context {
+ 
+    struct pipe_sampler_view *sampler_views[16];
+    struct pipe_sampler_state *samplers[16];
++   bool warned_sampler;
+ 
+    struct pipe_scissor_state scissor;
+    uint32_t no_scissor[3];
+diff --git a/src/gallium/drivers/grate/grate_draw.c b/src/gallium/drivers/grate/grate_draw.c
+index 2c74870f2ef..ef1b222a552 100644
+--- a/src/gallium/drivers/grate/grate_draw.c
++++ b/src/gallium/drivers/grate/grate_draw.c
+@@ -551,6 +551,9 @@ grate_draw_vbo(struct pipe_context *pcontext,
+    if (!grate_draw_pivot(pcontext, info, draws, &pivot))
+       return;
+ 
++   if (!grate_prepare_textures(context))
++      return;
++
+    err = grate_stream_begin(stream, &ptr);
+    if (err < 0) {
+       grate_loge("grate_stream_begin() failed: %d\n", err);
+diff --git a/src/gallium/drivers/grate/grate_resource.c b/src/gallium/drivers/grate/grate_resource.c
+index cfc764efe27..a875b28c0cb 100644
+--- a/src/gallium/drivers/grate/grate_resource.c
++++ b/src/gallium/drivers/grate/grate_resource.c
+@@ -71,6 +71,7 @@ grate_resource_destroy(struct pipe_screen *pscreen,
+    struct grate_resource *resource = grate_resource(presource);
+ 
+    grate_bo_unref(resource->bo);
++   grate_bo_unref(resource->sampler_bo);
+    FREE(resource);
+ }
+ 
+@@ -88,40 +89,28 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
+ 
+    if (usage & PIPE_MAP_DIRECTLY)
+       return NULL;
++   if (level > presource->last_level)
++      return NULL;
+ 
+    struct grate_transfer *gtrans = slab_zalloc(&context->transfer_pool);
+    if (!gtrans)
+       return NULL;
+    ptrans = &gtrans->b;
+ 
+-   if (level > 0) {
+-      /* Only level 0 has memory (the sampler is programmed for the base
+-       * level only). Give writes to the other levels, such as the ones of
+-       * glGenerateMipmap(), scratch memory: they would land on level 0. */
+-      unsigned stride =
+-         align(box->width * util_format_get_blocksize(presource->format), 4);
+-      gtrans->scratch = CALLOC(1, (size_t)stride * box->height * box->depth);
+-      if (!gtrans->scratch) {
+-         slab_free(&context->transfer_pool, gtrans);
+-         return NULL;
+-      }
+-      ptrans->stride = stride;
+-      ret = gtrans->scratch;
+-   } else {
+-      if (grate_bo_map(resource->bo, &ret)) {
+-         slab_free(&context->transfer_pool, gtrans);
+-         return NULL;
+-      }
+-      ptrans->stride = resource->pitch;
+-      ret = (uint8_t *)ret + box->y * resource->pitch +
+-            box->x * util_format_get_blocksize(presource->format);
++   if (grate_bo_map(resource->bo, &ret)) {
++      slab_free(&context->transfer_pool, gtrans);
++      return NULL;
+    }
++   ptrans->stride = resource->level_pitch[level];
++   ptrans->layer_stride = ptrans->stride * resource->level_height[level];
++   ret = (uint8_t *)ret + resource->level_offset[level] +
++         box->z * ptrans->layer_stride + box->y * ptrans->stride +
++         box->x * util_format_get_blocksize(presource->format);
+ 
+    pipe_resource_reference(&ptrans->resource, presource);
+    ptrans->level = level;
+    ptrans->usage = usage;
+    ptrans->box = *box;
+-   ptrans->layer_stride = ptrans->stride;
+    *transfer = ptrans;
+ 
+    return ret;
+@@ -140,12 +129,7 @@ grate_resource_transfer_unmap(struct pipe_context *pcontext,
+                               struct pipe_transfer *transfer)
+ {
+    struct grate_context *context = grate_context(pcontext);
+-   struct grate_transfer *gtrans = (struct grate_transfer *)transfer;
+-
+-   if (gtrans->scratch)
+-      FREE(gtrans->scratch);
+-   else
+-      grate_bo_unmap(grate_resource(transfer->resource)->bo);
++   grate_bo_unmap(grate_resource(transfer->resource)->bo);
+ 
+    pipe_resource_reference(&transfer->resource, NULL);
+    slab_free(&context->transfer_pool, transfer);
+@@ -240,6 +224,14 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
+    if (!resource)
+       return NULL;
+ 
++   if (template->last_level >= PIPE_MAX_TEXTURE_LEVELS ||
++       (template->last_level &&
++        (template->target != PIPE_TEXTURE_2D || template->array_size > 1 ||
++         util_format_is_depth_or_stencil(template->format)))) {
++      FREE(resource);
++      return NULL;
++   }
++
+    resource->b = *template;
+ 
+    pipe_reference_init(&resource->b.reference, 1);
+@@ -280,7 +272,7 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
+       resource->format = format;
+    }
+ 
+-   /* Textures use either tight POT rows or 64-byte NPOT rows. Renderable
++   /* Textures use either 16-byte POT rows or 64-byte NPOT rows. Renderable
+     * textures can be sampled later, so allocate a native NPOT-compatible
+     * stride rather than the framebuffer-only 32-byte alignment.
+     */
+@@ -288,7 +280,45 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
+        (template->bind & PIPE_BIND_SAMPLER_VIEW))
+       resource->pitch = align(resource->pitch, 64);
+ 
++   if (template->target == PIPE_TEXTURE_2D &&
++       (template->bind & PIPE_BIND_SAMPLER_VIEW) &&
++       !(template->bind & PIPE_BIND_DEPTH_STENCIL) &&
++       util_is_power_of_two_or_zero(template->width0) &&
++       util_is_power_of_two_or_zero(template->height0))
++      resource->pitch = align(template->width0 *
++                                 util_format_get_blocksize(template->format),
++                              16);
++
+    size = resource->pitch * height;
++   resource->level_pitch[0] = resource->pitch;
++   resource->level_height[0] = height;
++
++   if (template->last_level) {
++      unsigned cpp = util_format_get_blocksize(template->format);
++      bool pot = util_is_power_of_two_or_zero(template->width0) &&
++                 util_is_power_of_two_or_zero(template->height0);
++      unsigned alloc_width = util_next_power_of_two(template->width0);
++      unsigned alloc_height = util_next_power_of_two(template->height0);
++
++      /* NVIDIA's linear mip chains have 16-byte rows and level extents.
++       * NPOT level zero instead uses 64-byte rows, and later levels reserve
++       * power-of-two extents. T30 does not align the base extent to 1K.
++       */
++      resource->pitch = align(template->width0 * cpp, pot ? 16 : 64);
++      resource->level_pitch[0] = resource->pitch;
++      size = align(resource->pitch * height, 16);
++      for (unsigned level = 1; level <= template->last_level; level++) {
++         unsigned width = u_minify(template->width0, level);
++         unsigned h = u_minify(height, level);
++         resource->level_offset[level] = size;
++         resource->level_pitch[level] = align(width * cpp, 16);
++         resource->level_height[level] = h;
++         size += align(align(u_minify(alloc_width, level) * cpp, 16) *
++                          u_minify(alloc_height, level),
++                       16);
++      }
++      size = align(size, 1024);
++   }
+ 
+    if (util_format_has_stencil(util_format_description(template->format)) &&
+        grate_format_is_emulated_z24(template->format)) {
+@@ -317,6 +347,10 @@ grate_screen_resource_from_handle(struct pipe_screen *pscreen,
+    struct grate_resource *resource;
+    int format;
+ 
++   /* A dma-buf handle describes one image and supplies no mip offsets. */
++   if (template->last_level)
++      return NULL;
++
+    resource = CALLOC_STRUCT(grate_resource);
+    if (!resource)
+       return NULL;
+@@ -341,6 +375,8 @@ grate_screen_resource_from_handle(struct pipe_screen *pscreen,
+       goto fail;
+ 
+    resource->pitch = handle->stride;
++   resource->level_pitch[0] = resource->pitch;
++   resource->level_height[0] = template->height0;
+ 
+    format = grate_pixel_format(template->format);
+    if (format < 0) {
+@@ -379,10 +415,7 @@ grate_resource_copy_region(struct pipe_context *pcontext,
+    struct grate_resource *src = grate_resource(psrc);
+    void *dst_map, *src_map;
+ 
+-   /* Only level 0 has memory, and the copy is done by the CPU on linear
+-    * resources: this is what Mesa uses to carry the image over when it
+-    * reallocates a texture to give it mipmap levels. */
+-   if (dst_level > 0 || src_level > 0)
++   if (dst_level > pdst->last_level || src_level > psrc->last_level)
+       return;
+    if (dst->tiled || src->tiled ||
+        util_format_get_blocksize(pdst->format) !=
+@@ -395,8 +428,13 @@ grate_resource_copy_region(struct pipe_context *pcontext,
+    if (grate_bo_map(src->bo, &src_map) || grate_bo_map(dst->bo, &dst_map))
+       return;
+ 
+-   util_copy_box(dst_map, pdst->format, dst->pitch, 0, dstx, dsty, dstz,
+-                 box->width, box->height, box->depth, src_map, src->pitch, 0,
++   util_copy_box((uint8_t *)dst_map + dst->level_offset[dst_level],
++                 pdst->format, dst->level_pitch[dst_level],
++                 dst->level_pitch[dst_level] * dst->level_height[dst_level],
++                 dstx, dsty, dstz, box->width, box->height, box->depth,
++                 (uint8_t *)src_map + src->level_offset[src_level],
++                 src->level_pitch[src_level],
++                 src->level_pitch[src_level] * src->level_height[src_level],
+                  box->x, box->y, box->z);
+ 
+    grate_bo_unmap(src->bo);
+@@ -462,13 +500,15 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
+    GRATE_PUSHBUF_WORD(ptr, value);                 /* 0x046 - tilemode */
+ 
+    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_mask(0x02b, 0xe149));
+-   grate_stream_push_reloc(&gr2d->stream, &ptr, dst->bo, 0);      /* 0x02b - dstba */
++   grate_stream_push_reloc(&gr2d->stream, &ptr, dst->bo,
++                           dst->level_offset[info->dst.level]);
+ 
+-   GRATE_PUSHBUF_WORD(ptr, dst->pitch);            /* 0x02e - dstst */
++   GRATE_PUSHBUF_WORD(ptr, dst->level_pitch[info->dst.level]);
+ 
+-   grate_stream_push_reloc(&gr2d->stream, &ptr, src->bo, 0);      /* 0x031 - srcba */
++   grate_stream_push_reloc(&gr2d->stream, &ptr, src->bo,
++                           src->level_offset[info->src.level]);
+ 
+-   GRATE_PUSHBUF_WORD(ptr, src->pitch);            /* 0x033 - srcst */
++   GRATE_PUSHBUF_WORD(ptr, src->level_pitch[info->src.level]);
+ 
+    value = info->dst.box.height << 16 | info->dst.box.width;
+    GRATE_PUSHBUF_WORD(ptr, value);                 /* 0x038 - dstsize */
+@@ -599,8 +639,9 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
+       int i;
+       for (i = 0; i < fb->nr_cbufs; ++i) {
+          struct pipe_surface *dst = &fb->cbufs[i];
+-         fill(stream, &ptr, grate_resource(dst->texture), 0,
+-              grate_resource(dst->texture)->pitch,
++         fill(stream, &ptr, grate_resource(dst->texture),
++              grate_resource(dst->texture)->level_offset[dst->level],
++              grate_resource(dst->texture)->level_pitch[dst->level],
+               pack_color(dst->format, color->f),
+               util_format_get_blocksize(dst->format), 0, 0, fb->width,
+               fb->height);
+@@ -641,8 +682,9 @@ grate_clear_render_target(struct pipe_context *pipe,
+       return;
+    }
+ 
+-   fill(&context->gr2d->stream, &ptr, grate_resource(dst->texture), 0,
+-        grate_resource(dst->texture)->pitch,
++   fill(&context->gr2d->stream, &ptr, grate_resource(dst->texture),
++        grate_resource(dst->texture)->level_offset[dst->level],
++        grate_resource(dst->texture)->level_pitch[dst->level],
+         pack_color(dst->format, color->f),
+         util_format_get_blocksize(dst->format), dstx, dsty, width, height);
+ 
+diff --git a/src/gallium/drivers/grate/grate_resource.h b/src/gallium/drivers/grate/grate_resource.h
+index efac0438c25..921529c71cf 100644
+--- a/src/gallium/drivers/grate/grate_resource.h
++++ b/src/gallium/drivers/grate/grate_resource.h
+@@ -2,12 +2,18 @@
+ #define GRATE_RESOURCE_H
+ 
+ #include "pipe/p_screen.h"
++#include "pipe/p_state.h"
+ #include "util/u_transfer.h"
+ 
+ struct grate_resource {
+    struct pipe_resource b;
+    struct grate_bo *bo;
++   /* Linear sampler copy for imported buffers with a non-native stride. */
++   struct grate_bo *sampler_bo;
+    unsigned int pitch;
++   unsigned int level_pitch[PIPE_MAX_TEXTURE_LEVELS];
++   unsigned int level_offset[PIPE_MAX_TEXTURE_LEVELS];
++   unsigned int level_height[PIPE_MAX_TEXTURE_LEVELS];
+    unsigned int tiled : 1;
+    unsigned int format : 5;
+    /* Z24 depth/stencil formats: the GPU has no 24-bit depth. The depth plane
+@@ -20,12 +26,8 @@ struct grate_resource {
+    unsigned int stencil_pitch;
+ };
+ 
+-/* A resource holds the memory of one level only. A transfer of a higher
+- * level gets scratch memory instead, so that it cannot overwrite level 0.
+- */
+ struct grate_transfer {
+    struct pipe_transfer b;
+-   void *scratch;
+ };
+ 
+ static inline struct grate_resource *
+diff --git a/src/gallium/drivers/grate/grate_state.c b/src/gallium/drivers/grate/grate_state.c
+index 38f8b5214bd..ff5063859c6 100644
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -12,6 +12,7 @@
+ #include "util/u_framebuffer.h"
+ 
+ #include "grate_compiler.h"
++#include "grate_bo.h"
+ #include "grate_common.h"
+ #include "grate_context.h"
+ #include "grate_program.h"
+@@ -64,14 +65,15 @@ grate_add_render_target(struct grate_context *context,
+       rt_params |= TGR3D_GLOBAL_SURFDESC_ARRAY_STRIDE(res->stencil_pitch);
+    } else {
+       rt_params = TGR3D_GLOBAL_SURFDESC_SURF_FORMAT(res->format);
+-      rt_params |= TGR3D_GLOBAL_SURFDESC_ARRAY_STRIDE(res->pitch);
++      rt_params |=
++         TGR3D_GLOBAL_SURFDESC_ARRAY_STRIDE(res->level_pitch[ref->level]);
+    }
+    rt_params |= TGR3D_GLOBAL_SURFDESC_STRUCTURE(res->tiled);
+ 
+    context->framebuffer.rt_params[slot] = rt_params;
+    context->framebuffer.rt_bos[slot] = res->bo;
+    context->framebuffer.rt_offsets[slot] =
+-      stencil_plane ? res->stencil_offset : 0;
++      stencil_plane ? res->stencil_offset : res->level_offset[ref->level];
+    context->framebuffer.rt_mask |= 1u << slot;
+    context->framebuffer.num_rts =
+       MAX2(context->framebuffer.num_rts, slot + 1);
+@@ -947,9 +949,63 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
+    grate_stream_push_words(stream, ptrp, linker_insts, ARRAY_SIZE(linker_insts), 0);
+ }
+ 
+-/* Base-level linear 2D textures. The texture engine derives row stride from
+- * width; sampler-only resources therefore have tightly packed rows.
++/* Complete CPU copies before beginning a command stream: mapping waits for
++ * earlier GPU users, including users of the previous sampler copy.
+  */
++bool
++grate_prepare_textures(struct grate_context *ctx)
++{
++   for (unsigned i = 0; i < ARRAY_SIZE(ctx->sampler_views); i++) {
++      struct pipe_sampler_view *view = ctx->sampler_views[i];
++      if (!view || !ctx->samplers[i])
++         continue;
++      if (view->target != PIPE_TEXTURE_2D || view->u.tex.first_level ||
++          grate_pixel_format(view->format) < 0) {
++         if (!ctx->warned_sampler) {
++            grate_loge("unsupported sampler view; skipping draw\n");
++            ctx->warned_sampler = true;
++         }
++         return false;
++      }
++
++      struct grate_resource *res = grate_resource(view->texture);
++      if (res->tiled)
++         return false;
++      if (res->b.last_level)
++         continue;
++      unsigned row_bytes =
++         res->b.width0 * util_format_get_blocksize(res->b.format);
++      bool pot = util_is_power_of_two_or_zero(res->b.width0) &&
++                 util_is_power_of_two_or_zero(res->b.height0);
++      unsigned pitch = align(row_bytes, pot ? 16 : 64);
++      if (res->pitch == pitch ||
++          (res->b.height0 == 1 && res->pitch >= row_bytes))
++         continue;
++      if (res->pitch < row_bytes)
++         return false;
++      if (!res->sampler_bo)
++         res->sampler_bo =
++            grate_bo_alloc(ctx->drm, pitch * res->b.height0, 0);
++      if (!res->sampler_bo)
++         return false;
++
++      void *src, *dst;
++      if (grate_bo_map(res->bo, &src))
++         return false;
++      if (grate_bo_map(res->sampler_bo, &dst)) {
++         grate_bo_unmap(res->bo);
++         return false;
++      }
++      for (unsigned y = 0; y < res->b.height0; y++)
++         memcpy((uint8_t *)dst + y * pitch,
++                (uint8_t *)src + y * res->pitch, row_bytes);
++      grate_bo_unmap(res->bo);
++      grate_bo_unmap(res->sampler_bo);
++   }
++   return true;
++}
++
++/* Linear 2D textures, using NVIDIA's level layout and 4-bit fractional LOD. */
+ static void
+ emit_textures(struct grate_context *ctx, uint32_t **ptrp)
+ {
+@@ -961,29 +1017,8 @@ emit_textures(struct grate_context *ctx, uint32_t **ptrp)
+       if (!view || !sampler)
+          continue;
+       struct grate_resource *res = grate_resource(view->texture);
+-      assert(view->target == PIPE_TEXTURE_2D && view->u.tex.first_level == 0);
+-      /* Only the base level is programmed (BASE_LEVEL_ONLY below), so a
+-       * mipmapped texture, or a mipmap filter, samples level 0. This is
+-       * what the descriptor does anyway; it only gives up the smoothing
+-       * of minified textures, instead of aborting the application. */
+-      unsigned row_bytes =
+-         res->b.width0 * util_format_get_blocksize(res->b.format);
+-      /* POT layout is tightly packed. NPOT layout rounds rows to 64 bytes,
+-       * even when the logical dimensions themselves are powers of two.
+-       */
+       bool pot_layout = util_is_power_of_two_or_zero(res->b.width0) &&
+-                        util_is_power_of_two_or_zero(res->b.height0) &&
+-                        (res->pitch == row_bytes || res->b.height0 == 1);
+-      unsigned native_pitch = pot_layout ? row_bytes : align(row_bytes, 64);
+-      bool native_layout = res->pitch == native_pitch ||
+-                           (res->b.height0 == 1 && res->pitch >= row_bytes);
+-      if (!native_layout)
+-         fprintf(
+-            stderr,
+-            "GRATE unsupported sampler layout: %s %ux%u pitch=%u native=%u\n",
+-            util_format_name(res->b.format), res->b.width0, res->b.height0,
+-            res->pitch, native_pitch);
+-      assert(native_layout);
++                        util_is_power_of_two_or_zero(res->b.height0);
+       if (grate_debug & GRATE_DEBUG_TRACE)
+          fprintf(stderr,
+                  "GRATE sampler: %s view %s swizzle=%u,%u,%u,%u size=%ux%u "
+@@ -1012,48 +1047,75 @@ emit_textures(struct grate_context *ctx, uint32_t **ptrp)
+          break;
+       }
+       uint32_t lo = TGR3D_TEX_TEXDESC_LO_SURF_FORMAT(texture_format);
+-      if (sampler->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE)
++      /* Border and mirror-clamp modes degrade to clamp-to-edge. */
++      if (sampler->wrap_s != PIPE_TEX_WRAP_REPEAT &&
++          sampler->wrap_s != PIPE_TEX_WRAP_MIRROR_REPEAT)
+          lo |= 2;
+-      else
+-         assert(sampler->wrap_s == PIPE_TEX_WRAP_REPEAT);
+-      if (sampler->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE)
++      if (sampler->wrap_s == PIPE_TEX_WRAP_MIRROR_REPEAT)
++         lo |= TGR3D_TEX_TEXDESC_LO_MIRROR_S(TGR3D_STATE_ENABLED);
++      if (sampler->wrap_t != PIPE_TEX_WRAP_REPEAT &&
++          sampler->wrap_t != PIPE_TEX_WRAP_MIRROR_REPEAT)
+          lo |= 1;
+-      else
+-         assert(sampler->wrap_t == PIPE_TEX_WRAP_REPEAT);
++      if (sampler->wrap_t == PIPE_TEX_WRAP_MIRROR_REPEAT)
++         lo |= TGR3D_TEX_TEXDESC_LO_MIRROR_T(TGR3D_STATE_ENABLED);
+       if (sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR)
+          lo |= TGR3D_TEX_TEXDESC_LO_LERP_MIN;
+       if (sampler->mag_img_filter == PIPE_TEX_FILTER_LINEAR)
+          lo |= TGR3D_TEX_TEXDESC_LO_LERP_MAG;
+-      uint32_t hi = 0x80; /* base level only */
++      bool mipmaps = sampler->min_mip_filter != PIPE_TEX_MIPFILTER_NONE;
++      if (mipmaps && sampler->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR)
++         lo |= TGR3D_TEX_TEXDESC_LO_LERP_MIP |
++               TGR3D_TEX_TEXDESC_LO_TRILINEAR_OPT(TGR3D_STATE_ENABLED);
++      unsigned last = MIN2(view->u.tex.last_level, res->b.last_level);
++      float min_lod = CLAMP(sampler->min_lod, 0.0f, 255.0f / 16);
++      float max_lod = CLAMP(MIN2(sampler->max_lod, (float)last),
++                            0.0f, 255.0f / 16);
++      unsigned lod_min = mipmaps ? (unsigned)(min_lod * 16) : 0;
++      unsigned lod_max = mipmaps ? (unsigned)(max_lod * 16) : 0;
++      uint32_t hi = 0;
+       if (pot_layout) {
+          hi |= TGR3D_TEX_TEXDESC_HI_LOG2_WIDTH(util_logbase2(res->b.width0));
+          hi |=
+             TGR3D_TEX_TEXDESC_HI_LOG2_HEIGHT(util_logbase2(res->b.height0));
++         hi |= TGR3D_TEX_TEXDESC_HI_LOD_MIN(lod_min) |
++               TGR3D_TEX_TEXDESC_HI_LOD_MAX(lod_max);
++         if (!mipmaps) {
++            hi |= TGR3D_TEX_TEXDESC_HI_LOD_MAX(1);
++            if (!res->b.last_level)
++               hi |= TGR3D_TEX_TEXDESC_HI_BASE_LEVEL_ONLY(
++                  TGR3D_STATE_ENABLED);
++         }
+       } else {
+-         hi |= 0x40 | TGR3D_TEX_TEXDESC_HI_WIDTH(res->b.width0) |
++         /* NVIDIA's normal NPOT path clamps outside [0,1], even for a
++          * repeat sampler. Keep its limitation rather than wrap at the
++          * wrong power-of-two boundary.
++          */
++         lo |= 3;
++         hi |= 0xc0 | TGR3D_TEX_TEXDESC_HI_WIDTH(res->b.width0) |
+                TGR3D_TEX_TEXDESC_HI_HEIGHT(res->b.height0);
+       }
+       GRATE_PUSHBUF_WORD(ptr,
+                          host1x_opcode_incr(REG_TGR3D_TEX_TEXADDR(i), 1));
+-      grate_stream_push_reloc(stream, &ptr, res->bo, 0);
++      grate_stream_push_reloc(stream, &ptr,
++                              res->sampler_bo ? res->sampler_bo : res->bo, 0);
+       GRATE_PUSHBUF_WORD(ptr,
+                          host1x_opcode_incr(REG_TGR3D_TEX_TEXDESC_LO(i), 2));
+       GRATE_PUSHBUF_WORD(ptr, lo);
+       GRATE_PUSHBUF_WORD(ptr, hi);
+       if (!pot_layout) {
+-         /* A non-power-of-two descriptor keeps its level range in NPOT_AUX.
+-          * Left zero (as grate_init_state() clears it), the sampler wraps
+-          * coordinates at the next lower power of two even inside [0,1]: a
+-          * 1366x753 texture sampled with REPEAT, which is what Catacomb
+-          * composites its client buffers with, showed the left 1024 columns
+-          * and top 512 rows again beyond x=1024 and y=512. With
+-          * BASE_LEVEL_ONLY set the texture is addressed correctly across
+-          * [0,1]; beyond 1.0 REPEAT then clamps to the edge, so REPEAT is
+-          * exact only for coordinates in [0,1] on such textures. */
++         uint32_t aux = TGR3D_TEX_TEXDESC_NPOT_AUX_LOD_MIN(lod_min) |
++                        TGR3D_TEX_TEXDESC_NPOT_AUX_LOD_MAX(lod_max);
++         aux |= TGR3D_TEX_TEXDESC_NPOT_AUX_LOG2_WIDTH(
++            util_logbase2_ceil(res->b.width0));
++         aux |= TGR3D_TEX_TEXDESC_NPOT_AUX_LOG2_HEIGHT(
++            util_logbase2_ceil(res->b.height0));
++         if (!mipmaps)
++            aux |= TGR3D_TEX_TEXDESC_NPOT_AUX_BASE_LEVEL_ONLY(
++                      TGR3D_STATE_ENABLED) |
++                   TGR3D_TEX_TEXDESC_NPOT_AUX_LOD_MAX(1);
+          GRATE_PUSHBUF_WORD(
+             ptr, host1x_opcode_incr(REG_TGR3D_TEX_TEXDESC_NPOT_AUX(i), 1));
+-         GRATE_PUSHBUF_WORD(ptr, TGR3D_TEX_TEXDESC_NPOT_AUX_BASE_LEVEL_ONLY(
+-                                    TGR3D_STATE_ENABLED));
++         GRATE_PUSHBUF_WORD(ptr, aux);
+       }
+    }
+    *ptrp = ptr;
+diff --git a/src/gallium/drivers/grate/grate_state.h b/src/gallium/drivers/grate/grate_state.h
+index 49ca50aa12d..b9c0a684d2e 100644
+--- a/src/gallium/drivers/grate/grate_state.h
++++ b/src/gallium/drivers/grate/grate_state.h
+@@ -40,6 +40,9 @@ struct grate_vertex_state {
+ void
+ grate_emit_state(struct grate_context *context, uint32_t **ptrp);
+ 
++bool
++grate_prepare_textures(struct grate_context *context);
++
+ void
+ grate_context_state_init(struct pipe_context *pcontext);
+ 
+-- 
+2.56.0
+

@@ -281,3 +281,17 @@ Patches 0039-0041 (2026-11-09) follow NVIDIA's fragment compiler:
   the texture-selection fixture matches all 786432 pixels exactly.
 The existing GPU suite passes 24 tests with one expected 3D texture skip.
 These patches have not been validated in a compositor or bundled image.
+
+Step 3 (2026-11-09), patches 0042–0043, applies after 0041:
+* [0042](0042-grate-split-oversized-draws-and-use-indexed-fan-and-loop-pivots.patch):
+  split large draws while preserving topology, skip empty draws, and use
+  the first index value for indexed fan/loop pivots, following NVIDIA.
+  All 392 draw cases pass at 200x150 and 1024x768.
+* [0043](0043-grate-store-and-sample-linear-mip-chains-without-texture-aborts.patch):
+  store and sample real mip levels, handle mirrored repeat, and repack
+  non-native imported strides without aborting. NVIDIA instruction replay
+  matches 63 resource cases and 328 sampler descriptors; Tegra passes
+  219 mipmap cases and all nine wrap combinations.
+The full suite has 27 successful tests and one expected 3D texture skip;
+interleaved benchmarks show no material slowdown. These changes have not
+been installed or added to the image bundle.
