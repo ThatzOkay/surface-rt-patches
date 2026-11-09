@@ -257,3 +257,27 @@ Patches 0035-0037 (2026-11-07/08) come from running a Qt 6 / Material applicatio
 * [0037-grate-sample-the-base-level-of-mipmapped-textures.patch](0037-grate-sample-the-base-level-of-mipmapped-textures.patch): a texture with a mipmap filter aborted the
   application. The driver has memory for one level only, so it samples level 0; writes to higher levels went over level 0 and now go to scratch memory, and
   `resource_copy_region` copies level 0 (it did nothing, which emptied textures that Mesa reallocates to add mipmap levels). Real mipmap levels are not implemented.
+
+Patch [0038](0038-grate-spill-fragment-temporaries-to-surface-4.patch)
+adds scalar register spilling using NVIDIA's surface-4 ST_R20/LD_R20
+sequence and makes all four register rows available. Register exhaustion
+retries allocation with spill backing instead of refusing the shader.
+Automatic-spill tests pass at 200x150 and 1024x768 within 1/255, including
+source-over blending; 24 regression tests pass with one expected 3D-texture
+skip. Programs must still fit one 64-step epoch; predicate spilling and
+NVIDIA's vector-spill instructions remain unsupported. This patch has not
+been validated in a compositor session or installed in the system bundle.
+
+Patches 0039-0041 (2026-11-09) follow NVIDIA's fragment compiler:
+* [0039](0039-grate-implement-fragment-floor-and-fract-with-the-SFU.patch):
+  `fract` uses SFU FRC on FP20; `floor` subtracts that fraction from the
+  original. Six fixtures pass CPU checks at 200x150 and 1024x768.
+* [0040](0040-grate-unroll-bounded-shader-loops.patch): enable NIR's
+  32-iteration unroll budget; bounded loops and conditional breaks become
+  straight-line selections. Runtime-count loops remain unsupported.
+* [0041](0041-grate-preserve-FP20-comparisons-feeding-fragment-selections.patch):
+  keep scalar comparisons feeding selections in FP20, following NVIDIA's
+  difference/sign sequence. Fixes a two-column branch-threshold error;
+  the texture-selection fixture matches all 786432 pixels exactly.
+The existing GPU suite passes 24 tests with one expected 3D texture skip.
+These patches have not been validated in a compositor or bundled image.

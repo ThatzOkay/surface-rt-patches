@@ -1,0 +1,34 @@
+From 40208ee76cd3fd38b509dd1e2b1753fb1fb830bb Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Mon, 9 Nov 2026 15:34:46 +0100
+Subject: [PATCH] grate: unroll bounded shader loops
+
+Set the NIR unroll budget to 32 iterations. Grate already advertises
+zero control flow depth, so NIR flattens branches to selections after
+unrolling. Leave runtime and otherwise unbounded loops unsupported.
+
+NVIDIA's T30 compiler emits straight-line programs for the two- and
+four-iteration fixtures, including a conditional break, and rejects
+the runtime-count loop. Mesa now follows the same strategy. Both
+bounded loops pass the CPU model at 200x150 and 1024x768 within 1/255
+away from nearest-sampling boundaries; the previous driver rejects
+them. Branch comparison precision is fixed separately.
+---
+ src/gallium/drivers/grate/grate_screen.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/gallium/drivers/grate/grate_screen.c b/src/gallium/drivers/grate/grate_screen.c
+index 8db36ad91dc..1fadfb7d8dd 100644
+--- a/src/gallium/drivers/grate/grate_screen.c
++++ b/src/gallium/drivers/grate/grate_screen.c
+@@ -478,6 +478,7 @@ static const nir_shader_compiler_options grate_base_compiler_options = {
+    .force_indirect_unrolling_sampler = true,
+    .max_unroll_iterations = 32,
+     */
++   .max_unroll_iterations = 32,
+    .lower_fdiv = true,
+    .no_integers = true,
+ };
+-- 
+2.56.0
+
