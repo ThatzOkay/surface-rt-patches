@@ -74,5 +74,8 @@ cuts it out of the driver you already have:
 
 ## `tegra30-microsoft-surface-rt.dts`
 
-A reference copy of an earlier devicetree. It differs from the one in the kernel tree (its cover
-rail is already always on); kept for the camera and audio rail wiring comments.
+The full Surface RT devicetree (`arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts`) with
+the devicetree patches applied: 0002, 0024, 0025, 0026, 0028 and 0029 from this repository, plus
+the digital-microphone clock patch (GPIO2 and the S3 hog, `0030`, not published here yet). It
+compiles with `dtc` (only the usual `tegra30.dtsi` warnings). Use it to see the end result of the
+devicetree patches or as a starting point; the patches remain the way to apply the changes.
