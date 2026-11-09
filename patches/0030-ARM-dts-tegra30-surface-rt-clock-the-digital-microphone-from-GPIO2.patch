@@ -1,0 +1,83 @@
+Subject: [PATCH] ARM: dts: tegra30: surface-rt: clock the digital microphone from GPIO2 and power it
+
+The Surface RT's digital (PDM) stereo microphone still recorded exact zeros
+with patch 0024. Reading the WM8962's registers while Windows records
+(through the register reader's I2C dump) and then testing on a normally booted
+Linux showed why:
+
+1. DMICCLK is on the codec's GPIO2 pin (register 0x201), not on GPIO3 as
+   patch 0024 guessed. Windows leaves 0x201 = 0x0013 and 0x204 = 0x8014
+   (DMICDAT on GPIO5, whose bit 6 -- the live pin level -- toggles with the
+   microphone data) while recording. gpio-cfg entry 1 is register 0x201;
+   the driver's wm8962_set_gpio_mode() sets CLKOUT2_SEL for a GPIO2 entry,
+   which the datasheet requires to release the pin from its default CLKOUT2
+   (PLL2) function. With the clock on GPIO3 nothing reached the microphone.
+
+2. Tegra GPIO S3 (GPIO 147) is listed by the ACPI audio device, is driven low
+   when Windows is idle and high while it records, and the capture collapses
+   when it is low. It is the microphone's power or enable. Hold it high with
+   a gpio-hog, the same way patch 0028 holds PD1.
+
+Verified on the device by writing the equivalent register state into a codec
+that was booted normally (capture produces live samples on both channels;
+with Linux's previous state it stays exact zeros). Not yet verified with this
+devicetree built into a kernel. S3 is held high permanently; tying it to the
+capture stream would need a regulator and a consumer, which can follow.
+
+---
+--- a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
++++ b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
+@@ -78,6 +78,18 @@
+ 			output-low;
+ 			line-name = "bluetooth-pd1-active";
+ 		};
++
++		/*
++		 * GPIO S3 (Tegra GPIO 147) is the microphone's power or enable:
++		 * the ACPI audio device lists it, Windows drives it high only while
++		 * recording, and with it low the microphone data stops. Hold it high.
++		 */
++		microphone-power {
++			gpio-hog;
++			gpios = <TEGRA_GPIO(S, 3) GPIO_ACTIVE_HIGH>;
++			output-high;
++			line-name = "microphone-power";
++		};
+ 	};
+ 
+ 	pinmux@70000868 {
+@@ -375,20 +387,24 @@
+ 			SPKVDD2-supply = <&vdd_1v8_vio>;
+ 
+ 			/*
+-			 * The on-board digital microphone is wired to two of the
+-			 * codec's GPIO pins as clock and data. Which pins is not
+-			 * known (no schematic): GPIO2 as DMICCLK and GPIO4 as
+-			 * DMICDAT is the guess from the binding's example and the
+-			 * Wolfson reference design. The codec driver only enables
+-			 * its digital microphone input when it finds these two
+-			 * functions configured at probe.
++			 * The on-board digital (PDM) stereo microphone: its clock
++			 * (DMICCLK) comes from the codec's GPIO2 pin (register 0x201)
++			 * and its data (DMICDAT) goes to GPIO5 (register 0x204). This was
++			 * measured, not guessed: the Windows driver leaves GPIO2 = 0x0013
++			 * and GPIO5 = 0x8014 while recording (bit 6 of 0x204, the live pin
++			 * level, toggles with the microphone data). On Linux, writing
++			 * these registers into a normally booted codec makes the capture
++			 * produce live samples. The driver's gpio-cfg handling
++			 * (wm8962_set_gpio_mode()) also sets CLKOUT2_SEL for a GPIO2
++			 * entry, which the datasheet requires to release the pin from its
++			 * default CLKOUT2 function.
+ 			 */
+ 			gpio-cfg = <
+ 				0x0000 /* 0: not a GPIO */
+-				0x0000 /* 1: default */
+-				0x0013 /* 2: DMICCLK */
++				0x0013 /* 1: GPIO2, DMICCLK */
++				0x0000 /* 2: GPIO3, unused */
+ 				0x0000 /* 3: no register */
+-				0x8014 /* 4: DMICDAT (input) */
++				0x8014 /* 4: GPIO5, DMICDAT (input) */
+ 				0x0000 /* 5: default */
+ 			>;
+ 		};

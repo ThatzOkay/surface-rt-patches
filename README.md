@@ -42,6 +42,7 @@ Apply in numeric order with `patch -p1` to the kernel tree above.
 | `0027-wifi-mwifiex-sdio-add-opt-in-legacy-scan.patch` | `mwifiex_sdio.force_legacy_scan=1`: needed for scanning with the combo firmware below. |
 | `0028-ARM-dts-tegra30-surface-rt-hold-Bluetooth-PD1-active.patch` | Bluetooth: PD1 as a kernel-owned output-low GPIO hog. |
 | `0029-ARM-dts-tegra30-surface-rt-enable-HDMI-via-GPIO-DD4.patch` | HDMI: PDD4 as a fixed regulator, the connector's `hdmi-pwr-supply`. Windows RT holds it high; with it low HPD stays low and DDC reads return zeros. Not yet booted. |
+| `0030-ARM-dts-tegra30-surface-rt-clock-the-digital-microphone-from-GPIO2.patch` | Microphone: DMICCLK on the codec's GPIO2 and Tegra GPIO S3 held high as the microphones' power, matching the values the Windows driver leaves while recording. Verified: the microphone records live samples. |
 
 Sub-series:
 
@@ -75,7 +76,6 @@ cuts it out of the driver you already have:
 ## `tegra30-microsoft-surface-rt.dts`
 
 The full Surface RT devicetree (`arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts`) with
-the devicetree patches applied: 0002, 0024, 0025, 0026, 0028 and 0029 from this repository, plus
-the digital-microphone clock patch (GPIO2 and the S3 hog, `0030`, not published here yet). It
+the devicetree patches applied: 0002, 0024, 0025, 0026, 0028, 0029 and 0030 from this repository. It
 compiles with `dtc` (only the usual `tegra30.dtsi` warnings). Use it to see the end result of the
 devicetree patches or as a starting point; the patches remain the way to apply the changes.
