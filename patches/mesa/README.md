@@ -310,3 +310,23 @@ r32/r40/r48/r56 (top left, top right, bottom left, bottom right); the derivative
 Constant slots 0, 8, 16 and 24 are left free for programs with derivatives, which also get three register rows, and the
 result scale field is packed now. Checked with a self-checking test (4 tests, worst error 1/255) and 24 other
 self-checking tests, which are unchanged.
+
+Patch [0046](0046-grate-clear-the-PSEQ-command-slots-through-the-even-.patch) (after 0045): the per-draw clear of the sequencer command slots writes the 16 even slots with one
+single-word packet each, not 32 words over `0x520..0x53f`. Needed by kernel patch 0031: once the odd slots are address registers of the Grate command
+stream patcher, every word written to them is a relocation descriptor, and the zeros of the old clear would be patched with the address of buffer 0.
+
+Patch [0047](0047-grate-run-fragment-programs-of-more-than-one-epoch-t.patch) (after 0046): the driver half of NVIDIA's multi-epoch fragment programs. `grate_fp_info` gets an optional
+`grate_fp_epochs` (program blocks, constant packets, instruction counts); `emit_epochs()` writes three sequencer command pairs per epoch (constant DMA, program DMA,
+run), a closing pair and `PSEQ_PC`, and the pixel spill address once for every one of the two Tegra 30 pixel pipes (`GSHIM_WRITE_MASK` 1, 2, then 3), as NVIDIA's
+driver does. One address broadcast to both pipes made them overwrite each other's spilled pixels: 100 to 480 of 1024 pixels of a draw were never written and a
+second draw hung the job. Needs kernel patch 0031.
+
+Patch [0048](0048-grate-split-fragment-programs-that-read-more-than-32.patch) (after 0047): the compiler half. A program that reads more than 32 distinct constants is cut into at most five epochs at round
+borders (32 constants, 64 steps, 61 ALU and MFU instructions each), the constants of each epoch take the bank slots from 0, and the blocks are written like NVIDIA's.
+Refused with the reason in the message: derivatives, register spills, a round that does not fit, more than five epochs (about 90 scalars). Checked on the tablet with
+sums of 33, 48 and 80 uniform floats and NVIDIA's d12t shader shape (every pixel correct, three draws in a row, 32x32 and 64x64) and 21 other self-checking tests.
+Not done: blending of a split program, chaining beyond five epochs.
+
+Patch [0049](0049-grate-name-the-unimplemented-TGSI-opcode-and-texture.patch) (after 0048): the unimplemented-opcode message names the TGSI opcode (`0x0d MAX`), and a `TEX` on anything but a
+2D texture (a cube map) refuses the shader with `TEX on CUBE (only 2D)` instead of aborting the process. The next two missing features for three.js are `max()` and cube
+map sampling.

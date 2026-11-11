@@ -1,0 +1,379 @@
+From 7ff5369fbd06510a0dfde8b1dbdbb17099d103f1 Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Wed, 11 Nov 2026 00:15:36 +0100
+Subject: [PATCH 47/48] grate: run fragment programs of more than one epoch
+ through the sequencer DMA
+
+NVIDIA's driver runs a fragment program that needs more than the 32
+constant slots as several epochs: the sequencer loads the program block
+and the constant packet of each epoch by DMA, runs the epoch, and keeps
+the registers of the pixels in flight in a pixel spill buffer between
+the epochs. Add the driver half of it.
+
+grate_fp_info gets an optional struct grate_fp_epochs: per epoch the
+program block (offset and length in a program buffer), the instruction
+count and a constant packet (bank slot, and for every constant the
+uniform word or the immediate it takes). For such a program the compiled
+blob holds the common state only (rows, PSEQ_CTL with MIN_OUT 0, the
+offset resets); emit_epochs() writes the three command pairs of every
+epoch (constant DMA, program DMA, run: the odd slots of the DMAs are
+relocations, the other commands write their even slot only), the
+closing command pair, the pixel spill addresses and PSEQ_PC. The program
+buffer is written on first use and the constant buffer for every draw,
+after the wait for the draw that used it last. grate_fp_max_qid() is the
+table that program.c had inline.
+
+The Tegra 30 has two pixel pipelines that take alternate swaths of a
+draw. Each needs a pixel spill region of its own, and NVIDIA's driver
+writes GLOBAL_SPILLSURFADDR once for every pipe with GSHIM_WRITE_MASK
+selecting it (NvArdStreamBeginAndPushRelocs, multi-instance branch). One
+address broadcast to both pipes lets them overwrite each other's spilled
+pixels: whole batches of the pixels in flight were never written (a
+contiguous run of quads, 100 to 480 of 1024 pixels, as much as
+MAX_OUT / rows), and a draw that follows a finished one hung the job
+about half of the time.
+
+Nothing creates such a program yet: the compiler still refuses more than
+32 uniform scalars. Blending is not applied to a program of more than one
+epoch.
+
+Needs kernel patch 0031 (drivers/gpu/drm/grate) and Mesa 0046. Checked
+on the tablet (kernel 7.0.1-r19): NVIDIA's compiled two-epoch d12t
+program (49 uniform scalars), injected through a test hook that is not
+part of this commit, with the pixels counted that the draw never touched:
+one spill address for both pipes loses 100 to 480 of 1024 pixels at
+MAX_OUT 0x12c and 0x164 and hangs the job in 8 of 8 runs of four draws
+in a row, one spill region per pipe loses none in 10 of 10 runs at each
+capacity and in 8 of 8 runs of four draws, without a hang. A pixel spill
+address is needed (without it the data cache writes to a stale address and
+the job hangs), surface 4 is not. The 21 other self-checking tests give
+the same output as before.
+---
+ src/gallium/drivers/grate/fp/tgsi.c        |   1 +
+ src/gallium/drivers/grate/grate_compiler.h |  48 ++++++++
+ src/gallium/drivers/grate/grate_context.c  |   1 +
+ src/gallium/drivers/grate/grate_context.h  |   3 +
+ src/gallium/drivers/grate/grate_program.c  |  20 ++-
+ src/gallium/drivers/grate/grate_state.c    | 137 +++++++++++++++++++++
+ 6 files changed, 204 insertions(+), 6 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/fp/tgsi.c b/src/gallium/drivers/grate/fp/tgsi.c
+index 29c92e75d53..2dbd16f3590 100644
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -1958,6 +1958,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+    fp->info.num_spill_slots = 0;
+    fp->info.color_input = -1;
+    fp->info.max_tram_row = 1;
++   fp->info.epochs = NULL;
+    fp->num_immediates = 0;
+    fp->num_temporaries = 0;
+    fp->allocation_failed = false;
+diff --git a/src/gallium/drivers/grate/grate_compiler.h b/src/gallium/drivers/grate/grate_compiler.h
+index a48f39ee050..21a473fd1f5 100644
+--- a/src/gallium/drivers/grate/grate_compiler.h
++++ b/src/gallium/drivers/grate/grate_compiler.h
+@@ -38,6 +38,40 @@ struct grate_vp_shader {
+    bool failed; /* the program cannot be compiled: refuse the shader */
+ };
+ 
++struct grate_bo;
++
++/* A fragment program of more than one epoch, in NVIDIA's scheme: every
++ * epoch is a block of register writes (the program of up to 64 steps, the
++ * resets of the instruction offsets and the like) that the sequencer loads
++ * by DMA from a program buffer, plus a packet of fragment constants that it
++ * loads by DMA from a constant buffer, and the epochs run one after the
++ * other with their accumulators kept between them. The program buffer holds
++ * the blocks; the constant buffer is rewritten for every draw from the
++ * uniforms. */
++#define GRATE_FP_MAX_EPOCHS 5
++
++struct grate_fp_epoch {
++   unsigned prog_offset; /* byte offset of the block in the program buffer */
++   unsigned prog_words;  /* length of the block in words */
++   unsigned steps;       /* instructions of this epoch */
++   unsigned const_bank;  /* first bank slot of the constant packet */
++   unsigned num_constants;
++   struct {
++      int word; /* -1 for an immediate */
++      float immediate;
++   } constants[GRATE_FP_MAX_CONSTANTS];
++};
++
++struct grate_fp_epochs {
++   unsigned count;
++   struct grate_fp_epoch epoch[GRATE_FP_MAX_EPOCHS];
++   uint32_t *program; /* the blocks, uploaded on first use */
++   unsigned program_bytes;
++   struct grate_bo *program_bo;
++   struct grate_bo *constant_bo;
++   unsigned constant_bytes;
++};
++
+ struct grate_fp_info {
+    struct {
+       uint32_t src;
+@@ -57,8 +91,22 @@ struct grate_fp_info {
+     * 1 to 4: GLOBAL_PIX_ATTR.NUM_ROWS + 1. Set by grate_tgsi_to_fp(). */
+    unsigned num_rows;
+    unsigned num_spill_slots;
++   /* Not NULL for a program of more than one epoch, which owns it. */
++   struct grate_fp_epochs *epochs;
+ };
+ 
++/* NUM_QID - 1 of the register file for a program of 1 to 4 register rows,
++ * the numbers of NVIDIA's driver for a capacity of 0x12c. */
++static inline unsigned
++grate_fp_max_qid(unsigned rows)
++{
++   static const unsigned max_qid_for_rows[] = {0, (0x12c - 1) >> 2,
++                                               (0x12c - 1) >> 3,
++                                               (0x12c - 1) / 12,
++                                               (0x12c - 1) >> 4};
++   return max_qid_for_rows[rows];
++}
++
+ #define GRATE_FP_MAX_IMMEDIATES 32
+ #define GRATE_FP_MAX_TEMPS      64
+ #define GRATE_FP_MAX_SPILLS     256
+diff --git a/src/gallium/drivers/grate/grate_context.c b/src/gallium/drivers/grate/grate_context.c
+index 599fb814be0..ee2a5c19796 100644
+--- a/src/gallium/drivers/grate/grate_context.c
++++ b/src/gallium/drivers/grate/grate_context.c
+@@ -80,6 +80,7 @@ grate_context_destroy(struct pipe_context *pcontext)
+       pipe_sampler_view_reference(&context->sampler_views[i], NULL);
+ 
+    grate_bo_unref(context->spill_bo);
++   grate_bo_unref(context->pixel_spill_bo);
+    slab_destroy_child(&context->transfer_pool);
+ 
+    grate_channel_delete(context->gr3d);
+diff --git a/src/gallium/drivers/grate/grate_context.h b/src/gallium/drivers/grate/grate_context.h
+index f006e0d4def..bf7de8c5b20 100644
+--- a/src/gallium/drivers/grate/grate_context.h
++++ b/src/gallium/drivers/grate/grate_context.h
+@@ -41,6 +41,9 @@ struct grate_context {
+    struct grate_device *drm;
+    struct grate_bo *spill_bo;
+    unsigned spill_size;
++   /* the registers of the pixels in flight between the epochs of a
++    * fragment program, see emit_epochs() */
++   struct grate_bo *pixel_spill_bo;
+    struct grate_channel *gr2d;
+    struct grate_channel *gr3d;
+ 
+diff --git a/src/gallium/drivers/grate/grate_program.c b/src/gallium/drivers/grate/grate_program.c
+index 69bc5fa6fc9..b7a9bdcae38 100644
+--- a/src/gallium/drivers/grate/grate_program.c
++++ b/src/gallium/drivers/grate/grate_program.c
+@@ -774,16 +774,12 @@ grate_compile_fs(struct grate_context *context,
+     * (capacity - 1) >> 2, >> 3, / 12, >> 4 for 1 to 4 rows). A value in R4
+     * or above is only kept per pixel when NUM_ROWS covers it; the
+     * programs that used the globals 16-23 for it needed MAX_OUT 4. */
+-   static const unsigned max_qid_for_rows[] = {0, (0x12c - 1) >> 2,
+-                                               (0x12c - 1) >> 3,
+-                                               (0x12c - 1) / 12,
+-                                               (0x12c - 1) >> 4};
+    assert(fp.info.num_rows >= 1 && fp.info.num_rows <= 4);
+-   PUSH(TGR3D_GLOBAL_PIX_ATTR_MAX_QID(max_qid_for_rows[fp.info.num_rows]) |
++   PUSH(TGR3D_GLOBAL_PIX_ATTR_MAX_QID(grate_fp_max_qid(fp.info.num_rows)) |
+         TGR3D_GLOBAL_PIX_ATTR_NUM_ROWS(fp.info.num_rows - 1));
+    PUSH(host1x_opcode_incr(REG_TGR3D_PSEQ_CTL, 1));
+    PUSH(0x22000000 | TGR3D_PSEQ_CTL_MAX_OUT(0x12c) |
+-        TGR3D_PSEQ_CTL_MIN_OUT(has_spills ? 0 : 0xc8) |
++        TGR3D_PSEQ_CTL_MIN_OUT((has_spills || fp.info.epochs) ? 0 : 0xc8) |
+         TGR3D_PSEQ_CTL_MERGE_SPAN_STARTS | TGR3D_PSEQ_CTL_MERGE_REGISTERS |
+         TGR3D_PSEQ_CTL_REMOVE_KILLED_PIXELS |
+         (has_spills ? 0 : TGR3D_PSEQ_CTL_ALLOW_QID_COLLISIONS));
+@@ -793,6 +789,7 @@ grate_compile_fs(struct grate_context *context,
+    PUSH(host1x_opcode_imm(REG_TGR3D_AT_INST_OFFSET, 0));
+    PUSH(host1x_opcode_imm(REG_TGR3D_ALU_INST_OFFSET, 0));
+ 
++   size_t cmd_start = buf.size;
+    PUSH(host1x_opcode_incr(REG_TGR3D_PSEQ_COMMAND_EVEN(0), 1));
+    // TODO: document/convert these values
+    PUSH(0x20006000 | num_fp_instrs);
+@@ -858,6 +855,11 @@ grate_compile_fs(struct grate_context *context,
+    list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link)
+       PUSH(grate_fp_pack_dw(&instr->dw));
+ 
++   /* A program of more than one epoch is loaded by the sequencer's DMA,
++    * from the buffers of grate_fp_epochs: keep the common state only. */
++   if (fp.info.epochs)
++      buf.size = cmd_start;
++
+    uint32_t tram_setup = 0;
+    tram_setup |= TGR3D_GLOBAL_TRI_ATTR_NUM_TRIS(64 / fp.info.max_tram_row);
+    tram_setup |= TGR3D_GLOBAL_TRI_ATTR_TRI_ROWS(fp.info.max_tram_row);
+@@ -962,6 +964,12 @@ grate_delete_fs_state(struct pipe_context *pcontext, void *so)
+    struct grate_fragment_shader_state *shader = so;
+    grate_trace();
+    FREE(shader->blob.commands);
++   if (shader->info.epochs) {
++      grate_bo_unref(shader->info.epochs->program_bo);
++      grate_bo_unref(shader->info.epochs->constant_bo);
++      FREE(shader->info.epochs->program);
++      FREE(shader->info.epochs);
++   }
+    while (shader->dual_variants) {
+       struct grate_fragment_shader_state *variant = shader->dual_variants;
+ 
+diff --git a/src/gallium/drivers/grate/grate_state.c b/src/gallium/drivers/grate/grate_state.c
+index c619bd9eb3c..3e0b3149e68 100644
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -899,6 +899,141 @@ emit_fs_uniforms(struct grate_context *context, uint32_t **ptrp)
+    }
+ }
+ 
++/*
++ * A fragment program of more than one epoch, like NVIDIA's driver runs it:
++ * the sequencer takes its commands as (even, odd) pairs of registers,
++ * PSEQ_COMMAND_EVEN(n) at 0x520 + 2n and PSEQ_COMMAND_ODD(n) at 0x521 + 2n.
++ * Each epoch is three pairs: a DMA of its constant packet (the even word
++ * is the packet's length in words, the odd word the address), a DMA of its
++ * program block (0x10000000 | length in words, address) and the command
++ * that runs it (0x20002000 | steps, or 0x20004000 | steps for the last
++ * epoch). A last pair, 0x40000000 | (-pairs & 31), ends the list when
++ * there is room. The odd slots are relocations; the commands without an
++ * address write their even slot only (the kernel treats every word written
++ * to an odd slot as a relocation). The sequencer keeps the registers of
++ * the pixels in flight between the epochs in the pixel spill buffer.
++ *
++ * The Tegra 30 has two pixel pipelines that take alternate swaths of a draw
++ * (GSHIM_WRITE_MASK, see grate_draw_vbo()). Each needs a spill region of
++ * its own: NVIDIA's driver writes GLOBAL_SPILLSURFADDR once for every pipe,
++ * with the write mask selecting it. With one address broadcast to both,
++ * the pipes overwrite each other's spilled pixels: whole batches of the
++ * pixels in flight are lost, and a job that follows a finished one can hang
++ * the engine.
++ */
++#define GRATE_PIXEL_SPILL_SIZE (1 << 20) /* per pixel pipeline */
++
++static int
++emit_epochs(struct grate_context *context, uint32_t **ptrp)
++{
++   struct grate_stream *stream = &context->gr3d->stream;
++   struct grate_fp_epochs *epochs = context->fshader->info.epochs;
++   const struct pipe_constant_buffer *cb =
++      &context->constant_buffer[MESA_SHADER_FRAGMENT];
++   unsigned const_offset[GRATE_FP_MAX_EPOCHS];
++   void *map;
++
++   if (!epochs->program_bo) {
++      epochs->program_bo =
++         grate_bo_alloc(context->drm, epochs->program_bytes, 0);
++      if (!epochs->program_bo || grate_bo_map(epochs->program_bo, &map))
++         return -ENOMEM;
++      memcpy(map, epochs->program, epochs->program_bytes);
++
++      epochs->constant_bytes = 0;
++      for (unsigned i = 0; i < epochs->count; i++)
++         epochs->constant_bytes +=
++            (1 + epochs->epoch[i].num_constants) * sizeof(uint32_t);
++      epochs->constant_bo =
++         grate_bo_alloc(context->drm, epochs->constant_bytes, 0);
++      if (!epochs->constant_bo)
++         return -ENOMEM;
++   }
++   if (!context->pixel_spill_bo) {
++      context->pixel_spill_bo =
++         grate_bo_alloc(context->drm, 2 * GRATE_PIXEL_SPILL_SIZE, 0);
++      if (!context->pixel_spill_bo)
++         return -ENOMEM;
++   }
++
++   /* The constants change with the uniforms. Mapping the buffer waits for
++    * the draw that used it last. */
++   if (grate_bo_map(epochs->constant_bo, &map))
++      return -EIO;
++   uint32_t *packet = map;
++   for (unsigned i = 0; i < epochs->count; i++) {
++      const struct grate_fp_epoch *epoch = &epochs->epoch[i];
++
++      const_offset[i] = (uint8_t *)packet - (uint8_t *)map;
++      *packet++ = host1x_opcode_incr(0x820 + epoch->const_bank,
++                                     epoch->num_constants);
++      for (unsigned j = 0; j < epoch->num_constants; j++) {
++         float value = epoch->constants[j].immediate;
++         int word = epoch->constants[j].word;
++         if (word >= 0) {
++            value = 0;
++            if (cb->user_buffer &&
++                ((unsigned)word + 1) * sizeof(float) <= cb->buffer_size)
++               memcpy(&value,
++                      (const uint8_t *)cb->user_buffer + word * sizeof(float),
++                      sizeof(value));
++         }
++         *packet++ = fragment_fp20(value);
++      }
++   }
++
++   for (unsigned pipe = 0; pipe < 2; pipe++) {
++      GRATE_PUSHBUF_WORD(
++         *ptrp,
++         host1x_opcode_imm(REG_TGR3D_GSHIM_WRITE_MASK,
++                           pipe ? TGR3D_GSHIM_WRITE_MASK_GPU_B(
++                                     TGR3D_STATE_ENABLED)
++                                : TGR3D_GSHIM_WRITE_MASK_GPU_A(
++                                     TGR3D_STATE_ENABLED)));
++      GRATE_PUSHBUF_WORD(
++         *ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_SPILLSURFADDR, 1));
++      grate_stream_push_reloc(stream, ptrp, context->pixel_spill_bo,
++                              pipe * GRATE_PIXEL_SPILL_SIZE);
++   }
++   GRATE_PUSHBUF_WORD(
++      *ptrp,
++      host1x_opcode_imm(REG_TGR3D_GSHIM_WRITE_MASK,
++                        TGR3D_GSHIM_WRITE_MASK_GPU_A(TGR3D_STATE_ENABLED) |
++                           TGR3D_GSHIM_WRITE_MASK_GPU_B(
++                              TGR3D_STATE_ENABLED)));
++
++   unsigned slot = 0;
++   for (unsigned i = 0; i < epochs->count; i++) {
++      const struct grate_fp_epoch *epoch = &epochs->epoch[i];
++
++      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(
++                                   REG_TGR3D_PSEQ_COMMAND_EVEN(slot++), 2));
++      GRATE_PUSHBUF_WORD(*ptrp, 1 + epoch->num_constants);
++      grate_stream_push_reloc(stream, ptrp, epochs->constant_bo,
++                              const_offset[i]);
++
++      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(
++                                   REG_TGR3D_PSEQ_COMMAND_EVEN(slot++), 2));
++      GRATE_PUSHBUF_WORD(*ptrp, 0x10000000 | epoch->prog_words);
++      grate_stream_push_reloc(stream, ptrp, epochs->program_bo,
++                              epoch->prog_offset);
++
++      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(
++                                   REG_TGR3D_PSEQ_COMMAND_EVEN(slot++), 1));
++      GRATE_PUSHBUF_WORD(*ptrp, (i + 1 == epochs->count ? 0x20004000
++                                                          : 0x20002000) |
++                                   epoch->steps);
++   }
++   if (slot < 16) {
++      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(
++                                   REG_TGR3D_PSEQ_COMMAND_EVEN(slot), 1));
++      GRATE_PUSHBUF_WORD(*ptrp, 0x40000000 | (-slot & 31));
++   }
++   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_imm(REG_TGR3D_PSEQ_PC, 0));
++
++   return 0;
++}
++
+ static void
+ emit_shader(struct grate_stream *stream, uint32_t **ptrp,
+             const struct grate_shader_blob *blob)
+@@ -922,6 +1057,8 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
+          fragment = blended;
+    }
+    emit_shader(stream, ptrp, fragment);
++   if (context->fshader->info.epochs && emit_epochs(context, ptrp))
++      grate_loge("cannot set up the epochs of the fragment program\n");
+ 
+    cull_face_linker_setup = TGR3D_SU_PARAM_SUBPIX_XOFF(0x38) |
+                             TGR3D_SU_PARAM_SUBPIX_YOFF(0x38) |
+-- 
+2.56.0
+
