@@ -1,0 +1,61 @@
+From 0e0944d4215127dc3b5e3245484bd57490556f57 Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Wed, 11 Nov 2026 11:57:30 +0100
+Subject: [PATCH] grate: implement fragment max()
+
+TGSI MAX (0x0d) was refused by the fragment compiler, which blocked
+almost every three.js and glmark2 lighting shader (saturate(), clamp(),
+max(dot(n, l), 0.0)). The ALU already has the MAX op (2), next to MIN
+(1), so add MAX to the same code path as MIN: ALU op MAX, the second
+value in the third source (with it in the second one the op returns
+min/max(a * b, 0)), and the same operand staging and scalarization
+for spilling.
+
+Checked three ways. Against a CPU model on the tablet: six new cases of
+grate-frag-compare-test (max of two uniforms, of a varying and a
+uniform, of two varyings, of negated values, against a literal zero, and
+min(max()) together) pass, as do the 13 older ones. Against NVIDIA's
+compiler (the Android one on the tablet, decoded with ar20bin-dump.py):
+max(c.rgb, 0.5), max of two lanes of one sample and max(c, uniform) all
+come out as ALU op 2 with the value in A, the constant one in B and the
+other value in C, the layout of min() with op 1. And glmark2 now runs
+the blinn-phong-inf and bump tests that stopped at 0x0d.
+---
+ src/gallium/drivers/grate/fp/tgsi.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/drivers/grate/fp/tgsi.c b/src/gallium/drivers/grate/fp/tgsi.c
+index 0dc9fa7dfdd..226b7dc85b0 100644
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -631,9 +631,10 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
+          op.src[2] = fp_tgsi_src(fp, third, i, mfu);
+          break;
+       case TGSI_OPCODE_MIN:
++      case TGSI_OPCODE_MAX:
+          /* like ADD, the second value is the third source: with it in the
+           * second one the op returned min(a * b, 0) (measured) */
+-         op.op = FP_ALU_OP_MIN;
++         op.op = opcode == TGSI_OPCODE_MIN ? FP_ALU_OP_MIN : FP_ALU_OP_MAX;
+          op.src[1] = fp_alu_src_one();
+          op.src[2] = b;
+          break;
+@@ -1218,6 +1219,7 @@ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *
+    case TGSI_OPCODE_SGE:
+    case TGSI_OPCODE_SEQ:
+    case TGSI_OPCODE_MIN:
++   case TGSI_OPCODE_MAX:
+    case TGSI_OPCODE_MUL: {
+       const struct tgsi_src_register *a = &inst->Src[0].Register;
+       const struct tgsi_src_register *b = &inst->Src[1].Register;
+@@ -1848,6 +1850,7 @@ scalarize_for_spilling(struct util_dynarray *instructions)
+       case TGSI_OPCODE_ADD:
+       case TGSI_OPCODE_MUL:
+       case TGSI_OPCODE_MIN:
++      case TGSI_OPCODE_MAX:
+       case TGSI_OPCODE_SLT:
+       case TGSI_OPCODE_SGE:
+       case TGSI_OPCODE_SEQ:
+-- 
+2.56.0
+
