@@ -1,0 +1,71 @@
+From e434a479809dfe5f0625bef8a76534d11bf80e8c Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Wed, 11 Nov 2026 11:03:37 +0100
+Subject: [PATCH] grate: name the unimplemented TGSI opcode and texture target,
+ refuse non-2D TEX
+
+The fragment compiler printed "GRATE FRAG TGSI UNIMPLEMENTED: 0x0d" for an
+opcode it cannot express, which needs a lookup in p_shader_tokens.h to
+mean anything (0x0d is TGSI_OPCODE_MAX, GLSL max()). Print the TGSI name
+next to the number.
+
+emit_TEX() asserted a 2D texture, so a shader that samples a cube map
+(three.js' physical material, samplerCube) aborted the process, and with
+it Firefox. Refuse the shader like an unimplemented opcode does instead:
+print "TEX on CUBE (only 2D)", mark the compile failed, and the draws
+that need it are skipped.
+
+Checked on the tablet (kernel 7.0.1-r19): a shader with max() prints
+"0x0d MAX", a samplerCube lookup prints "TEX on CUBE (only 2D)" and the
+process lives on with the clear colour intact; texture2D() and min()
+shaders still draw. The 21 self-checking tests give the same output.
+---
+ src/gallium/drivers/grate/fp/tgsi.c | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/fp/tgsi.c b/src/gallium/drivers/grate/fp/tgsi.c
+index 2dbd16f3590..0dc9fa7dfdd 100644
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -2,7 +2,9 @@
+ #include "grate_compiler.h"
+ #include "fpir.h"
+ 
++#include "tgsi/tgsi_info.h"
+ #include "tgsi/tgsi_parse.h"
++#include "tgsi/tgsi_strings.h"
+ #include "tgsi/tgsi_util.h"
+ #include "util/u_dynarray.h"
+ 
+@@ -675,7 +677,15 @@ emit_TEX(struct grate_fp_shader *fp, const struct tgsi_full_instruction *tgsi)
+    const struct tgsi_src_register *coord = &tgsi->Src[0].Register;
+    const struct tgsi_src_register *sampler = &tgsi->Src[1].Register;
+    const struct tgsi_dst_register *dst = &tgsi->Dst[0].Register;
+-   assert(tgsi->Texture.Texture == TGSI_TEXTURE_2D);
++   if (tgsi->Texture.Texture != TGSI_TEXTURE_2D) {
++      /* Refuse the shader like an unimplemented opcode, do not abort. */
++      fprintf(stderr, "GRATE FRAG TGSI UNIMPLEMENTED: TEX on %s (only 2D)\n",
++              tgsi->Texture.Texture < TGSI_TEXTURE_COUNT
++                 ? tgsi_texture_names[tgsi->Texture.Texture]
++                 : "an unknown target");
++      fp->allocation_failed = true;
++      return;
++   }
+    assert((coord->File == TGSI_FILE_INPUT && !coord->Negate &&
+            !coord->Absolute) ||
+           coord->File == TGSI_FILE_TEMPORARY ||
+@@ -1334,8 +1344,9 @@ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *
+        * The message stays, naming the opcode to implement next; it is
+        * printed even after an earlier failure, since a missing opcode says
+        * more than a register shortage does. */
+-      fprintf(stderr, "GRATE FRAG TGSI UNIMPLEMENTED: 0x%02x\n",
+-              inst->Instruction.Opcode);
++      fprintf(stderr, "GRATE FRAG TGSI UNIMPLEMENTED: 0x%02x %s\n",
++              inst->Instruction.Opcode,
++              tgsi_get_opcode_name(inst->Instruction.Opcode));
+       fp->allocation_failed = true;
+       break;
+    }
+-- 
+2.56.0
+

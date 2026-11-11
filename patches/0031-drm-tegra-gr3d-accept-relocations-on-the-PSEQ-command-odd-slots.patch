@@ -1,0 +1,64 @@
+From: Kayori <thatzokay@proton.me>
+Subject: [PATCH] drm/grate: gr3d: accept relocations on the PSEQ command odd slots
+
+The Tegra30 3D pixel sequencer takes its commands as (even, odd) register
+pairs, PSEQ_COMMAND_EVEN(n) at 0x520 + 2n and PSEQ_COMMAND_ODD(n) at
+0x521 + 2n. A DMA command, which NVIDIA's driver uses to load the program
+and the constants of a fragment program with more than one epoch, carries
+the word count in the even slot and a buffer address in the odd slot.
+
+The Grate command stream patcher (uapi/patching.c) replaces the payload of
+every write to a register in gr3d_addr_regs[] with the DMA address of the
+buffer named by the relocation descriptor. The PSEQ odd slots were not in
+the list, so the descriptor that userspace places there reached the
+sequencer unpatched and the DMA never read the buffer.
+
+Add the 16 odd slots to the list. As for every address register, every
+word written to an odd slot is now a relocation descriptor: a write of a
+literal zero is read as bo_index 0, bo_offset 0, and fails the job if it
+has no buffer. A userspace that clears the command slots must therefore
+write the even slots only. A command that does not use its odd slot
+(execute, tail) must do the same.
+
+This replaces the earlier version of this patch, which edited
+drivers/gpu/drm/tegra/gr3d.c. That file is only built with
+CONFIG_DRM_TEGRA_ORIG, not by the kernel this tree ships.
+
+Not tested on hardware when written.
+
+---
+--- a/drivers/gpu/drm/grate/gr3d.h
++++ b/drivers/gpu/drm/grate/gr3d.h
+@@ -13,6 +13,7 @@
+ #define GR3D_QR_CZ_ADDR			0x419
+ #define GR3D_TEX_TEX_ADDR(x)		(0x710 + (x))
+ #define GR3D_DW_MEMORY_OUTPUT_ADDRESS	0x904
++#define GR3D_PSEQ_COMMAND_ODD(x)	(0x521 + (x) * 2)
+ #define GR3D_GLOBAL_SURFADDR(x)		(0xe00 + (x))
+ #define GR3D_GLOBAL_SPILLSURFADDR	0xe2a
+ #define GR3D_GLOBAL_SURFOVERADDR(x)	(0xe30 + (x))
+--- a/drivers/gpu/drm/grate/gr3d.c
++++ b/drivers/gpu/drm/grate/gr3d.c
+@@ -247,6 +247,22 @@
+ 	GR3D_TEX_TEX_ADDR(14),
+ 	GR3D_TEX_TEX_ADDR(15),
+ 	GR3D_DW_MEMORY_OUTPUT_ADDRESS,
++	GR3D_PSEQ_COMMAND_ODD( 0),
++	GR3D_PSEQ_COMMAND_ODD( 1),
++	GR3D_PSEQ_COMMAND_ODD( 2),
++	GR3D_PSEQ_COMMAND_ODD( 3),
++	GR3D_PSEQ_COMMAND_ODD( 4),
++	GR3D_PSEQ_COMMAND_ODD( 5),
++	GR3D_PSEQ_COMMAND_ODD( 6),
++	GR3D_PSEQ_COMMAND_ODD( 7),
++	GR3D_PSEQ_COMMAND_ODD( 8),
++	GR3D_PSEQ_COMMAND_ODD( 9),
++	GR3D_PSEQ_COMMAND_ODD(10),
++	GR3D_PSEQ_COMMAND_ODD(11),
++	GR3D_PSEQ_COMMAND_ODD(12),
++	GR3D_PSEQ_COMMAND_ODD(13),
++	GR3D_PSEQ_COMMAND_ODD(14),
++	GR3D_PSEQ_COMMAND_ODD(15),
+ 	GR3D_GLOBAL_SURFADDR( 0),
+ 	GR3D_GLOBAL_SURFADDR( 1),
+ 	GR3D_GLOBAL_SURFADDR( 2),

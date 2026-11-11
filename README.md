@@ -43,12 +43,13 @@ Apply in numeric order with `patch -p1` to the kernel tree above.
 | `0028-ARM-dts-tegra30-surface-rt-hold-Bluetooth-PD1-active.patch` | Bluetooth: PD1 as a kernel-owned output-low GPIO hog. |
 | `0029-ARM-dts-tegra30-surface-rt-enable-HDMI-via-GPIO-DD4.patch` | HDMI: PDD4 as a fixed regulator, the connector's `hdmi-pwr-supply`. Windows RT holds it high; with it low HPD stays low and DDC reads return zeros. Not yet booted. |
 | `0030-ARM-dts-tegra30-surface-rt-clock-the-digital-microphone-from-GPIO2.patch` | Microphone: DMICCLK on the codec's GPIO2 and Tegra GPIO S3 held high as the microphones' power, matching the values the Windows driver leaves while recording. Verified: the microphone records live samples. |
+| `0031-drm-tegra-gr3d-accept-relocations-on-the-PSEQ-command-odd-slots.patch` | 3D engine: the sequencer's DMA commands (used by NVIDIA's driver for fragment programs with more than one epoch, i.e. more than 32 uniform scalars) carry a buffer address in an odd `PSEQ_COMMAND` slot (`0x521 + 2n`). The Grate command stream patcher (`drivers/gpu/drm/grate`) only resolves relocations on registers in `gr3d_addr_regs[]`, so the address reached the sequencer unpatched. Adds the 16 odd slots; every word written there is then a relocation, so userspace must clear the command slots through the even slots only (Mesa patch 0046). Verified on the tablet: the constant and program DMAs and NVIDIA's two-epoch program give the expected pixels. |
 
 Sub-series:
 
 - [`patches/camera/`](patches/camera/README.md): `0003`–`0022`, the OV9726 sensor driver and Tegra30 CSI/VI support ported to the grate host1x stack.
 - [`patches/upstream-csi-v7/`](patches/upstream-csi-v7/README.md): unmodified copy of the upstream series the camera patches are ported from (Svyatoslav Ryhel, v7, linux-media 2026-03-03). All credit for that work is the original author's.
-- [`patches/mesa/`](patches/mesa/README.md): `0001`–`0044` against `libre-tegra-mesa` (`0001`–`0019` were written on branch `grate-26.2.3`; `0001`–`0037` are also commits on `grate-26.2.6` of [ThatzOkay/libre-tegra-mesa](https://github.com/ThatzOkay/libre-tegra-mesa)).
+- [`patches/mesa/`](patches/mesa/README.md): `0001`–`0049` against `libre-tegra-mesa` (`0001`–`0019` were written on branch `grate-26.2.3`; `0001`–`0037` are also commits on `grate-26.2.6` of [ThatzOkay/libre-tegra-mesa](https://github.com/ThatzOkay/libre-tegra-mesa); `0045`–`0049` are the commits of the branches `grate-derivatives`, `grate-pseq-clear`, `grate-epoch-driver` and `grate-epoch-compiler` there).
 - [`patches/gnome-session/`](patches/gnome-session/): two patches for the Phosh session (select GLES before the GTK probe; guard the X11 helper and empty EGL config results).
 
 ## Bluetooth/Wi-Fi combo firmware (not included)

@@ -1,0 +1,53 @@
+From c03421d31aeb7c12a56f63c083e1183fb3f27092 Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Tue, 10 Nov 2026 21:57:14 +0100
+Subject: [PATCH] grate: clear the PSEQ command slots through the even slots
+ only
+
+grate_init_state() cleared the 16 sequencer command pairs with one
+32-word write to PSEQ_COMMAND_EVEN(0), which also writes the 16 odd
+slots at 0x521 + 2n. The odd slots hold the buffer address of a DMA
+command, and kernel patch 0031 makes the Grate command stream patcher
+read every word written to them as a relocation descriptor. The zeros
+of the clear would then be patched with the address of buffer 0, and a
+job without buffers would fail.
+
+Write the 16 even slots with one single-word packet each. Nothing
+reads a command slot that is not part of the program that is about to
+run, so leaving the odd slots alone does not change a draw. The
+packet is one word longer per pair, 32 words instead of 33.
+
+Checked: the file compiles for armv7 with the compile command of the
+0045 image build. Not run on the tablet yet; needs kernel patch 0031
+(new version, drivers/gpu/drm/grate) to see any effect, and must ship
+together with it.
+---
+ src/gallium/drivers/grate/grate_draw.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/grate_draw.c b/src/gallium/drivers/grate/grate_draw.c
+index ef1b222a552..e9f34378a51 100644
+--- a/src/gallium/drivers/grate/grate_draw.c
++++ b/src/gallium/drivers/grate/grate_draw.c
+@@ -247,9 +247,16 @@ grate_init_state(struct grate_context *context, uint32_t **ptrp)
+    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_PSEQ_TIMEOUT, 0));
+    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_PSEQ_PC, 0));
+ 
+-   GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_PSEQ_COMMAND_EVEN(0), 32));
+-   for (int i = 0; i < 32; i++)
++   /*
++    * Clear the sequencer commands. Only the even slots are written: the
++    * kernel treats every word written to an odd slot as the relocation of
++    * a DMA address.
++    */
++   for (int i = 0; i < 16; i++) {
++      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(
++                                REG_TGR3D_PSEQ_COMMAND_EVEN(i), 1));
+       GRATE_PUSHBUF_WORD(ptr, 0);
++   }
+ 
+    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_PSEQ_INST_OFFSET, 0));
+    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_PSEQ_DBG_X, 0));
+-- 
+2.56.0
+
