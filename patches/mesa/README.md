@@ -330,3 +330,7 @@ Not done: blending of a split program, chaining beyond five epochs.
 Patch [0049](0049-grate-name-the-unimplemented-TGSI-opcode-and-texture.patch) (after 0048): the unimplemented-opcode message names the TGSI opcode (`0x0d MAX`), and a `TEX` on anything but a
 2D texture (a cube map) refuses the shader with `TEX on CUBE (only 2D)` instead of aborting the process. The next two missing features for three.js are `max()` and cube
 map sampling.
+
+Patch [0050](0050-grate-implement-fragment-max.patch) (after 0049): `max()` (TGSI `MAX`, 0x0d) in the fragment compiler, the ALU op MAX next to MIN with the second value in the third source. Checked against a CPU model (six new cases in `grate-frag-compare-test`) and against NVIDIA's compiler, which emits ALU op 2 with the same operand layout as `min()`.
+
+Patch [0051](0051-grate-compile-SQRT-and-SEQ-in-the-vertex-program.patch) (independent of 0050): `SQRT` in the vertex program as `RCP(RSQ(x))` per lane through a temporary, and `SEQ` as the vector op, both as NVIDIA's vertex compiler emits them. Seven new cases in `grate-vertex-ops-test`.
