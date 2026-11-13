@@ -1,0 +1,154 @@
+From a65b8d0dd6d315c7fb85181b6511394b000ffe14 Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Fri, 13 Nov 2026 09:30:55 +0100
+Subject: [PATCH] grate: compile FLR in the vertex program and SSG in the
+ fragment program
+
+The Plasma lockscreen on the tablet (kwin and plasmashell, the journal
+of the EFI stick) logged "GRATE VERTEX TGSI UNIMPLEMENTED: 0x1a" and
+"GRATE FRAG TGSI UNIMPLEMENTED: 0x41 SSG" for every start, so the
+draws with those shaders were refused.
+
+Vertex 0x1a is FLR. The vector unit has a FLR op (15, already in
+vpir.h), so it is the same one-instruction case as MOV. NVIDIA's
+compiler (the Android one on the tablet, decoded with ar20vp-dump.py)
+compiles floor() to a single vector FLR with the operand in slot A.
+
+The fragment unit has no sign op. NVIDIA builds sign() from condition
+flags (two steps, three packets for a vec4, not decoded yet). Until
+that is understood, lower SSG(x) before packing to SLT(0, x) minus
+SLT(x, 0): exact for 0, uses only ops that are checked against the CPU
+model, and costs two scratch temporaries. The pass runs before
+lower_sne().
+
+Checked on the tablet: three new floor cases in grate-vertex-ops-test
+(positive, negative, with a write mask) and three new sign cases in
+grate-frag-compare-test (u == v giving 0, the negated form, a varying
+operand); with the older cases 25/25 and 22/22 pass. With the library
+installed the Plasma lockscreen draws the keypad arrow and backspace
+buttons correctly and the journal has no more 0x1a or SSG refusals.
+---
+ src/gallium/drivers/grate/fp/tgsi.c | 68 +++++++++++++++++++++++++++++
+ src/gallium/drivers/grate/vp/tgsi.c | 13 ++++++
+ 2 files changed, 81 insertions(+)
+
+diff --git a/src/gallium/drivers/grate/fp/tgsi.c b/src/gallium/drivers/grate/fp/tgsi.c
+index 0b422cd2adb..ce363391fb2 100644
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -1768,6 +1768,73 @@ writes_temp(const struct tgsi_full_instruction *inst, unsigned index)
+    return false;
+ }
+ 
++/* The hardware has no sign op. NVIDIA's compiler builds it from condition
++ * flags (decoded with ar20bin-dump.py: two steps, three packets for a
++ * vec4); here SSG(x) is SLT(0, x) - SLT(x, 0), which is exact for 0, NaN
++ * aside, and uses only ops that are checked against the CPU model. */
++static void
++lower_ssg(struct grate_fp_shader *fp, struct util_dynarray *instructions)
++{
++   bool any = false;
++   util_dynarray_foreach (instructions, struct tgsi_full_instruction, code)
++      any |= code->Instruction.Opcode == TGSI_OPCODE_SSG;
++   if (!any)
++      return;
++
++   unsigned zero_comp;
++   unsigned zero_imm = find_immediate(fp, 0.0f, &zero_comp);
++
++   struct util_dynarray out;
++   util_dynarray_init(&out, NULL);
++   util_dynarray_foreach (instructions, struct tgsi_full_instruction, code) {
++      struct tgsi_full_instruction inst = *code;
++      if (inst.Instruction.Opcode != TGSI_OPCODE_SSG) {
++         util_dynarray_append_typed(&out, struct tgsi_full_instruction, inst);
++         continue;
++      }
++
++      assert(fp->num_temporaries + 2 <= GRATE_FP_MAX_TEMPS);
++      unsigned temp[2] = {fp->num_temporaries, fp->num_temporaries + 1};
++      fp->num_temporaries += 2;
++
++      for (unsigned k = 0; k < 2; k++) {
++         struct tgsi_full_instruction slt = {0};
++         slt.Instruction.Opcode = TGSI_OPCODE_SLT;
++         slt.Instruction.NumDstRegs = 1;
++         slt.Instruction.NumSrcRegs = 2;
++         slt.Dst[0].Register.File = TGSI_FILE_TEMPORARY;
++         slt.Dst[0].Register.Index = temp[k];
++         slt.Dst[0].Register.WriteMask = inst.Dst[0].Register.WriteMask;
++         /* temp[0] = 0 < x, temp[1] = x < 0 */
++         struct tgsi_full_src_register *zero = &slt.Src[k ? 1 : 0];
++         struct tgsi_full_src_register *value = &slt.Src[k ? 0 : 1];
++         *value = inst.Src[0];
++         zero->Register.File = TGSI_FILE_IMMEDIATE;
++         zero->Register.Index = zero_imm;
++         set_src_swizzle(&zero->Register, zero_comp, zero_comp, zero_comp,
++                         zero_comp);
++         util_dynarray_append_typed(&out, struct tgsi_full_instruction, slt);
++      }
++
++      struct tgsi_full_instruction add = {0};
++      add.Instruction.Opcode = TGSI_OPCODE_ADD;
++      add.Instruction.NumDstRegs = 1;
++      add.Instruction.NumSrcRegs = 2;
++      add.Instruction.Saturate = inst.Instruction.Saturate;
++      add.Dst[0] = inst.Dst[0];
++      for (unsigned k = 0; k < 2; k++) {
++         add.Src[k].Register.File = TGSI_FILE_TEMPORARY;
++         add.Src[k].Register.Index = temp[k];
++         add.Src[k].Register.Negate = k;
++         set_src_swizzle(&add.Src[k].Register, TGSI_SWIZZLE_X,
++                         TGSI_SWIZZLE_Y, TGSI_SWIZZLE_Z, TGSI_SWIZZLE_W);
++      }
++      util_dynarray_append_typed(&out, struct tgsi_full_instruction, add);
++   }
++   util_dynarray_fini(instructions);
++   *instructions = out;
++}
++
+ /* The hardware has EQUAL, GREATER and GEQUAL conditions but no NOTEQUAL:
+  * SNE(a, b) is SEQ(a, b) followed by 1 - x. */
+ static void
+@@ -2415,6 +2482,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+       return;
+    }
+ 
++   lower_ssg(fp, &instructions);
+    lower_sne(fp, &instructions);
+    lower_select_comparisons(&instructions);
+ 
+diff --git a/src/gallium/drivers/grate/vp/tgsi.c b/src/gallium/drivers/grate/vp/tgsi.c
+index 0ed5bda5ead..2d46122a30a 100644
+--- a/src/gallium/drivers/grate/vp/tgsi.c
++++ b/src/gallium/drivers/grate/vp/tgsi.c
+@@ -136,6 +136,12 @@ emit_vMOV(struct vp_dst_operand dst, struct vp_src_operand src)
+    return emit_vec_unop(VP_VEC_OP_MOV, dst, src);
+ }
+ 
++static struct vp_vec_instr
++emit_vFLR(struct vp_dst_operand dst, struct vp_src_operand src)
++{
++   return emit_vec_unop(VP_VEC_OP_FLR, dst, src);
++}
++
+ static struct vp_vec_instr
+ emit_vADD(struct vp_dst_operand dst, struct vp_src_operand src0,
+           struct vp_src_operand src2)
+@@ -335,6 +341,13 @@ tgsi_to_vp(struct grate_vp_shader *vp, const struct tgsi_full_instruction *inst)
+                    tgsi_src_to_vp(vp, &inst->Src[1].Register)),
+          emit_sNOP());
+ 
++   case TGSI_OPCODE_FLR:
++      /* One vector op like MOV: NVIDIA's compiler compiles floor() to a
++       * FLR with the operand in slot A (decoded with ar20vp-dump.py). */
++      return emit_packed(emit_vFLR(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
++                                   tgsi_src_to_vp(vp, &inst->Src[0].Register)),
++                         emit_sNOP());
++
+    case TGSI_OPCODE_SQRT: {
+       /* The scalar unit has no square root. NVIDIA's compiler computes
+        * sqrt(x) = RCP(RSQ(x)), which keeps sqrt(0) = RCP(inf) = 0, where
+-- 
+2.56.0
+
