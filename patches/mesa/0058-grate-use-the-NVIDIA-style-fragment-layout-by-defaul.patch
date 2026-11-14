@@ -1,0 +1,145 @@
+From ac05909b183cf64fe1e4e50e6e350254bf664803 Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Fri, 13 Nov 2026 09:45:01 +0100
+Subject: [PATCH] grate: use the NVIDIA-style fragment layout by default
+
+GRATE_LAYOUT_V1=1 turns it off and brings back the old layout; the
+GRATE_LAYOUT_V2 opt-in of the previous patch is gone. The layout and
+its evaluator keep static working state, so each entry point now takes
+a mutex (the driver compiles shaders from several threads). Nothing is
+printed unless GRATE_PACKING_DEBUG is set.
+
+Checked on the tablet: the 25 self-checking tests give the same results
+with the default and with GRATE_LAYOUT_V1=1, and glmark2 bump height,
+bump normals, blinn-phong, phong, cel and texture run at 85, 116, 71,
+44, 46 and 147 FPS against 50, 61, 46, 0, 0 and 123 with the old
+layout (phong and cel did not draw at all). The Plasma Mobile
+lockscreen and shell run on it.
+---
+ src/gallium/drivers/grate/fp/layout.c     | 17 +++++++++++++++++
+ src/gallium/drivers/grate/fp/layout2.c    | 17 +++++++++++++++++
+ src/gallium/drivers/grate/grate_program.c | 18 ++++++++++++++++--
+ 3 files changed, 50 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/fp/layout.c b/src/gallium/drivers/grate/fp/layout.c
+index addecd8ae27..275a889b802 100644
+--- a/src/gallium/drivers/grate/fp/layout.c
++++ b/src/gallium/drivers/grate/fp/layout.c
+@@ -18,6 +18,7 @@
+ 
+ #include "util/list.h"
+ #include "util/macros.h"
++#include "util/simple_mtx.h"
+ #include "util/u_math.h"
+ 
+ #include "fp/fpir.h"
+@@ -341,9 +342,25 @@ lo_units(struct lo_eval *e, const struct fp_instr *instr,
+    return true;
+ }
+ 
++/* The evaluation state is static: one evaluation at a time. */
++static simple_mtx_t lo_mutex = SIMPLE_MTX_INITIALIZER;
++
++static bool lo_signature(const struct grate_fp_shader *fp, bool sequential,
++                         uint64_t *signature, const char **why);
++
+ bool
+ grate_fp_layout_signature(const struct grate_fp_shader *fp, bool sequential,
+                           uint64_t *signature, const char **why)
++{
++   simple_mtx_lock(&lo_mutex);
++   bool ok = lo_signature(fp, sequential, signature, why);
++   simple_mtx_unlock(&lo_mutex);
++   return ok;
++}
++
++static bool
++lo_signature(const struct grate_fp_shader *fp, bool sequential,
++             uint64_t *signature, const char **why)
+ {
+    static struct lo_eval e_storage;
+    struct lo_eval *e = &e_storage;
+diff --git a/src/gallium/drivers/grate/fp/layout2.c b/src/gallium/drivers/grate/fp/layout2.c
+index 75c59ec39be..80df55f3e1e 100644
+--- a/src/gallium/drivers/grate/fp/layout2.c
++++ b/src/gallium/drivers/grate/fp/layout2.c
+@@ -23,6 +23,7 @@
+ #include <string.h>
+ 
+ #include "util/list.h"
++#include "util/simple_mtx.h"
+ #include "util/macros.h"
+ #include "util/u_memory.h"
+ 
+@@ -1606,9 +1607,25 @@ fail:
+    return false;
+ }
+ 
++/* The scheduler state is static: one layout at a time. */
++static simple_mtx_t l2_mutex = SIMPLE_MTX_INITIALIZER;
++
++static bool l2_layout(struct grate_fp_shader *fp, uint64_t seq_signature,
++                      bool verbose, unsigned old_steps, unsigned old_packets);
++
+ bool
+ grate_fp_layout_nvidia(struct grate_fp_shader *fp, uint64_t seq_signature,
+                        bool verbose, unsigned old_steps, unsigned old_packets)
++{
++   simple_mtx_lock(&l2_mutex);
++   bool ok = l2_layout(fp, seq_signature, verbose, old_steps, old_packets);
++   simple_mtx_unlock(&l2_mutex);
++   return ok;
++}
++
++static bool
++l2_layout(struct grate_fp_shader *fp, uint64_t seq_signature, bool verbose,
++          unsigned old_steps, unsigned old_packets)
+ {
+    static struct l2 storage;
+    struct l2 *s = &storage;
+diff --git a/src/gallium/drivers/grate/grate_program.c b/src/gallium/drivers/grate/grate_program.c
+index 170fa7371ae..6226f4aa5c1 100644
+--- a/src/gallium/drivers/grate/grate_program.c
++++ b/src/gallium/drivers/grate/grate_program.c
+@@ -1500,6 +1500,20 @@ fail:
+    return false;
+ }
+ 
++/* The NVIDIA-style layout (fp/layout2.c) is on unless GRATE_LAYOUT_V1 is set
++ * (or GRATE_LAYOUT_V2=0). It only replaces the old layout when its own
++ * symbolic check agrees. */
++static bool
++layout_v2_enabled(void)
++{
++   const char *off = getenv("GRATE_LAYOUT_V1");
++   const char *v2 = getenv("GRATE_LAYOUT_V2");
++
++   if (off && *off && strcmp(off, "0"))
++      return false;
++   return !(v2 && !strcmp(v2, "0"));
++}
++
+ /**
+  * Compiles the program of so->base.tokens, storing the output the mode asks
+  * for, into so->blob and so->info.
+@@ -1573,7 +1587,7 @@ grate_compile_fs(struct grate_context *context,
+                  sig_why ? sig_why : "?");
+    }
+    bool laid_out = false;
+-   if (getenv("GRATE_LAYOUT_V2") && !fp.allocation_failed &&
++   if (layout_v2_enabled() && !fp.allocation_failed &&
+        fp.info.num_constants <= GRATE_FP_MAX_CONSTANTS) {
+       if (!have_seq)
+          have_seq = grate_fp_layout_signature(&fp, true, &sig_seq, &sig_why);
+@@ -1626,7 +1640,7 @@ grate_compile_fs(struct grate_context *context,
+    if (getenv("GRATE_PACKING_DEBUG") &&
+        atoi(getenv("GRATE_PACKING_DEBUG")) >= 2)
+       debug_dump_steps(&fp, "after align_to_rows");
+-   if (have_seq) {
++   if (have_seq && getenv("GRATE_PACKING_DEBUG")) {
+       if (!grate_fp_layout_signature(&fp, false, &sig_hw, &sig_why))
+          fprintf(stderr,
+                  "GRATE LAYOUT CHECK: emitted layout not modelled (%s)\n",
+-- 
+2.56.0
+
