@@ -1,0 +1,64 @@
+From b9981b973d42ff4d8eb5793e292879ee1768f61a Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Sat, 14 Nov 2026 23:04:51 +0100
+Subject: [PATCH] grate: lower texture projectors (TGSI TXP) in NIR
+
+The fragment compiler has no TXP, so every shader with texture2DProj
+was refused ("GRATE FRAG TGSI UNIMPLEMENTED: 0x36 TXP").
+
+Run nir_lower_tex with lower_txp for every sampler dimension before
+nir_to_tgsi: the coordinates are divided by the projector (reciprocal
+and multiply) and fetched with TEX, which we have. NVIDIA's compiler
+does the division in the interpolation unit and needs no ALU operation
+(texture2DProj: 2 steps, 0 packets; the manual divide: 3 steps, 2 mad);
+doing the same is a follow-up, see TODO.
+
+Checked on the tablet with the new grate-texture-proj-test (constant q,
+varying q, computed coordinate, vec3 coordinate): the installed driver
+fails all four with the TXP refusal, this one passes all four. The other
+tests of run-grate-tests.sh give the same results as before.
+---
+ src/gallium/drivers/grate/grate_program.c | 6 ++++++
+ src/gallium/drivers/grate/meson.build     | 2 +-
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/drivers/grate/grate_program.c b/src/gallium/drivers/grate/grate_program.c
+index 5df448aee3b..c575ee50d4a 100644
+--- a/src/gallium/drivers/grate/grate_program.c
++++ b/src/gallium/drivers/grate/grate_program.c
+@@ -4,6 +4,7 @@
+ #include "util/u_dynarray.h"
+ #include "util/u_memory.h"
+ 
++#include "compiler/nir/nir.h"
+ #include "nir/nir_to_tgsi.h"
+ 
+ #include "tgsi/tgsi_dump.h"
+@@ -1912,6 +1913,11 @@ grate_create_fs_state(struct pipe_context *pcontext,
+    so->base = *template;
+ 
+    if (template->type == PIPE_SHADER_IR_NIR) {
++      /* The fragment compiler has no TGSI TXP: divide the coordinates by the
++       * projector here (reciprocal and multiply) and fetch with TEX. NVIDIA's
++       * compiler does the division in the interpolation unit instead. */
++      nir_lower_tex_options lower_txp = {.lower_txp = ~0u};
++      nir_lower_tex(template->ir.nir, &lower_txp);
+       so->base.tokens = nir_to_tgsi(template->ir.nir, pcontext->screen);
+       so->base.type = PIPE_SHADER_IR_TGSI;
+    }
+diff --git a/src/gallium/drivers/grate/meson.build b/src/gallium/drivers/grate/meson.build
+index f778fb830ba..0c3696e2960 100644
+--- a/src/gallium/drivers/grate/meson.build
++++ b/src/gallium/drivers/grate/meson.build
+@@ -70,7 +70,7 @@ libgrate = static_library(
+     inc_src, inc_include, inc_gallium, inc_gallium_aux,
+     inc_gallium_drivers, inc_libgrate,
+   ],
+-  dependencies : [dep_libdrm, dep_valgrind, idep_mesautil],
++  dependencies : [dep_libdrm, dep_valgrind, idep_mesautil, idep_nir_headers],
+   gnu_symbol_visibility : 'hidden',
+   build_by_default : false,
+ )
+-- 
+2.56.0
+

@@ -1,0 +1,99 @@
+From 59058274f57da9e0fcbe122545d353d276707edd Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Sat, 14 Nov 2026 22:05:51 +0100
+Subject: [PATCH] grate: choose the unit operations of a round when the
+ round starts
+
+All units of a round (interpolation, SFU, fetch) act at its start,
+before every ALU packet of the round, including the packets of earlier
+steps (experiments ix_*, docs/grate-alu-latency.md). The scheduler chose
+the unit of a step when it reached that step, so the consumer of an SFU
+result could only start after the unit's step, and a chain of SFU
+operations lost up to a round per link.
+
+The scheduler now chooses the units of all the steps of a round when the
+round starts (same selection and checks as before, operands still must
+come from an earlier round). GRATE_LAYOUT_UNITS_LATE=1 restores the old
+order.
+
+Checked on the tablet: the kwin shadowrect shader without derivatives
+goes from 40 steps and 62 packets to 28 steps and 51 packets (NVIDIA: 20
+and 26); with derivatives it now gets a validated layout at 28 steps and
+56 packets (NVIDIA: 28 and 30) where it found no registers before.
+grate-derivative-test passes 5 of 5 and every test of run-grate-tests.sh
+gives the same result as GRATE_LAYOUT_V1=1.
+---
+ src/gallium/drivers/grate/fp/layout2.c | 57 ++++++++++++++++----------
+ 1 file changed, 35 insertions(+), 22 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/fp/layout2.c b/src/gallium/drivers/grate/fp/layout2.c
+index 0488ef89f26..77d091023ef 100644
+--- a/src/gallium/drivers/grate/fp/layout2.c
++++ b/src/gallium/drivers/grate/fp/layout2.c
+@@ -1137,28 +1137,41 @@ l2_schedule(struct l2 *s)
+       s->step_first[t] = gfirst;
+       bool progress = false;
+ 
+-      /* unit operations first, the best of each kind */
+-      for (int kind = L2_MFU; kind <= L2_TEX; kind++) {
+-         int best = -1;
+-         for (unsigned i = 0; i < s->num_ops; i++) {
+-            struct l2_op *op = &s->ops[i];
+-            if (op->placed || (int)op->kind != kind)
+-               continue;
+-            if (i >= first_waiting(s) + s->window)
+-               continue;
+-            if (!unit_row_ok(s, op, t) || !ops_ready(s, op, gfirst, t))
+-               continue;
+-            if (best < 0 || op->height > s->ops[best].height)
+-               best = i;
+-         }
+-         if (best >= 0 && place_unit(s, &s->ops[best], t,
+-                                     s->step_first[t - t % s->rows])) {
+-            if (kind == L2_MFU)
+-               s->step_mfu[t] = best;
+-            else
+-               s->step_tex[t] = best;
+-            remaining--;
+-            progress = true;
++      /* Unit operations first, the best of each kind. All units of a round
++       * act at its start, before every ALU packet of the round, so the
++       * units of all the steps of a round are chosen when the round starts:
++       * the ALU packets of its first steps can already read their results
++       * (docs/grate-alu-latency.md, experiments ix_*). */
++      const bool early = !getenv("GRATE_LAYOUT_UNITS_LATE");
++      const unsigned first_unit_step = t;
++      const unsigned last_unit_step =
++         early && t % s->rows == 0 ? t + s->rows - 1 : t;
++      if (early && t % s->rows != 0) {
++         /* chosen at the start of the round */
++      } else
++      for (unsigned tt = first_unit_step; tt <= last_unit_step; tt++) {
++         for (int kind = L2_MFU; kind <= L2_TEX; kind++) {
++            int best = -1;
++            for (unsigned i = 0; i < s->num_ops; i++) {
++               struct l2_op *op = &s->ops[i];
++               if (op->placed || (int)op->kind != kind)
++                  continue;
++               if (i >= first_waiting(s) + s->window)
++                  continue;
++               if (!unit_row_ok(s, op, tt) || !ops_ready(s, op, gfirst, tt))
++                  continue;
++               if (best < 0 || op->height > s->ops[best].height)
++                  best = i;
++            }
++            if (best >= 0 && place_unit(s, &s->ops[best], tt,
++                                        s->step_first[t - t % s->rows])) {
++               if (kind == L2_MFU)
++                  s->step_mfu[tt] = best;
++               else
++                  s->step_tex[tt] = best;
++               remaining--;
++               progress = true;
++            }
+          }
+       }
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,52 @@
+From 0f5ebb6d33ce90a268d9f985999757caa09429cd Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Sat, 14 Nov 2026 21:28:10 +0100
+Subject: [PATCH] grate: print the register pressure of each fragment
+ layout candidate
+
+With GRATE_PACKING_DEBUG and GRATE_LAYOUT_VERBOSE, every candidate prints
+its packet count and the most registers live at once. Used to compare
+the scheduler with NVIDIA's code for shadowrect: NVIDIA 30 packets and
+about 10 registers live, ours 59-74 packets and 15.5-22.
+---
+ src/gallium/drivers/grate/fp/layout2.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/src/gallium/drivers/grate/fp/layout2.c b/src/gallium/drivers/grate/fp/layout2.c
+index 5f78645aea0..0488ef89f26 100644
+--- a/src/gallium/drivers/grate/fp/layout2.c
++++ b/src/gallium/drivers/grate/fp/layout2.c
+@@ -1451,6 +1451,30 @@ l2_allocate(struct l2 *s)
+       }
+    }
+ 
++   if (s->verbose) {
++      /* half-registers live at each packet, to compare with NVIDIA's code */
++      unsigned maxlive = 0, at = 0;
++      for (int64_t g = 0; g < total; g++) {
++         unsigned live = 0;
++         for (unsigned d = 0; d < s->num_defs; d++) {
++            const struct l2_def *def = &s->defs[d];
++            if (def->dead || def->quad || def->reg_free || !def->written ||
++                s->ops[def->writer].dead)
++               continue;
++            if (def->start <= g && g <= def->last_read)
++               live += def->width;
++         }
++         if (live > maxlive) {
++            maxlive = live;
++            at = g;
++         }
++      }
++      fprintf(stderr,
++              "GRATE LAYOUT2: rows %u: %lld packets, at most %u.%u registers "
++              "live (packet %u)\n",
++              s->rows, (long long)total, maxlive / 2, (maxlive % 2) * 5, at);
++   }
++
+    /* tied and pinned values first, they have no choice */
+    for (unsigned d = 0; d < s->num_defs; d++) {
+       struct l2_def *def = &s->defs[d];
+-- 
+2.56.0
+

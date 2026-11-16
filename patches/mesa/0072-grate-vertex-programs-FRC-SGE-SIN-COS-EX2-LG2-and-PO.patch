@@ -1,0 +1,147 @@
+From 2bb31becac304917444b1670dc6cb5b995082dfe Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Mon, 16 Nov 2026 20:27:15 +0100
+Subject: [PATCH] grate: vertex programs: FRC, SGE, SIN, COS, EX2, LG2
+ and POW
+
+The vertex compiler refused these TGSI opcodes, which dropped the draws
+of glmark2 conditionals, function, loop, refract and jellyfish. The
+hardware has them: FRC and SGE are vector ops, SIN, COS, EX2 and LG2
+are scalar ops that take their operand in slot C.
+
+Each one follows what NVIDIA's compiler emits for the same GLSL
+(cgtest, decoded with ar20vp-dump.py): fract() is one FRC, step() and
+greaterThanEqual() one SGE with a >= b in slots A and B, sin() and
+cos() one scalar op per lane with no range reduction, exp2() and log2()
+one scalar op, and pow(x, y) is LG2 of x, a vector MUL by y and EX2.
+
+Checked on the tablet with 22 new cases in grate-vertex-ops-test
+(47 of 47 pass), against a CPU model, and with a full glmark2 run: the
+26 FRC and SGE refusals and the SIN and POW refusals are gone.
+---
+ src/gallium/drivers/grate/vp/tgsi.c | 81 +++++++++++++++++++++++++++++
+ 1 file changed, 81 insertions(+)
+
+diff --git a/src/gallium/drivers/grate/vp/tgsi.c b/src/gallium/drivers/grate/vp/tgsi.c
+index 2d46122a30a..f85c681eb64 100644
+--- a/src/gallium/drivers/grate/vp/tgsi.c
++++ b/src/gallium/drivers/grate/vp/tgsi.c
+@@ -142,6 +142,12 @@ emit_vFLR(struct vp_dst_operand dst, struct vp_src_operand src)
+    return emit_vec_unop(VP_VEC_OP_FLR, dst, src);
+ }
+ 
++static struct vp_vec_instr
++emit_vFRC(struct vp_dst_operand dst, struct vp_src_operand src)
++{
++   return emit_vec_unop(VP_VEC_OP_FRC, dst, src);
++}
++
+ static struct vp_vec_instr
+ emit_vADD(struct vp_dst_operand dst, struct vp_src_operand src0,
+           struct vp_src_operand src2)
+@@ -166,6 +172,7 @@ GEN_V_BINOP(MUL)
+ GEN_V_BINOP(DP3)
+ GEN_V_BINOP(DP4)
+ GEN_V_BINOP(SLT)
++GEN_V_BINOP(SGE)
+ GEN_V_BINOP(MAX)
+ GEN_V_BINOP(MIN)
+ GEN_V_BINOP(SNE)
+@@ -208,6 +215,10 @@ emit_s ## OP (struct vp_dst_operand dst, struct vp_src_operand src) \
+ 
+ GEN_S_UNOP(RSQ)
+ GEN_S_UNOP(RCP)
++GEN_S_UNOP(SIN)
++GEN_S_UNOP(COS)
++GEN_S_UNOP(LG2)
++GEN_S_UNOP(EX2)
+ 
+ static struct vp_instr *
+ emit_packed(struct vp_vec_instr vec, struct vp_scalar_instr scalar)
+@@ -348,6 +359,22 @@ tgsi_to_vp(struct grate_vp_shader *vp, const struct tgsi_full_instruction *inst)
+                                    tgsi_src_to_vp(vp, &inst->Src[0].Register)),
+                          emit_sNOP());
+ 
++   case TGSI_OPCODE_FRC:
++      /* One vector op like FLR, operand in slot A (NVIDIA's compiler
++       * compiles fract() to a FRC, decoded with ar20vp-dump.py). */
++      return emit_packed(emit_vFRC(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
++                                   tgsi_src_to_vp(vp, &inst->Src[0].Register)),
++                         emit_sNOP());
++
++   case TGSI_OPCODE_SGE:
++      /* a >= b with the operands in slots A and B, like NVIDIA's compiler
++       * for step() and greaterThanEqual(). */
++      return emit_packed(
++         emit_vSGE(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
++                   tgsi_src_to_vp(vp, &inst->Src[0].Register),
++                   tgsi_src_to_vp(vp, &inst->Src[1].Register)),
++         emit_sNOP());
++
+    case TGSI_OPCODE_SQRT: {
+       /* The scalar unit has no square root. NVIDIA's compiler computes
+        * sqrt(x) = RCP(RSQ(x)), which keeps sqrt(0) = RCP(inf) = 0, where
+@@ -493,6 +520,60 @@ tgsi_to_vp(struct grate_vp_shader *vp, const struct tgsi_full_instruction *inst)
+          emit_sNOP());
+    }
+ 
++   case TGSI_OPCODE_SIN:
++      /* The scalar unit has SIN and takes the angle in radians as it is,
++       * without range reduction, like NVIDIA's compiler (sin.vert). */
++      return emit_packed(emit_vNOP(),
++                         emit_sSIN(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
++                                   tgsi_src_to_vp(vp, &inst->Src[0].Register)));
++
++   case TGSI_OPCODE_COS:
++      /* Like SIN (cos.vert). */
++      return emit_packed(emit_vNOP(),
++                         emit_sCOS(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
++                                   tgsi_src_to_vp(vp, &inst->Src[0].Register)));
++
++   case TGSI_OPCODE_EX2:
++      /* The scalar unit has EX2 and LG2, exp2() and log2() are one each in
++       * NVIDIA's compiler (exp2.vert). */
++      return emit_packed(emit_vNOP(),
++                         emit_sEX2(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
++                                   tgsi_src_to_vp(vp, &inst->Src[0].Register)));
++
++   case TGSI_OPCODE_LG2:
++      return emit_packed(emit_vNOP(),
++                         emit_sLG2(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
++                                   tgsi_src_to_vp(vp, &inst->Src[0].Register)));
++
++   case TGSI_OPCODE_POW: {
++      /* pow(x, y) = EX2(y * LG2(x)), the same three steps as NVIDIA's
++       * compiler (pow.vert): LG2 on the scalar unit, a vector MUL of the
++       * lane x, then EX2. */
++      static const enum vp_swz xxxx[4] = {VP_SWZ_X, VP_SWZ_X, VP_SWZ_X,
++                                          VP_SWZ_X};
++      if (vp->num_temps >= 62) {
++         fprintf(stderr, "GRATE VERTEX: out of temporaries for POW\n");
++         vp->failed = true;
++         return 0;
++      }
++      unsigned t = vp->num_temps++;
++      struct vp_instr *lg2 = emit_packed(
++         emit_vNOP(), emit_sLG2(dst_temp(t, 0x1, false),
++                                tgsi_src_to_vp(vp, &inst->Src[0].Register)));
++      legalize_fetches(vp, lg2, &vp->instructions);
++      list_addtail(&lg2->link, &vp->instructions);
++      struct vp_instr *mul = emit_packed(
++         emit_vMUL(dst_temp(t, 0x1, false), src_temp(t, xxxx, false, false),
++                   tgsi_src_to_vp(vp, &inst->Src[1].Register)),
++         emit_sNOP());
++      legalize_fetches(vp, mul, &vp->instructions);
++      list_addtail(&mul->link, &vp->instructions);
++      return emit_packed(
++         emit_vNOP(),
++         emit_sEX2(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
++                   src_temp(t, xxxx, false, false)));
++   }
++
+    case TGSI_OPCODE_RSQ:
+       return emit_packed(emit_vNOP(),
+                          emit_sRSQ(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
+-- 
+2.56.0
+
