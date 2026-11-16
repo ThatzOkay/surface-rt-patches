@@ -1,0 +1,51 @@
+From 81328b5955860617c0bea148db878d76257dea16 Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Sun, 15 Nov 2026 00:53:12 +0100
+Subject: [PATCH] grate: only refuse blits that read outside the source
+
+The bounds guard of grate_blit also refused blits whose source and
+destination boxes differ in size. glGenerateMipmap blits a level into
+the next, smaller one, so every generated mipmap level was refused:
+grate-mipmap-test went from 0 to 24 of 219 cases failing. The 2D copy
+does not scale (the smaller destination gets the top-left part of the
+source, as before); the fault came from reading outside the source, so
+only that is refused now.
+
+Checked on the tablet: grate-mipmap-test 0/219 failing again, the other
+tests of run-grate-tests.sh give the same results as before the guard.
+---
+ src/gallium/drivers/grate/grate_resource.c | 11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/grate_resource.c b/src/gallium/drivers/grate/grate_resource.c
+index c224acf0fbd..c563cdb4560 100644
+--- a/src/gallium/drivers/grate/grate_resource.c
++++ b/src/gallium/drivers/grate/grate_resource.c
+@@ -595,9 +595,10 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
+       return;
+    }
+ 
+-   /* The plain 2D copy reads src.box at the size of dst.box: a box outside
+-    * the source, or another size, reads memory that is not the source (the
+-    * tegra-mc g2sr SMMU faults), so refuse it. */
++   /* The plain 2D copy reads the source from src.box.x/y at the size of
++    * dst.box (it does not scale: a smaller destination, as in mipmap
++    * generation, gets the top-left part): a read outside the source is memory
++    * that is not the source (the tegra-mc g2sr SMMU faults), so refuse it. */
+    {
+       unsigned sw = u_minify(info->src.resource->width0, info->src.level);
+       unsigned sh = u_minify(info->src.resource->height0, info->src.level);
+@@ -608,9 +609,7 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
+           info->src.box.x + info->dst.box.width > sw ||
+           info->src.box.y + info->dst.box.height > sh ||
+           info->dst.box.x + info->dst.box.width > dw ||
+-          info->dst.box.y + info->dst.box.height > dh ||
+-          info->src.box.width != info->dst.box.width ||
+-          info->src.box.height != info->dst.box.height) {
++          info->dst.box.y + info->dst.box.height > dh) {
+          grate_unimplemented();
+          return;
+       }
+-- 
+2.56.0
+

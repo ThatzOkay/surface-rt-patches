@@ -1,0 +1,282 @@
+From 860918a805d64183e32cf2f049bef6bb58518d9d Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Mon, 16 Nov 2026 00:46:27 +0100
+Subject: [PATCH] grate: gl_FragCoord.z and .w from the interpolated
+ vertex position
+
+NVIDIA's compiler gets gl_FragCoord.w as the reciprocal of the
+interpolated w of tram row 0 and gl_FragCoord.z from the interpolated
+position scaled and offset by constants of the driver (cgtest on
+gl_FragCoord.w / .z). Interpolation is perspective correct, so the
+interpolated clip coordinates are those of the pixel.
+
+A shader that reads z or w now gets one more fragment input, linked from
+vertex output 0 (the position), and the program starts with
+  t.w = 1 / position.w
+  t.z = position.z * t.w * depth scale + depth offset
+next to the existing t.xy = R72/R73 - 8192, and every read of gl_FragCoord
+reads t. The depth scale and offset are constants the driver supplies
+(GRATE_FP_DRIVER_Z_SCALE/OFFSET): the bank upload takes them from the
+current viewport (grate_state.c), so a new viewport or glDepthRange does
+not need a new program. (A TGSI register index has 16 bits, which is why
+the driver words sit at vec4 index 0x7000.)
+
+Checked on the tablet with grate-fragcoord-test (FC_ZW: corners with
+different clip w and z, each pixel against sum(lambda / w) and the depth
+range applied to sum(lambda * z_ndc)): pbuffer and FBO, default and
+non-default depth range, 32 to 1024 pixels, a viewport that does not
+start at the window origin, and all four components in one shader. The
+tests of run-grate-tests.sh give the same results as before.
+---
+ src/gallium/drivers/grate/fp/tgsi.c        | 125 +++++++++++++++------
+ src/gallium/drivers/grate/grate_compiler.h |   8 ++
+ src/gallium/drivers/grate/grate_context.h  |   1 +
+ src/gallium/drivers/grate/grate_state.c    |  25 ++++-
+ 4 files changed, 121 insertions(+), 38 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/fp/tgsi.c b/src/gallium/drivers/grate/fp/tgsi.c
+index b7b942c7ce0..85f4daf6ff5 100644
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -2581,19 +2581,26 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+          }
+       }
+ 
+-      /* The position registers hold the integer pixel coordinates plus 8192
+-       * (measured: R72 is 8192 + x, R73 is 8192 + y counted from the bottom,
+-       * grate-fragcoord-test). Take the bias off once, at the start:
+-       * TEMP[t].xy = SV[0].xy - 8192, and read x and y from the temporary. */
+-      unsigned pos_xy_reads = 0;
++      /* gl_FragCoord comes from two places. x and y: the position registers
++       * hold the integer pixel coordinates plus 8192 (measured: R72 is
++       * 8192 + x, R73 is 8192 + y counted from the top, grate-fragcoord-test).
++       * z and w: NVIDIA's compiler interpolates the vertex position (tram row
++       * of vertex output 0, perspective correct, so it yields the clip
++       * coordinates of the pixel) and takes w = 1 / w_clip and
++       * z = z_clip / w_clip * depth scale + depth offset, with the scale and
++       * the offset of the viewport as constants. All reads of the position
++       * read one temporary that is filled at the start of the program. */
++      unsigned pos_reads = 0;
+       util_dynarray_foreach (&instructions, struct tgsi_full_instruction,
+                              pos_inst) {
+          for (unsigned i = 0; i < pos_inst->Instruction.NumSrcRegs; i++)
+             if (pos_inst->Src[i].Register.File == TGSI_FILE_SYSTEM_VALUE)
+-               pos_xy_reads |= tgsi_util_get_inst_usage_mask(pos_inst, i);
++               pos_reads |= tgsi_util_get_inst_usage_mask(pos_inst, i);
+       }
+-      if ((pos_xy_reads & 0x3) && fp->num_temporaries < GRATE_FP_MAX_TEMPS &&
+-          fp->num_immediates < GRATE_FP_MAX_IMMEDIATES) {
++      const bool pos_zw = pos_reads & 0xc;
++      if (pos_reads && fp->num_temporaries < GRATE_FP_MAX_TEMPS &&
++          fp->num_immediates < GRATE_FP_MAX_IMMEDIATES &&
++          (!pos_zw || fp->info.num_inputs < 15)) {
+          unsigned temp = fp->num_temporaries++;
+          unsigned imm = fp->num_immediates++;
+          fp->immediates[imm][0] = -8192.0f;
+@@ -2603,41 +2610,87 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+                                 pos_inst) {
+             for (unsigned i = 0; i < pos_inst->Instruction.NumSrcRegs; i++) {
+                struct tgsi_src_register *reg = &pos_inst->Src[i].Register;
+-               if (reg->File == TGSI_FILE_SYSTEM_VALUE &&
+-                   !(tgsi_util_get_inst_usage_mask(pos_inst, i) & 0xc)) {
++               if (reg->File == TGSI_FILE_SYSTEM_VALUE) {
+                   reg->File = TGSI_FILE_TEMPORARY;
+                   reg->Index = temp;
+                }
+             }
+          }
+-         struct tgsi_full_instruction bias;
+-         memset(&bias, 0, sizeof(bias));
+-         bias.Instruction.Type = TGSI_TOKEN_TYPE_INSTRUCTION;
+-         bias.Instruction.NrTokens = 1;
+-         bias.Instruction.Opcode = TGSI_OPCODE_ADD;
+-         bias.Instruction.NumDstRegs = 1;
+-         bias.Instruction.NumSrcRegs = 2;
+-         bias.Dst[0].Register.File = TGSI_FILE_TEMPORARY;
+-         bias.Dst[0].Register.Index = temp;
+-         bias.Dst[0].Register.WriteMask = TGSI_WRITEMASK_XY;
+-         bias.Src[0].Register.File = TGSI_FILE_SYSTEM_VALUE;
+-         bias.Src[0].Register.Index = 0;
+-         bias.Src[0].Register.SwizzleX = TGSI_SWIZZLE_X;
+-         bias.Src[0].Register.SwizzleY = TGSI_SWIZZLE_Y;
+-         bias.Src[0].Register.SwizzleZ = TGSI_SWIZZLE_X;
+-         bias.Src[0].Register.SwizzleW = TGSI_SWIZZLE_X;
+-         bias.Src[1].Register.File = TGSI_FILE_IMMEDIATE;
+-         bias.Src[1].Register.Index = imm;
+-         /* SwizzleX/Y/Z/W of the immediate: all X (value 0) */
+-         util_dynarray_append_typed(&instructions,
+-                                    struct tgsi_full_instruction, bias);
+-         /* the bias goes first */
+-         struct tgsi_full_instruction *code = instructions.data;
++
++         struct tgsi_full_instruction fill[6];
++         unsigned nfill = 0;
++         memset(fill, 0, sizeof(fill));
++#define FILL_INST(op_, nsrc_, mask_)                                         \
++   ({                                                                        \
++      struct tgsi_full_instruction *f_ = &fill[nfill++];                     \
++      f_->Instruction.Type = TGSI_TOKEN_TYPE_INSTRUCTION;                    \
++      f_->Instruction.NrTokens = 1;                                          \
++      f_->Instruction.Opcode = (op_);                                        \
++      f_->Instruction.NumDstRegs = 1;                                        \
++      f_->Instruction.NumSrcRegs = (nsrc_);                                  \
++      f_->Dst[0].Register.File = TGSI_FILE_TEMPORARY;                        \
++      f_->Dst[0].Register.Index = temp;                                      \
++      f_->Dst[0].Register.WriteMask = (mask_);                               \
++      f_;                                                                    \
++   })
++#define FILL_SRC(inst_, n_, file_, index_, sw_)                              \
++   do {                                                                      \
++      (inst_)->Src[n_].Register.File = (file_);                              \
++      (inst_)->Src[n_].Register.Index = (index_);                            \
++      (inst_)->Src[n_].Register.SwizzleX = (sw_)[0];                         \
++      (inst_)->Src[n_].Register.SwizzleY = (sw_)[1];                         \
++      (inst_)->Src[n_].Register.SwizzleZ = (sw_)[2];                         \
++      (inst_)->Src[n_].Register.SwizzleW = (sw_)[3];                         \
++   } while (0)
++         static const unsigned xyxx[4] = {0, 1, 0, 0}, xxxx[4] = {0, 0, 0, 0},
++                               yyyy[4] = {1, 1, 1, 1}, zzzz[4] = {2, 2, 2, 2},
++                               wwww[4] = {3, 3, 3, 3};
++         if (pos_reads & 0x3) {
++            /* t.xy = position.xy - 8192 */
++            struct tgsi_full_instruction *f = FILL_INST(
++               TGSI_OPCODE_ADD, 2, TGSI_WRITEMASK_XY);
++            FILL_SRC(f, 0, TGSI_FILE_SYSTEM_VALUE, 0, xyxx);
++            FILL_SRC(f, 1, TGSI_FILE_IMMEDIATE, imm, xxxx);
++         }
++         if (pos_zw) {
++            /* the vertex position as one more fragment input (tram row) */
++            unsigned row = fp->info.num_inputs;
++            fp->info.inputs[row].src = LINK_SRC(0) | (row << 9);
++            fp->info.inputs[row].dst = 0;
++            for (int i = 0; i < 4; ++i)
++               fp->info.inputs[row].dst |= LINK_DST(i, i, LINK_DST_FP20);
++            fp->info.num_inputs++;
++            const unsigned k = GRATE_FP_DRIVER_WORD_BASE / 4;
++            /* t.w = 1 / w_clip (gl_FragCoord.w) */
++            struct tgsi_full_instruction *f =
++               FILL_INST(TGSI_OPCODE_RCP, 1, TGSI_WRITEMASK_W);
++            FILL_SRC(f, 0, TGSI_FILE_INPUT, row, wwww);
++            /* t.z = z_clip * t.w */
++            f = FILL_INST(TGSI_OPCODE_MUL, 2, TGSI_WRITEMASK_Z);
++            FILL_SRC(f, 0, TGSI_FILE_INPUT, row, zzzz);
++            FILL_SRC(f, 1, TGSI_FILE_TEMPORARY, temp, wwww);
++            /* t.z = t.z * depth scale + depth offset (gl_FragCoord.z); the
++             * compiler has no MAD */
++            f = FILL_INST(TGSI_OPCODE_MUL, 2, TGSI_WRITEMASK_Z);
++            FILL_SRC(f, 0, TGSI_FILE_TEMPORARY, temp, zzzz);
++            FILL_SRC(f, 1, TGSI_FILE_CONSTANT, k, xxxx);
++            f = FILL_INST(TGSI_OPCODE_ADD, 2, TGSI_WRITEMASK_Z);
++            FILL_SRC(f, 0, TGSI_FILE_TEMPORARY, temp, zzzz);
++            FILL_SRC(f, 1, TGSI_FILE_CONSTANT, k, yyyy);
++         }
++#undef FILL_INST
++#undef FILL_SRC
++         /* the fill instructions go first */
+          unsigned count = util_dynarray_num_elements(
+             &instructions, struct tgsi_full_instruction);
+-         struct tgsi_full_instruction last = code[count - 1];
+-         memmove(code + 1, code, (count - 1) * sizeof(*code));
+-         code[0] = last;
++         for (unsigned i = 0; i < nfill; i++)
++            util_dynarray_append_typed(&instructions,
++                                       struct tgsi_full_instruction, fill[i]);
++         struct tgsi_full_instruction *code = instructions.data;
++         struct tgsi_full_instruction moved[6];
++         memcpy(moved, code + count, nfill * sizeof(*code));
++         memmove(code + nfill, code, count * sizeof(*code));
++         memcpy(code, moved, nfill * sizeof(*code));
+       }
+    }
+ 
+diff --git a/src/gallium/drivers/grate/grate_compiler.h b/src/gallium/drivers/grate/grate_compiler.h
+index 79b1146561c..b6baed1d843 100644
+--- a/src/gallium/drivers/grate/grate_compiler.h
++++ b/src/gallium/drivers/grate/grate_compiler.h
+@@ -28,6 +28,14 @@ struct tgsi_full_instruction;
+ /* Constants a program may use before it is split into epochs of at most
+  * GRATE_FP_MAX_CONSTANTS each. */
+ #define GRATE_FP_MAX_LOGICAL_CONSTANTS 192
++
++/* Constants the driver supplies, not the application: a constant whose word is
++ * GRATE_FP_DRIVER_WORD_BASE + n takes the value of driver constant n when the
++ * bank is uploaded (grate_state.c). 0: the viewport's depth scale, 1: its depth
++ * translate (what gl_FragCoord.z needs). */
++#define GRATE_FP_DRIVER_WORD_BASE 0x1c000 /* vec4 index 0x7000: a TGSI register index has 16 bits */
++#define GRATE_FP_DRIVER_Z_SCALE   (GRATE_FP_DRIVER_WORD_BASE + 0)
++#define GRATE_FP_DRIVER_Z_OFFSET  (GRATE_FP_DRIVER_WORD_BASE + 1)
+ #define GRATE_FP_UNIFORM_COMPONENTS 256
+ 
+ struct grate_vp_shader {
+diff --git a/src/gallium/drivers/grate/grate_context.h b/src/gallium/drivers/grate/grate_context.h
+index bf7de8c5b20..48888b91f8a 100644
+--- a/src/gallium/drivers/grate/grate_context.h
++++ b/src/gallium/drivers/grate/grate_context.h
+@@ -77,6 +77,7 @@ struct grate_context {
+    struct pipe_scissor_state scissor;
+    uint32_t no_scissor[3];
+    uint32_t viewport[10];
++   float viewport_z_scale, viewport_z_translate;
+    uint32_t guardband[4];
+    bool y_invert;
+ };
+diff --git a/src/gallium/drivers/grate/grate_state.c b/src/gallium/drivers/grate/grate_state.c
+index 3cdcab8b02c..d71e4cbc316 100644
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -166,6 +166,8 @@ grate_set_viewport_states(struct pipe_context *pcontext,
+    assert(num_viewports == 1);
+    assert(start_slot == 0);
+ 
++   context->viewport_z_scale = viewports[0].scale[2];
++   context->viewport_z_translate = viewports[0].translate[2];
+    context->viewport[0] = host1x_opcode_incr(REG_TGR3D_SU_VIEWPORT_X, 6);
+    context->viewport[1] = u_bitcast_f2u(viewports[0].translate[0] * 16.0f);
+    context->viewport[2] = u_bitcast_f2u(viewports[0].translate[1] * 16.0f);
+@@ -873,6 +875,21 @@ fragment_fp20(float value)
+    return sign | ((uint32_t)adjusted << 13) | ((bits & 0x7fffff) >> 10);
+ }
+ 
++
++/* The value of a constant the driver supplies, see GRATE_FP_DRIVER_WORD_BASE */
++static float
++grate_fp_driver_constant(const struct grate_context *context, int word)
++{
++   switch (word) {
++   case GRATE_FP_DRIVER_Z_SCALE:
++      return context->viewport_z_scale;
++   case GRATE_FP_DRIVER_Z_OFFSET:
++      return context->viewport_z_translate;
++   default:
++      return 0.0f;
++   }
++}
++
+ static void
+ emit_fs_uniforms(struct grate_context *context, uint32_t **ptrp)
+ {
+@@ -888,7 +905,9 @@ emit_fs_uniforms(struct grate_context *context, uint32_t **ptrp)
+    for (unsigned i = 0; i < info->num_constants; i++) {
+       float value = info->constants[i].immediate;
+       int word = info->constants[i].word;
+-      if (word >= 0) {
++      if (word >= GRATE_FP_DRIVER_WORD_BASE) {
++         value = grate_fp_driver_constant(context, word);
++      } else if (word >= 0) {
+          assert(cb->user_buffer &&
+                 ((unsigned)word + 1) * sizeof(float) <= cb->buffer_size);
+          memcpy(&value,
+@@ -970,7 +989,9 @@ emit_epochs(struct grate_context *context, struct grate_fp_epochs *epochs,
+       for (unsigned j = 0; j < epoch->num_constants; j++) {
+          float value = epoch->constants[j].immediate;
+          int word = epoch->constants[j].word;
+-         if (word >= 0) {
++         if (word >= GRATE_FP_DRIVER_WORD_BASE) {
++            value = grate_fp_driver_constant(context, word);
++         } else if (word >= 0) {
+             value = 0;
+             if (cb->user_buffer &&
+                 ((unsigned)word + 1) * sizeof(float) <= cb->buffer_size)
+-- 
+2.56.0
+

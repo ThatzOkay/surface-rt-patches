@@ -1,0 +1,76 @@
+From 08728d5243190c4e30640cb9be3db36f4546572b Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Sat, 14 Nov 2026 21:23:54 +0100
+Subject: [PATCH] grate: do not lose quad exchange reads in large
+ programs
+
+The scheduler gets stuck when a read of the quad port misses its one
+valid packet. Two ways it did: the read was outside the candidate
+window, and when the write was the last packet of a step nothing made
+the empty packet between write and read, so the global packet count
+never reached write + 2.
+
+A read of the quad port now ignores the window, and an empty packet is
+made (also at the start of a step or the end of a round) when such a
+read is due in the next packet.
+
+Checked on the tablet: grate-derivative-test passes 5 of 5, the other
+tests of run-grate-tests.sh give the same results as with
+GRATE_LAYOUT_V1=1 (only timings and addresses differ). The kwin
+shadowrect shader no longer gets stuck in the scheduler (it did at
+steps 38-51 with 26-32 operations left); it now fails in the register
+allocation (rows 3: 12 registers, rows 4: 16), where the same shader
+without derivatives lays out at 40 steps and 62 packets.
+---
+ src/gallium/drivers/grate/fp/layout2.c | 21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/fp/layout2.c b/src/gallium/drivers/grate/fp/layout2.c
+index cb72637beb0..5f78645aea0 100644
+--- a/src/gallium/drivers/grate/fp/layout2.c
++++ b/src/gallium/drivers/grate/fp/layout2.c
+@@ -1173,7 +1173,7 @@ l2_schedule(struct l2 *s)
+                struct l2_op *op = &s->ops[i];
+                if (op->placed || op->kind != L2_ALU)
+                   continue;
+-               if (i >= first_waiting(s) + s->window)
++               if (i >= first_waiting(s) + s->window && !reads_quad(s, op))
+                   continue;
+                if (!ops_ready(s, op, g, t))
+                   continue;
+@@ -1196,7 +1196,8 @@ l2_schedule(struct l2 *s)
+                   struct l2_op *op = &s->ops[i];
+                   if (op->placed || op->kind != L2_ALU || (int)i == best)
+                      continue;
+-                  if (i >= first_waiting(s) + s->window)
++                  if (i >= first_waiting(s) + s->window &&
++                      !reads_quad(s, op))
+                      continue;
+                   if (!ops_ready(s, op, g, t))
+                      continue;
+@@ -1226,6 +1227,22 @@ l2_schedule(struct l2 *s)
+          /* nothing could go: a bubble if an operation only waits for the
+           * latency of an earlier packet of this round */
+          bool waiting = false;
++         /* a read of the quad port that is due in the packet after this one
++          * needs an empty packet here, even at the start of a step or the end
++          * of a round (the write may have been the last packet of a step) */
++         for (unsigned i = 0; i < s->num_ops && !waiting; i++) {
++            struct l2_op *op = &s->ops[i];
++            if (op->placed || !reads_quad(s, op))
++               continue;
++            if (ops_ready(s, op, g + 1, p < 2 ? t : t + 1) &&
++                !ops_ready(s, op, g, t))
++               waiting = true;
++         }
++         if (waiting) {
++            s->step_packets[t]++;
++            s->total_packets++;
++            continue;
++         }
+          if (p < 2 && (t + 1) % s->rows != 0 && s->step_packets[t] > 0)
+             for (unsigned i = 0; i < s->num_ops && !waiting; i++) {
+                struct l2_op *op = &s->ops[i];
+-- 
+2.56.0
+
