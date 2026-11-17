@@ -1,0 +1,140 @@
+From 4dd7d7cd5bee16445967702cb17a9eb1b91694ea Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Tue, 17 Nov 2026 22:03:43 +0100
+Subject: [PATCH 73/75] grate: layout v2: accept the discard kill write (R76)
+
+KILL_IF writes the negated source to R76 and the hardware kills the
+pixel; NVIDIA's compiler does the same. Layout v2 refused any ALU
+destination above R15 ("not modelled"), so every fragment shader with a
+discard fell back to the old layout: the gpui scene.frag (a clip test
+with discard) came out at 36 steps and 22 ALU packets, against NVIDIA's
+8 steps and 7 packets, and one full-screen quad took about 117 ms.
+
+The evaluator now accepts the write. Nothing reads R76, so only the
+value counts: the kill values are summed into the signature, which makes
+the order of the writes irrelevant, like the other unordered outputs.
+l2_extract treats the write as an ALU op without a result. The
+GRATE_FP_KILL_REGISTER define moves to fpir.h so tgsi.c and the layout
+code share it.
+
+Checked on the tablet: scene.frag is now 9 steps and 11 packets, a
+full-screen quad takes about 54 ms (87 to 31 ms on a clipped, textured
+variant), and the pixels are identical to GRATE_LAYOUT_V1=1 and to the
+installed library in the four cases compared. All 37 self-checking
+tests in tools/gpu pass or behave as before, grate-kill-test included
+(480 killed, 480 kept, 0 bad).
+---
+ src/gallium/drivers/grate/fp/fpir.h    |  4 ++++
+ src/gallium/drivers/grate/fp/layout.c  | 16 +++++++++++++++-
+ src/gallium/drivers/grate/fp/layout2.c |  8 ++++++--
+ src/gallium/drivers/grate/fp/tgsi.c    |  2 --
+ 4 files changed, 25 insertions(+), 5 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/fp/fpir.h b/src/gallium/drivers/grate/fp/fpir.h
+index 0df33678e2d..a32ea839002 100644
+--- a/src/gallium/drivers/grate/fp/fpir.h
++++ b/src/gallium/drivers/grate/fp/fpir.h
+@@ -149,6 +149,10 @@ struct fp_sched {
+    int address;
+ };
+ 
++/* KILL_IF writes the negated source to this register and the hardware kills
++ * the pixel (see emit_kill_if in tgsi.c). Nothing reads it back. */
++#define GRATE_FP_KILL_REGISTER 76
++
+ struct fp_instr {
+    struct list_head link;
+    uint32_t pseq;
+diff --git a/src/gallium/drivers/grate/fp/layout.c b/src/gallium/drivers/grate/fp/layout.c
+index a11f1496a24..81682887e95 100644
+--- a/src/gallium/drivers/grate/fp/layout.c
++++ b/src/gallium/drivers/grate/fp/layout.c
+@@ -261,6 +261,10 @@ lo_supported_packet(struct lo_eval *e, const struct fp_alu_instr_packet *p)
+          continue;
+       if (e->derivatives && a->dst.index == 32 && a->condition == FP_CONDITION_ALWAYS)
+          continue;
++      if (a->dst.index == GRATE_FP_KILL_REGISTER &&
++          a->condition == FP_CONDITION_ALWAYS && a->dst.write_low_sub_reg &&
++          a->dst.write_high_sub_reg)
++         continue;
+       if (!lo_reg_ok(a->dst.index) && a->dst.index != 31) {
+          if (getenv("GRATE_PACKING_DEBUG"))
+             fprintf(stderr,
+@@ -418,6 +422,9 @@ lo_signature(const struct grate_fp_shader *fp, bool sequential,
+       mf[i++] = m;
+ 
+    uint64_t sig = 0x5167;
++   /* the pixel kills: a sum, so that the order of the writes does not matter */
++   uint64_t kill_sum = 0;
++   bool has_kill = false;
+    int64_t g = 0;
+    unsigned step = 0;
+    unsigned seq_dw = 0;
+@@ -547,6 +554,13 @@ lo_signature(const struct grate_fp_shader *fp, bool sequential,
+                      (a->dst.write_high_sub_reg ? 2 : 0);
+             if (a->dst.index == 31)
+                continue;
++            if (a->dst.index == GRATE_FP_KILL_REGISTER) {
++               /* the kill flag is not a register that anything reads: only
++                * the value that is written counts */
++               kill_sum += mix(0x4b111, v);
++               has_kill = true;
++               continue;
++            }
+             if (e->derivatives && a->dst.index == 32) {
+                /* published when the packet is done, after its reads */
+                quad_pending = true;
+@@ -650,6 +664,6 @@ lo_signature(const struct grate_fp_shader *fp, bool sequential,
+       *why = "no output write";
+       return false;
+    }
+-   *signature = sig;
++   *signature = has_kill ? mix(sig, kill_sum) : sig;
+    return true;
+ }
+diff --git a/src/gallium/drivers/grate/fp/layout2.c b/src/gallium/drivers/grate/fp/layout2.c
+index fa9b8878000..85e22c1a854 100644
+--- a/src/gallium/drivers/grate/fp/layout2.c
++++ b/src/gallium/drivers/grate/fp/layout2.c
+@@ -395,11 +395,15 @@ l2_extract(struct l2 *s, const struct grate_fp_shader *fp)
+             if (!a->dst.write_low_sub_reg && !a->dst.write_high_sub_reg)
+                continue;
+             bool pinned = a->dst.index >= 64 && a->dst.index < 72;
++            /* a kill: the written value is not kept in a register */
++            bool kill = a->dst.index == GRATE_FP_KILL_REGISTER &&
++                        a->condition == FP_CONDITION_ALWAYS &&
++                        a->dst.write_low_sub_reg && a->dst.write_high_sub_reg;
+             bool quad = deriv && a->dst.index == 32 &&
+                         a->condition == FP_CONDITION_ALWAYS &&
+                         a->dst.write_low_sub_reg && a->dst.write_high_sub_reg;
+             if ((a->dst.index >= 16 && a->dst.index != 31 && !pinned &&
+-                 !quad) ||
++                 !quad && !kill) ||
+                 (a->condition != FP_CONDITION_ALWAYS && !pinned) ||
+                 (pinned &&
+                  a->dst.write_low_sub_reg == a->dst.write_high_sub_reg)) {
+@@ -470,7 +474,7 @@ l2_extract(struct l2 *s, const struct grate_fp_shader *fp)
+             }
+             if (!ok)
+                break;
+-            if (a->dst.index != 31) {
++            if (a->dst.index != 31 && !kill) {
+                unsigned width =
+                   a->dst.write_low_sub_reg && a->dst.write_high_sub_reg ? 2
+                                                                         : 1;
+diff --git a/src/gallium/drivers/grate/fp/tgsi.c b/src/gallium/drivers/grate/fp/tgsi.c
+index 85f4daf6ff5..789ee968969 100644
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -935,8 +935,6 @@ emit_load_scalar(struct grate_fp_shader *fp,
+  * negated value to R76 (checked with cgtest on `if (x < c) discard;`:
+  * `r76 = -x + c`; `alpha < 0.5` is `r76 = -alpha + 0.5`; two discards are two
+  * writes to R76 in one packet). One write per distinct source component. */
+-#define GRATE_FP_KILL_REGISTER 76
+-
+ static void
+ emit_kill_if(struct grate_fp_shader *fp,
+              const struct tgsi_full_instruction *tgsi)
+-- 
+2.56.0
+

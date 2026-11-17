@@ -1,0 +1,65 @@
+From 58e3cb4a7b06a2750e2996ea425ac0fe848ad9ed Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Tue, 17 Nov 2026 22:03:44 +0100
+Subject: [PATCH 75/75] grate: layout v2: say why a candidate layout was
+ rejected
+
+With GRATE_PACKING_DEBUG the line for a rejected candidate only said
+"REJECTED by the evaluator". The evaluator already knows the reason,
+for example "ALU destination above R15" or "no output write", and a
+failed rebuild or a different signature has none, so those are named
+too: "the rebuild failed", "the signature differs".
+
+This is what showed that color_rounded_gray was refused because of the
+signature and not because of an op the evaluator does not model. It only
+changes the debug output.
+
+Checked by building the driver and running GRATE_PACKING_DEBUG=1 on the
+tablet: the rejected candidates print their reason, the accepted ones
+print as before.
+---
+ src/gallium/drivers/grate/fp/layout2.c | 25 ++++++++++++++++---------
+ 1 file changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/fp/layout2.c b/src/gallium/drivers/grate/fp/layout2.c
+index 85e22c1a854..6c884779954 100644
+--- a/src/gallium/drivers/grate/fp/layout2.c
++++ b/src/gallium/drivers/grate/fp/layout2.c
+@@ -1877,18 +1877,25 @@ l2_layout(struct grate_fp_shader *fp, uint64_t seq_signature, bool verbose,
+       unsigned old_rows = fp->info.num_rows;
+       fp->info.num_rows = cands[c].rows;
+       bool ok = l2_rebuild(s, fp, &old_steps, &old_alus, &old_mfus);
++      const bool rebuilt = ok;
++      bool evaluated = false;
+       uint64_t sig = 0;
+       const char *why = NULL;
+-      if (ok)
+-         ok = grate_fp_layout_signature(fp, false, &sig, &why) &&
+-              sig == seq_signature;
++      if (ok) {
++         evaluated = grate_fp_layout_signature(fp, false, &sig, &why);
++         ok = evaluated && sig == seq_signature;
++      }
++      if (!ok && !why)
++         why = !rebuilt ? "the rebuild failed" : "the signature differs";
+       if (verbose)
+-         fprintf(
+-            stderr,
+-            "GRATE LAYOUT2: rows %u window %u%s, %u steps, %u packets: %s\n",
+-            cands[c].rows, cands[c].window, cands[c].prop ? " +prop" : "",
+-            cands[c].steps, cands[c].packets,
+-            ok ? "validated" : "REJECTED by the evaluator");
++         fprintf(stderr,
++                 "GRATE LAYOUT2: rows %u window %u%s, %u steps, %u packets: "
++                 "%s%s%s\n",
++                 cands[c].rows, cands[c].window,
++                 cands[c].prop ? " +prop" : "", cands[c].steps,
++                 cands[c].packets,
++                 ok ? "validated" : "REJECTED by the evaluator",
++                 !ok && why ? ": " : "", !ok && why ? why : "");
+       if (ok) {
+          free_lists(&old_steps, &old_alus, &old_mfus);
+          return true;
+-- 
+2.56.0
+
