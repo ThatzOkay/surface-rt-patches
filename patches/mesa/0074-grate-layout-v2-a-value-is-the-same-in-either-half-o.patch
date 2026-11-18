@@ -1,0 +1,61 @@
+From 8a97e559bbdae0a256a9d953d5535f133bd323d0 Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Tue, 17 Nov 2026 22:03:43 +0100
+Subject: [PATCH 74/75] grate: layout v2: a value is the same in either half of
+ a register
+
+The evaluator hashed sub_reg_select_high into every source operand, so
+the same value read from the low half in the sequential program and
+from the high half after layout looked different, and layout v2
+rejected the result ("the signature differs"). That happens whenever
+the common subexpression elimination of interpolations lets the
+allocator keep a copy in the high half: color_rounded_gray was rejected
+and fell back to the old layout (72 steps, 96 packets).
+
+For FIXED10 reads of a register or a forward the leaf already is the
+value of the selected half, so which half is read is a choice of
+location. lo_src no longer mixes the half-select bit in for those.
+
+Checked on the tablet with a rounded rectangle (1000x500, radius 80)
+through the same shader: color_rounded_gray is now 15 steps and 25
+packets (NVIDIA 24 and 32) instead of 72 and 96, and 4.4 times faster
+(55 ms against 242 ms for a full-screen quad). Its pixels match a CPU
+model to within 1/255 on all 1366x768 pixels; the installed library and
+GRATE_LAYOUT_V1=1 are wrong on about 5700 pixels in the rounded
+corners. The other shape shaders (color, color_rounded, border,
+premult_rounded, glyph) give the same pixels as before, and the
+tools/gpu self-checking tests behave as before.
+---
+ src/gallium/drivers/grate/fp/layout.c | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/fp/layout.c b/src/gallium/drivers/grate/fp/layout.c
+index 81682887e95..ec7d4e07fc8 100644
+--- a/src/gallium/drivers/grate/fp/layout.c
++++ b/src/gallium/drivers/grate/fp/layout.c
+@@ -246,9 +246,19 @@ lo_src(const struct lo_eval *e, const struct fp_alu_src_operand *s, int64_t q,
+        int round)
+ {
+    uint64_t leaf = lo_leaf(e, s, q, round);
+-   uint64_t a[] = {
+-      leaf,         s->negate,   s->absolute_value,     s->scale_by_two,
+-      s->minus_one, s->datatype, s->sub_reg_select_high};
++   /* Which half of a register or forward a half-precision operand reads is a
++    * choice of location: the leaf already is the value of that half, and a
++    * value stored in a half is the same whichever half holds it. */
++   const bool half_select =
++      s->datatype == FP_DATATYPE_FIXED10 &&
++      (lo_reg_ok(s->index) || (s->index >= 24 && s->index <= 27));
++   uint64_t a[] = {leaf,
++                   s->negate,
++                   s->absolute_value,
++                   s->scale_by_two,
++                   s->minus_one,
++                   s->datatype,
++                   half_select ? 0 : s->sub_reg_select_high};
+    return mixn(7, a);
+ }
+ 
+-- 
+2.56.0
+
