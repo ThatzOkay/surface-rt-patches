@@ -1,0 +1,37 @@
+From: Kayori <thatzokay@proton.me>
+Subject: [PATCH] drm/grate: arm connector hotplug detection once the connectors exist
+
+drm_kms_helper_poll_init() runs before host1x_device_init() creates the
+connectors, so the enable_hpd pass of drm_kms_helper_poll_enable() finds
+none. Hotplug bridges, here HDMI through display-connector, then never get
+their HPD callback: the interrupt fires (hpd_cb is NULL in
+display_connector_hpd_irq), the connector status never changes and no
+hotplug uevent is sent, so HDMI only appeared after a manual
+echo detect > .../status.
+
+Disable and re-enable polling just before drm_dev_register(), when the
+connectors exist, so enable_hpd runs for each of them.
+
+Checked on the tablet booted through the Microsoft UEFI: before the change
+a debug trace showed no enable_hpd pass and hpd_cb=0x0 on every HPD
+interrupt; after it the HDMI status follows the cable without any manual
+detect.
+
+---
+--- a/drivers/gpu/drm/grate/drm.c
++++ b/drivers/gpu/drm/grate/drm.c
+@@ -559,6 +559,14 @@
+ 	err = aperture_remove_all_conflicting_devices(tegra_drm_driver.name);
+ 	if (err < 0)
+ 		goto hub;
++
++	/*
++	 * Output polling was initialised before the connectors existed, so its
++	 * enable_hpd pass found none and hotplug bridges (HDMI through
++	 * display-connector) never got their HPD callback. Run it again now.
++	 */
++	drm_kms_helper_poll_disable(drm);
++	drm_kms_helper_poll_enable(drm);
+ 
+ 	err = drm_dev_register(drm, 0);
+ 	if (err < 0)
