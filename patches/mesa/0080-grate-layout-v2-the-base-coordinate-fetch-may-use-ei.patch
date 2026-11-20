@@ -1,0 +1,123 @@
+From a439134637bbe4670ef86b69393dd466f80d6d57 Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Fri, 20 Nov 2026 23:28:19 +0100
+Subject: [PATCH] grate: layout v2: the base coordinate fetch may use either
+ pair
+
+A fetch whose coordinates are the interpolated varying itself (the
+centre tap of a box blur) needs no ALU operation, so the scheduler puts
+it on the first step, and its result then waits in its row until the
+serial accumulation reaches it. In the +reinterp layouts every fetch
+used R2/R3 of its row (TEX_INST_DATA 0x430), so that result held row 0
+against the other fetches for about 12 taps: rounds 1 to 3 had three
+fetches instead of four on 4 rows, and the 25-tap blur needed 32 steps.
+
+When the varying is linked twice (dup_rows) the interpolation can write
+either pair, so such a fetch now takes R0/R1 (0x400) or R2/R3 per class
+(pair_rel, as +dynpair does for every fetch). NVIDIA mixes 0x400 and
+0x430 in one program as well (its 5x5 blur: 13 fetches against 12).
+
+GRATE_LAYOUT_DIAG prints a header per schedule, and for the chosen
+schedule every fetch with its row, step and the steps of its coordinate
+producers, which is how the blocked row was found.
+
+Checked on the tablet against the installed library (0079):
+- 5x5 blur (25 taps): 28 steps/33 packets -> 28/32, 49.9 -> 48.6 ms
+  per 1024x768 draw (4 interleaved pairs; NVIDIA's compiled program
+  33/30, 47.9 ms). 20 taps 27 -> 26 packets; 1, 3, 5, 10, 15 taps
+  unchanged.
+- the 36 self-checking tests and grate-blend-row-test: identical
+  PASS/FAIL lines (37 programs, 454 PASS); the blend-row 3x3 and 5x5
+  boxes use the new layouts and compare pixels (bad=0/1024).
+- every layout is validated by the evaluator (0 REJECTED).
+- glmark2, 49 programs layout by layout: 9 get one packet fewer
+  (545 -> 536 in total), none get more steps or packets.
+---
+ src/gallium/drivers/grate/fp/layout2.c | 41 +++++++++++++++++++++++++-
+ 1 file changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/drivers/grate/fp/layout2.c b/src/gallium/drivers/grate/fp/layout2.c
+index 30d565b9728..eea9ed5f677 100644
+--- a/src/gallium/drivers/grate/fp/layout2.c
++++ b/src/gallium/drivers/grate/fp/layout2.c
+@@ -449,8 +449,10 @@ l2_extract(struct l2 *s, const struct grate_fp_shader *fp)
+           * columns 2/3 as well (grate_fp_info.dup_rows); otherwise it has to
+           * use R0/R1. The other fetches may use R2/R3 */
+          unsigned mask = 1;
++         bool either = false;
+          if (s->reinterp) {
+             bool again = false, all_dup = true;
++            unsigned direct = 0;
+             for (unsigned k = 0; k < 2; k++) {
+                int d = cur_fp20(&cur, k);
+                if (d < 0)
+@@ -464,14 +466,27 @@ l2_extract(struct l2 *s, const struct grate_fp_shader *fp)
+                if (key < 0)
+                   continue;
+                again = true;
++               direct++;
+                all_dup &= (key >> 3) < 32 && (s->dup_rows >> (key >> 3) & 1);
+             }
+             /* with dyn_pair the scheduler picks the pair of the class
+              * (cls_pair), else it is fixed here */
+             mask = again && !all_dup ? 1 : (s->dyn_pair ? 3 : 2);
++            /* The fetch at the base coordinate itself (no offset added)
++             * needs no ALU operation, so it goes on the first step, and its
++             * result then waits in its row until the accumulation reaches
++             * it. On R2/R3 that holds the row against the other fetches for
++             * several rounds, and the program needs a round more. Either
++             * pair is valid for it (the varying is linked twice); NVIDIA
++             * also mixes TEX_INST_DATA 0x400 (R0/R1) and 0x430 (R2/R3) in
++             * one program. */
++            if (!s->dyn_pair && again && all_dup && direct == 2) {
++               mask = 3;
++               either = true;
++            }
+          }
+          op->pair_mask = mask;
+-         const bool rel = s->dyn_pair;
++         const bool rel = s->dyn_pair || either;
+          const unsigned fixed = rel ? 0 : (mask == 2);
+          op->tex_hi = fixed;
+          for (unsigned k = 0; k < 2; k++) {
+@@ -1500,6 +1515,13 @@ l2_schedule(struct l2 *s)
+       }
+    }
+    compute_heights(s);
++   if (getenv("GRATE_LAYOUT_DIAG"))
++      fprintf(
++         stderr,
++         "DIAG schedule rows %u window %u detach %d reinterp %d nodup %d "
++         "prop %d dyn %d ops %u\n",
++         s->rows, s->window, s->detach, s->reinterp, s->nodup, s->prop,
++         s->dyn_pair, s->num_ops);
+    s->total_packets = 0;
+    s->steps = 0;
+    memset(s->step_packets, 0, sizeof(s->step_packets));
+@@ -1778,6 +1800,23 @@ l2_schedule(struct l2 *s)
+    if (remaining)
+       return false;
+ 
++   if (getenv("GRATE_LAYOUT_DIAG"))
++      /* every fetch: its row and step, and where what computes its
++       * coordinates went (op, kind, step, packet) */
++      for (unsigned i = 0; i < s->num_ops; i++) {
++         const struct l2_op *op = &s->ops[i];
++         if (op->kind != L2_TEX || op->dead)
++            continue;
++         fprintf(stderr, "DIAG fetch op%u row %d step %d <-", i,
++                 s->cls_row[cls_find(s, op->cls)], op->step);
++         for (unsigned k = 0; k < op->num_in; k++) {
++            const int w = s->defs[op->in[k]].writer;
++            fprintf(stderr, " [op%d kind %d step %d pk %d]", w,
++                    s->ops[w].kind, s->ops[w].step, s->ops[w].packet);
++         }
++         fprintf(stderr, "\n");
++      }
++
+    /* the output write: every other operation is placed; it goes in the round
+     * of the last step that does something, on the step whose row holds the
+     * output (it fires at the end of the round and reads that row) */
+-- 
+2.56.0
+
