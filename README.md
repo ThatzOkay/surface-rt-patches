@@ -27,6 +27,22 @@ Measured on one device, 2026-10-29 to 2026-11-05.
 | HDMI output | works at 1920x1080@60 once GPIO PDD4 is driven high (confirmed at runtime with a userspace register write, with hotplug); patch 0029 does this from the devicetree and has not been booted yet |
 | Light, motion and temperature sensors | enumerate over I2C/IIO; cover response untested |
 
+## Building Grate Mesa natively on Alpine / postmarketOS (armv7)
+
+Heads-up for GCC builds on armv7, for example with `pmbootstrap`: Mesa's meson picks `-mtls-dialect=gnu2`, and
+the result can be unusable (a `pmbootstrap` build of this branch crashed in `glCreateShader`, and Weston segfaulted
+after "failed to detect GLES version"). Alpine attributes this to a binutils bug with TLS descriptors on armv7 and builds its own Mesa package for
+armhf/armv7 with the plain dialect instead. Do the same before building:
+
+    export CFLAGS="$CFLAGS -mtls-dialect=gnu"
+    export CXXFLAGS="$CXXFLAGS -mtls-dialect=gnu"
+
+Upstream: [aports#14140](https://gitlab.alpinelinux.org/alpine/aports/-/issues/14140), Alpine's fix
+[aports!85304](https://gitlab.alpinelinux.org/alpine/aports/-/merge_requests/85304) and
+[mesa#13236](https://gitlab.freedesktop.org/mesa/mesa/-/issues/13236). Found by
+[jberclaz](https://github.com/ThatzOkay/surface-rt-patches/issues/17#issuecomment-7028279301).
+A clang/lld cross build needs nothing: clang rejects `-mtls-dialect` for ARMv7, and the library built that way has no TLS-descriptor relocations.
+
 ## `patches/` (kernel)
 
 Apply in numeric order with `patch -p1` to the kernel tree above.
