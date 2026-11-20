@@ -16,7 +16,9 @@ Linux showed why:
 2. Tegra GPIO S3 (GPIO 147) is listed by the ACPI audio device, is driven low
    when Windows is idle and high while it records, and the capture collapses
    when it is low. It is the microphone's power or enable. Hold it high with
-   a gpio-hog, the same way patch 0028 holds PD1.
+   a gpio-hog, the same way patch 0028 holds PD1. The hog sits in its own
+   gpio@6000d000 node (merged with 0028's by dtc), so this patch applies with
+   or without 0028.
 
 Verified on the device by writing the equivalent register state into a codec
 that was booted normally (capture produces live samples on both channels;
@@ -27,11 +29,11 @@ capture stream would need a regulator and a consumer, which can follow.
 ---
 --- a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
 +++ b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
-@@ -78,6 +78,18 @@
- 			output-low;
- 			line-name = "bluetooth-pd1-active";
+@@ -65,6 +65,20 @@
  		};
-+
+ 	};
+ 
++	gpio@6000d000 {
 +		/*
 +		 * GPIO S3 (Tegra GPIO 147) is the microphone's power or enable:
 +		 * the ACPI audio device lists it, Windows drives it high only while
@@ -43,10 +45,12 @@ capture stream would need a regulator and a consumer, which can follow.
 +			output-high;
 +			line-name = "microphone-power";
 +		};
- 	};
- 
- 	pinmux@70000868 {
-@@ -375,20 +387,24 @@
++	};
++
+ 	vde@6001a000 {
+ 		assigned-clocks = <&tegra_car TEGRA30_CLK_VDE>;
+ 		assigned-clock-parents = <&tegra_car TEGRA30_CLK_PLL_P>;
+@@ -357,20 +371,24 @@
  			SPKVDD2-supply = <&vdd_1v8_vio>;
  
  			/*
