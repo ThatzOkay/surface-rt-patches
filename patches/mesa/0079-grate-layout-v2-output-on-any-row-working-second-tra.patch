@@ -1,0 +1,480 @@
+From 59fe54cc15408f84c2448c9efbe848a4d5a70201 Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Fri, 20 Nov 2026 01:57:38 +0100
+Subject: [PATCH] grate: layout v2: output on any row, working second tram
+ link, copy propagation
+
+The output write no longer sits on row 0. With the output class pinned
+to row 0 the accumulator held R0-R2 for the whole program and no
+round-start step could take a fetch (3 fetches per 4 steps on 4 rows).
+NVIDIA puts the write on the last step on any row (its 5x5 blur ends on
+row 2 of 3, accumulator in R10/R11). l2_schedule lets the output class
+pick its row and puts the write on that step of the last round
+(GRATE_LAYOUT_DWROW0=1 pins it to row 0 again). The blend stage follows:
+create_blend_blob takes the row of the program's last output store,
+puts the destination read and the output write on that step of the
+extra round, and grate_fp_blend_alu(key, row, ...) moves its R0-R3
+operands to the registers of that row.
+
+The second tram link of 5c53372e2ca never happened for real programs:
+emit_tgsi_input compared Declaration.Semantic, a one-bit "has semantic"
+flag, with TGSI_SEMANTIC_COLOR, which is also 1, so every varying with a
+semantic was excluded. It tests Semantic.Name now. color_input had the
+same mistake, and held the declaration index although the flat shading
+code indexes the link table by position.
+
+Layout candidates: +reinterp-nodup lays the program out as if no row
+were linked twice (it packs better for some programs, the 5x5 blur
+among them). The +prop dimension was set and never read, so every
++prop candidate repeated its twin; it now propagates copies that cannot
+be folded: the readers of a copy of a fetch result or of an
+interpolation read the source itself, as NVIDIA's code does. A +prop
+candidate is only generated when it propagated something. Compile time
+of the 25-tap blur 6 s -> 3 s.
+
+Checked on the tablet: glmark2 5x5 box blur 36 steps/35 packets to 28
+steps/33 packets, a 1024x768 draw 52.5 to 49.7 ms (NVIDIA's compiled
+program replayed in our driver: 33 steps/30 packets, 47.9 ms); N-tap
+blurs of 3 to 25 taps are within 0 to 1.7 ms of NVIDIA's; glmark2's 49
+programs 484 to 446 steps in total, none with more steps or packets
+than before any of these changes; the 36 self-checking tests give the
+same verdicts as the installed library; the new
+tools/gpu/grate-blend-row-test (3x3 and 5x5 box, five blend modes,
+output on row 2 of 3 and of 4) passes, also with a +prop layout forced;
+grate-texture-lane-test passes with the second link active; no gr3d
+reset. Costs measured in docs/grate-cost-model.md.
+---
+ src/gallium/drivers/grate/fp/blend.c      |  17 ++-
+ src/gallium/drivers/grate/fp/blend.h      |   6 +-
+ src/gallium/drivers/grate/fp/layout2.c    | 149 ++++++++++++++++++----
+ src/gallium/drivers/grate/fp/tgsi.c       |  10 +-
+ src/gallium/drivers/grate/grate_program.c |  44 ++++++-
+ 5 files changed, 184 insertions(+), 42 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/fp/blend.c b/src/gallium/drivers/grate/fp/blend.c
+index 5f58085b292..0df0cbd46d3 100644
+--- a/src/gallium/drivers/grate/fp/blend.c
++++ b/src/gallium/drivers/grate/fp/blend.c
+@@ -231,8 +231,19 @@ grate_fp_blend_key(const struct pipe_rt_blend_state *rt)
+           (rt->colormask & KEY_COLORMASK_MASK) << KEY_COLORMASK_SHIFT;
+ }
+ 
++/* Move the operands that name R0-R3 to the registers of row `row`. */
++static void
++blend_to_row(struct fp_alu_instr *instr, unsigned row)
++{
++   if (instr->dst.index < 4)
++      instr->dst.index += row * 4;
++   for (unsigned k = 0; k < 4; k++)
++      if (instr->src[k].index < 4)
++         instr->src[k].index += row * 4;
++}
++
+ unsigned
+-grate_fp_blend_alu(uint32_t key,
++grate_fp_blend_alu(uint32_t key, unsigned row,
+                    uint32_t words[GRATE_FP_BLEND_MAX_PACKETS * 8])
+ {
+    struct fp_alu_instr packets[GRATE_FP_BLEND_MAX_PACKETS][4] = {{{0}}};
+@@ -348,8 +359,10 @@ grate_fp_blend_alu(uint32_t key,
+    }
+ 
+    for (unsigned i = 0; i < num_packets; i++) {
+-      for (unsigned p = 0; p < 4; p++)
++      for (unsigned p = 0; p < 4; p++) {
++         blend_to_row(&packets[i][p], row);
+          grate_fp_pack_alu(words + i * 8 + p * 2, &packets[i][p]);
++      }
+    }
+ 
+    return num_packets;
+diff --git a/src/gallium/drivers/grate/fp/blend.h b/src/gallium/drivers/grate/fp/blend.h
+index c328a89fdeb..12f6fed895b 100644
+--- a/src/gallium/drivers/grate/fp/blend.h
++++ b/src/gallium/drivers/grate/fp/blend.h
+@@ -21,11 +21,13 @@ uint32_t grate_fp_blend_key(const struct pipe_rt_blend_state *rt);
+ 
+ /**
+  * Builds the ALU packets of the epilogue for a key from
+- * grate_fp_blend_key(). Writes 8 words per packet to words and returns the
++ * grate_fp_blend_key(), for a colour in R2/R3 of register row `row` (the
++ * destination is read into R0/R1 of that row). Writes 8 words per packet to
++ * words and returns the
+  * number of packets (at most GRATE_FP_BLEND_MAX_PACKETS), or 0 for a key
+  * that is not valid.
+  */
+-unsigned grate_fp_blend_alu(uint32_t key,
++unsigned grate_fp_blend_alu(uint32_t key, unsigned row,
+                             uint32_t words[GRATE_FP_BLEND_MAX_PACKETS * 8]);
+ 
+ /**
+diff --git a/src/gallium/drivers/grate/fp/layout2.c b/src/gallium/drivers/grate/fp/layout2.c
+index 1edac567b87..30d565b9728 100644
+--- a/src/gallium/drivers/grate/fp/layout2.c
++++ b/src/gallium/drivers/grate/fp/layout2.c
+@@ -114,7 +114,6 @@ struct l2 {
+    int64_t total_packets;
+    bool verbose;
+    unsigned folded; /* copies removed */
+-   bool prop;       /* also propagate copies that cannot be folded */
+    /* copy every interpolated value into a free register right after the
+     * interpolation: the interpolation unit writes the registers of a row,
+     * and a value that stays there for the whole program keeps a fetch from
+@@ -128,6 +127,9 @@ struct l2 {
+     * row, else it keeps R2/R3 */
+    bool dyn_pair;
+    uint32_t dup_rows; /* grate_fp_info.dup_rows: var2/var3 alias var0/var1 */
++   bool nodup;        /* candidate: lay out as if no row were linked twice */
++   bool prop; /* candidate: readers of a copy read its source instead */
++   unsigned num_propped; /* copies removed that way */
+    struct fp_mfu_instr synth_mfu[64];
+    unsigned num_synth;
+    /* an operation may only be scheduled when fewer than this many operations
+@@ -270,7 +272,7 @@ l2_new_copy(struct l2 *s, int src, bool *ok)
+ static bool
+ l2_extract(struct l2 *s, const struct grate_fp_shader *fp)
+ {
+-   s->dup_rows = fp->info.dup_rows;
++   s->dup_rows = s->nodup ? 0 : fp->info.dup_rows;
+    unsigned num_packets = list_length(&fp->alu_instructions);
+    unsigned num_mfus = list_length(&fp->mfu_instructions);
+    const struct fp_alu_instr_packet **pk =
+@@ -987,6 +989,66 @@ l2_fold_copies(struct l2 *s)
+       uses[id]--;
+       removed++;
+    }
++   /* a copy whose source cannot be folded into the slot that computes it (a
++    * fetch result, an interpolation): the readers of the copy read the source
++    * itself, as NVIDIA's code does (the first tap of a blur is added to the
++    * second one straight from the fetch registers). The source stays in its
++    * register for the later reads; the scheduler already keeps a unit from
++    * overwriting a register that is still to be read. */
++   for (unsigned c = 0; s->prop && c < s->num_ops; c++) {
++      struct l2_op *cp = &s->ops[c];
++      if (cp->kind != L2_ALU || cp->dead || cp->dst_def < 0 ||
++          !alu_is_plain_copy(&cp->alu) || cp->src_def[0] < 0 ||
++          cp->src_def[1] >= 0 || cp->src_def[2] >= 0 || cp->src_def[3] >= 0)
++         continue;
++      const int xi = cp->src_def[0], yi = cp->dst_def;
++      struct l2_def *x = &s->defs[xi];
++      struct l2_def *y = &s->defs[yi];
++      if (xi == yi || x->quad || y->quad || x->dead || y->dead ||
++          x->fixed_reg >= 0 || y->fixed_reg >= 0 || y->tie_k >= 0 ||
++          x->width != y->width || y->num_readers == 0 ||
++          x->num_readers + y->num_readers > 16 ||
++          cp->alu.src[0].datatype !=
++             (x->width == 2 ? FP_DATATYPE_FP20 : FP_DATATYPE_FIXED10))
++         continue;
++      /* every reader is an ALU slot that reads y as an ordinary source in
++       * the format of x */
++      bool ok = true;
++      for (unsigned r = 0; r < y->num_readers && ok; r++) {
++         const struct l2_op *o = &s->ops[y->readers[r]];
++         if (o->kind != L2_ALU || o->dead) {
++            ok = false;
++            break;
++         }
++         for (unsigned k = 0; k < L2_SRCS && ok; k++) {
++            if (o->src_def[k] != yi)
++               continue;
++            if (k == 3 ||
++                o->alu.src[k].datatype !=
++                   (x->width == 2 ? FP_DATATYPE_FP20 : FP_DATATYPE_FIXED10))
++               ok = false;
++         }
++      }
++      if (!ok)
++         continue;
++      for (unsigned r = 0; r < y->num_readers; r++) {
++         struct l2_op *o = &s->ops[y->readers[r]];
++         for (unsigned k = 0; k < L2_SRCS; k++)
++            if (o->src_def[k] == yi)
++               o->src_def[k] = xi;
++         x->readers[x->num_readers++] = y->readers[r];
++      }
++      uses[xi] += uses[yi] - 1;
++      uses[yi] = 0;
++      y->num_readers = 0;
++      y->dead = true;
++      cp->dead = true;
++      cp->placed = true;
++      cp->dst_def = -1;
++      cp->src_def[0] = -1;
++      s->num_propped++;
++      removed++;
++   }
+    /* an interpolation nothing reads any more */
+    if (s->reinterp) {
+       for (unsigned i = 0; i < s->num_ops; i++) {
+@@ -1416,9 +1478,10 @@ tex_ready_with_mfu(struct l2 *s, const struct l2_op *op, int64_t g,
+ static bool
+ l2_schedule(struct l2 *s)
+ {
+-   /* DW tie: the output is read from row 0 */
++   /* DW tie: the output is read from the row of the step that holds the
++    * output write; GRATE_LAYOUT_DWROW0 pins it to row 0 */
+    for (unsigned i = 0; i < s->num_ops; i++)
+-      if (s->ops[i].kind == L2_DW)
++      if (s->ops[i].kind == L2_DW && getenv("GRATE_LAYOUT_DWROW0"))
+          s->cls_row[cls_find(s, s->ops[i].cls)] = 0;
+    for (unsigned d = 0; d < s->num_defs; d++) {
+       s->defs[d].uses_left = 0;
+@@ -1715,8 +1778,9 @@ l2_schedule(struct l2 *s)
+    if (remaining)
+       return false;
+ 
+-   /* the output write: every other operation is placed; it goes on the first
+-    * step of the round of the last step that does something */
++   /* the output write: every other operation is placed; it goes in the round
++    * of the last step that does something, on the step whose row holds the
++    * output (it fires at the end of the round and reads that row) */
+    unsigned last = 0;
+    for (unsigned t = 0; t < s->steps; t++)
+       if (s->step_packets[t] || s->step_mfu[t] >= 0 || s->step_tex[t] >= 0)
+@@ -1729,7 +1793,9 @@ l2_schedule(struct l2 *s)
+       for (unsigned k = 0; k < op->num_in; k++)
+          if (!s->defs[op->in[k]].written)
+             return false;
+-      op->step = dw_step;
++      /* the output write reads the registers of the row of its step */
++      const int row = s->cls_row[cls_find(s, op->cls)];
++      op->step = dw_step + (row > 0 ? row : 0);
+       op->placed = true;
+    }
+    s->steps = dw_step + s->rows;
+@@ -2248,20 +2314,29 @@ l2_layout(struct grate_fp_shader *fp, uint64_t seq_signature, bool verbose,
+    static const unsigned windows[] = {3, 5, 8, 12, 20, 40, 1000};
+    struct cand {
+       unsigned rows, window, steps, packets;
+-      bool prop, detach, reinterp, dyn_pair;
+-   } cands[32 * ARRAY_SIZE(windows)];
++      bool prop, detach, reinterp, dyn_pair, nodup;
++   } cands[28 * ARRAY_SIZE(windows)];
+    unsigned num_cands = 0;
+ 
+    /* the quad exchange needs three register rows, as in NVIDIA's code */
+    for (unsigned rows = fp->uses_derivatives ? 3 : 1; rows <= 4; rows++) {
+-      for (unsigned w = 0; w < 8 * ARRAY_SIZE(windows); w++) {
++      for (unsigned w = 0; w < 7 * ARRAY_SIZE(windows); w++) {
++         const unsigned group = w / ARRAY_SIZE(windows);
++         /* groups 4 and 6 are +reinterp laid out as if no row were linked
++          * twice (what the program did before the duplicate link worked): it
++          * packs better for some programs; groups 5 and 6 also propagate the
++          * copies that cannot be folded */
++         const bool nodup = group == 4 || group == 6;
++         if (nodup && !fp->info.dup_rows)
++            continue;
+          memset(s, 0, sizeof(*s));
+          s->rows = rows;
+-         s->detach = w >= 2 * ARRAY_SIZE(windows);
+-         s->reinterp = w >= 4 * ARRAY_SIZE(windows);
+-         s->dyn_pair = w >= 6 * ARRAY_SIZE(windows);
++         s->nodup = nodup;
++         s->prop = group >= 5;
++         s->detach = group >= 1;
++         s->reinterp = group >= 2;
++         s->dyn_pair = group == 3;
+          s->window = windows[w % ARRAY_SIZE(windows)];
+-         s->prop = (w / ARRAY_SIZE(windows)) % 2;
+          s->verbose = verbose && getenv("GRATE_LAYOUT_VERBOSE");
+          if (!l2_extract(s, fp)) {
+             if (verbose)
+@@ -2270,6 +2345,10 @@ l2_layout(struct grate_fp_shader *fp, uint64_t seq_signature, bool verbose,
+                continue;
+             return false;
+          }
++         /* nothing to propagate: the same program as the candidate without
++          * +prop */
++         if (s->prop && !s->num_propped)
++            continue;
+          /* nothing to re-interpolate and no fetch in R2/R3: the same
+           * program as the +detach candidate */
+          if (s->reinterp && !l2_reinterp_changes(s))
+@@ -2289,9 +2368,11 @@ l2_layout(struct grate_fp_shader *fp, uint64_t seq_signature, bool verbose,
+             continue;
+          }
+          cands[num_cands++] =
+-            (struct cand){rows,     windows[w % ARRAY_SIZE(windows)],
+-                          s->steps, (unsigned)s->total_packets,
+-                          s->prop,  s->detach, s->reinterp, s->dyn_pair};
++            (struct cand){rows,        windows[w % ARRAY_SIZE(windows)],
++                          s->steps,    (unsigned)s->total_packets,
++                          s->prop,     s->detach,
++                          s->reinterp, s->dyn_pair,
++                          s->nodup};
+       }
+    }
+    /* best first: fewest steps, then packets, then rows */
+@@ -2309,12 +2390,17 @@ l2_layout(struct grate_fp_shader *fp, uint64_t seq_signature, bool verbose,
+ 
+    if (verbose && getenv("GRATE_LAYOUT_LIST"))
+       for (unsigned c = 0; c < num_cands; c++)
+-         fprintf(stderr, "GRATE LAYOUT2 cand: rows %u window %u%s%s%s: %u steps, %u packets\n",
+-                 cands[c].rows, cands[c].window, cands[c].prop ? " +prop" : "",
++         fprintf(stderr,
++                 "GRATE LAYOUT2 cand: rows %u window %u%s%s%s: %u steps, %u "
++                 "packets\n",
++                 cands[c].rows, cands[c].window,
++                 cands[c].prop ? " +prop" : "",
+                  cands[c].detach ? " +detach" : "",
+-                 cands[c].reinterp ? (cands[c].dyn_pair ? " +dynpair" : " +reinterp") : "",
+-                 cands[c].steps,
+-                 cands[c].packets);
++                 cands[c].reinterp ? (cands[c].dyn_pair ? " +dynpair"
++                                      : cands[c].nodup  ? " +reinterp-nodup"
++                                                        : " +reinterp")
++                                   : "",
++                 cands[c].steps, cands[c].packets);
+    const char *only = getenv("GRATE_LAYOUT_ONLY");
+    unsigned only_rows = 0, only_window = 0, only_reinterp = 9;
+    if (only)
+@@ -2336,8 +2422,10 @@ l2_layout(struct grate_fp_shader *fp, uint64_t seq_signature, bool verbose,
+       /* third field: 0 none, 1 reinterp (fetches keep R2/R3), 3 reinterp
+        * with a pair per class */
+       if (only && only_reinterp < 9 &&
+-          (cands[c].reinterp ? (cands[c].dyn_pair ? 3u : 1u) : 0u) !=
+-             only_reinterp)
++          (cands[c].reinterp ? (cands[c].dyn_pair ? 3u
++                                : cands[c].nodup  ? 4u
++                                                  : 1u)
++                             : 0u) != only_reinterp)
+          continue;
+       if (only && (cands[c].rows != only_rows ||
+                    (only_window && cands[c].window != only_window)))
+@@ -2345,10 +2433,11 @@ l2_layout(struct grate_fp_shader *fp, uint64_t seq_signature, bool verbose,
+       memset(s, 0, sizeof(*s));
+       s->rows = cands[c].rows;
+       s->window = cands[c].window;
+-      s->prop = cands[c].prop;
+       s->detach = cands[c].detach;
+       s->reinterp = cands[c].reinterp;
+       s->dyn_pair = cands[c].dyn_pair;
++      s->nodup = cands[c].nodup;
++      s->prop = cands[c].prop;
+       if (!l2_extract(s, fp) || !l2_schedule(s) || !l2_allocate(s))
+          continue;
+ 
+@@ -2375,9 +2464,13 @@ l2_layout(struct grate_fp_shader *fp, uint64_t seq_signature, bool verbose,
+             "GRATE LAYOUT2: rows %u window %u%s%s, %u steps, %u packets: "
+             "%s%s%s\n",
+             cands[c].rows, cands[c].window, cands[c].prop ? " +prop" : "",
+-            cands[c].reinterp ? (cands[c].dyn_pair ? " +dynpair" : " +reinterp")
+-            : cands[c].detach ? " +detach" : "", cands[c].steps,
+-            cands[c].packets, ok ? "validated" : "REJECTED by the evaluator",
++            cands[c].reinterp ? (cands[c].dyn_pair ? " +dynpair"
++                                 : cands[c].nodup  ? " +reinterp-nodup"
++                                                   : " +reinterp")
++            : cands[c].detach ? " +detach"
++                              : "",
++            cands[c].steps, cands[c].packets,
++            ok ? "validated" : "REJECTED by the evaluator",
+             !ok && why ? ": " : "", !ok && why ? why : "");
+       if (ok) {
+          free_lists(&old_steps, &old_alus, &old_mfus);
+diff --git a/src/gallium/drivers/grate/fp/tgsi.c b/src/gallium/drivers/grate/fp/tgsi.c
+index c28ed950b92..340c8f917ac 100644
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -1682,7 +1682,9 @@ emit_tgsi_input(struct grate_fp_shader *fp, const struct tgsi_full_declaration *
+    const unsigned row = decl->Range.First;
+    /* x and y only: link them into columns 2 and 3 as well */
+    if (decl->Declaration.UsageMask && !(decl->Declaration.UsageMask & 0xc) &&
+-       decl->Declaration.Semantic != TGSI_SEMANTIC_COLOR && row < 32 &&
++       !(decl->Declaration.Semantic &&
++         decl->Semantic.Name == TGSI_SEMANTIC_COLOR) &&
++       row < 32 &&
+        fp->info.num_dup_inputs < ARRAY_SIZE(fp->info.dup_inputs) &&
+        !getenv("GRATE_NO_DUP_LINK") &&
+        !(getenv("GRATE_INDST") && fp->info.num_inputs == 0)) {
+@@ -1696,8 +1698,10 @@ emit_tgsi_input(struct grate_fp_shader *fp, const struct tgsi_full_declaration *
+    fp->info.inputs[fp->info.num_inputs].src = src;
+    fp->info.inputs[fp->info.num_inputs].dst = dst;
+ 
+-   if (decl->Declaration.Semantic == TGSI_SEMANTIC_COLOR)
+-      fp->info.color_input = decl->Range.First;
++   /* grate_state.c flags this entry of the link table when flat shading */
++   if (decl->Declaration.Semantic &&
++       decl->Semantic.Name == TGSI_SEMANTIC_COLOR)
++      fp->info.color_input = fp->info.num_inputs;
+ 
+    fp->info.num_inputs++;
+ }
+diff --git a/src/gallium/drivers/grate/grate_program.c b/src/gallium/drivers/grate/grate_program.c
+index c575ee50d4a..af47a3dd448 100644
+--- a/src/gallium/drivers/grate/grate_program.c
++++ b/src/gallium/drivers/grate/grate_program.c
+@@ -179,18 +179,48 @@ grate_delete_vs_state(struct pipe_context *pcontext, void *so)
+  * (see fp/blend.c). The stage is one more sequencer instruction, which
+  * reads the destination pixel into R0/R1, and its ALU packets. With more
+  * than one register row the program is a whole number of rounds long and the
+- * rows of a step are those of its index modulo `rows`: the stage becomes the
+- * first step of one more round (it reads the destination into the row 0
+- * registers and the output write on it reads R2/R3 of row 0), followed by
+- * empty steps to the end of that round.
++ * rows of a step are those of its index modulo `rows`: the stage becomes one
++ * step of one more round, the one on the row of the application's output
++ * write (it reads the destination into R0/R1 of that row and the output
++ * write on it reads R2/R3 of that row), with empty steps around it. Its ALU
++ * packets are on the first step of the round.
+  */
++
++/* The row of the application's output write: the last step that stores. */
++static unsigned
++blend_output_row(const struct grate_shader_blob *source, unsigned rows)
++{
++   unsigned row = 0;
++
++   for (unsigned i = 0; i < (unsigned)source->num_commands;) {
++      uint32_t command = source->commands[i++];
++      unsigned opcode = command >> 28;
++      unsigned reg = (command >> 16) & 0xfff;
++      unsigned count = command & 0xffff;
++      if (opcode == 4)
++         continue;
++      if ((opcode != 1 && opcode != 2) ||
++          count > (unsigned)source->num_commands - i)
++         break;
++      if (opcode == 2 && reg == REG_TGR3D_DW_INST_DATA)
++         for (unsigned j = 0; j < count; j++)
++            if ((source->commands[i + j] & 3) == TGR3D_DATA_OP_ST)
++               row = j % rows;
++      i += count;
++   }
++   return row;
++}
++
+ static bool
+ create_blend_blob(const struct grate_shader_blob *source, unsigned fp_count,
+                   unsigned alu_count, unsigned rows, uint32_t key,
+                   struct grate_shader_blob *output)
+ {
+    uint32_t blend_words[GRATE_FP_BLEND_MAX_PACKETS * 8];
+-   unsigned packets = grate_fp_blend_alu(key, blend_words);
++   const unsigned row = blend_output_row(source, rows);
++   if (getenv("GRATE_PACKING_DEBUG"))
++      fprintf(stderr, "GRATE BLEND: output on row %u of %u\n", row, rows);
++   unsigned packets = grate_fp_blend_alu(key, row, blend_words);
+ 
+    if (!packets) {
+       grate_loge("blend: no ALU packets for key 0x%08x\n", key);
+@@ -291,7 +321,7 @@ create_blend_blob(const struct grate_shader_blob *source, unsigned fp_count,
+          if (bit == 16)
+             BLEND_PUSH(blend_words[j]);
+          else
+-            BLEND_PUSH(j == 0 ? last : 0);
++            BLEND_PUSH(j == ((bit == 1 || bit == 64) ? row : 0) ? last : 0);
+       }
+       if (bit == 1)
+          BLEND_PUSH(host1x_opcode_imm(REG_TGR3D_PSEQ_FLUSH, 0));
+@@ -328,7 +358,7 @@ create_blend_epochs(const struct grate_fragment_shader_state *shader,
+    };
+    struct grate_shader_blob blended;
+    uint32_t words[GRATE_FP_BLEND_MAX_PACKETS * 8];
+-   const unsigned blend_packets = grate_fp_blend_alu(key, words);
++   const unsigned blend_packets = grate_fp_blend_alu(key, 0, words);
+ 
+    if (!create_blend_blob(&block, last->steps, last->packets,
+                           shader->info.num_rows, key, &blended))
+-- 
+2.56.0
+
