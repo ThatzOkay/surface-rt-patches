@@ -16,6 +16,7 @@ Measured on one device, 2026-10-29 to 2026-11-05.
 | Area | State |
 |---|---|
 | Display, backlight, touchscreen, USB Ethernet | work |
+| Shutdown / reboot | works with patch 0032 (verified on the UEFI boot path; APX/U-Boot not yet tested) |
 | Cover keyboard | works with patch 0002 |
 | Audio (speakers) | works with patch 0001 |
 | Wi-Fi (Marvell 88W8797) | works with NetworkManager after patch 0025 |
@@ -60,6 +61,7 @@ Apply in numeric order with `patch -p1` to the kernel tree above.
 | `0029-ARM-dts-tegra30-surface-rt-enable-HDMI-via-GPIO-DD4.patch` | HDMI: PDD4 as a fixed regulator, the connector's `hdmi-pwr-supply`. Windows RT holds it high; with it low HPD stays low and DDC reads return zeros. Not yet booted. |
 | `0030-ARM-dts-tegra30-surface-rt-clock-the-digital-microphone-from-GPIO2.patch` | Microphone: DMICCLK on the codec's GPIO2 and Tegra GPIO S3 held high as the microphones' power, matching the values the Windows driver leaves while recording. Verified: the microphone records live samples. |
 | `0031-drm-tegra-gr3d-accept-relocations-on-the-PSEQ-command-odd-slots.patch` | 3D engine: the sequencer's DMA commands (used by NVIDIA's driver for fragment programs with more than one epoch, i.e. more than 32 uniform scalars) carry a buffer address in an odd `PSEQ_COMMAND` slot (`0x521 + 2n`). The Grate command stream patcher (`drivers/gpu/drm/grate`) only resolves relocations on registers in `gr3d_addr_regs[]`, so the address reached the sequencer unpatched. Adds the 16 odd slots; every word written there is then a relocation, so userspace must clear the command slots through the even slots only (Mesa patch 0046). Verified on the tablet: the constant and program DMAs and NVIDIA's two-epoch program give the expected pixels. |
+| `0032-regulator-tps65910-keep-external-control-of-always-on-rails-at-shutdown.patch` | Shutdown/reboot hang (black screen, needs a long press): `tps65910_shutdown()` released the EN1 control of the always-on CPU rail `vddctrl`, whose sleep voltage is 0 V, so the CPU lost power before the PMIC got DEV_OFF/restart. Keeps external control on always-on rails. Traced with netconsole + `initcall_debug`. Verified on the UEFI boot path (7.3.1): poweroff and reboot complete. |
 
 Sub-series:
 

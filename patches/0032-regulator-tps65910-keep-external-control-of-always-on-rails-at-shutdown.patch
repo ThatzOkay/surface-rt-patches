@@ -1,0 +1,46 @@
+From: Jerome Berclaz <26882162+jberclaz@users.noreply.github.com>
+Subject: [PATCH] regulator: tps65910: keep external control of always-on rails at shutdown
+
+tps65910_shutdown() clears the external (EN1/EN2/sleep) control of every
+regulator. On the Microsoft Surface RT (Tegra 30 + TPS65911) the CPU rail
+VDDCTRL is always-on and controlled by EN1 with a 0 V sleep voltage;
+releasing EN1 drops the CPU supply while it is still running this loop,
+so the system hangs before the PMIC receives DEV_OFF (poweroff) or the
+restart request. Symptom: black screen, PMIC and EC still powered, the
+user must hold the power button.
+
+Skip always-on rails that have external control: they keep the SoC
+alive until the final power-off/restart, which resets the PMIC anyway.
+
+Traced with netconsole + initcall_debug: the last message is the
+clearing of regulator 4 (vddctrl, ext=0x1); "done" is never printed.
+
+Tested on Microsoft Surface RT, kernel 7.3.1 (libre-tegra eab1ff1e),
+UEFI boot: poweroff and reboot complete, the PMIC switches off.
+
+Assisted-by: Claude (Anthropic)
+---
+diff --git a/drivers/regulator/tps65910-regulator.c b/drivers/regulator/tps65910-regulator.c
+index 3a3027e..4ba1a79 100644
+--- a/drivers/regulator/tps65910-regulator.c
++++ b/drivers/regulator/tps65910-regulator.c
+@@ -1244,6 +1244,19 @@ static void tps65910_shutdown(struct platform_device *pdev)
+ 		if (!pmic->rdev[i])
+ 			continue;
+ 
++		/*
++		 * Keep external control on always-on rails: they power the
++		 * SoC that is still executing this code. On the Microsoft
++		 * Surface RT the CPU rail (VDDCTRL) is controlled by EN1 and
++		 * its sleep voltage is 0, so releasing EN1 here drops the CPU
++		 * supply before the PMIC can be told to power off or restart,
++		 * leaving the system hung with the PMIC still on.
++		 */
++		if (pmic->board_ext_control[i] &&
++		    pmic->rdev[i]->constraints &&
++		    pmic->rdev[i]->constraints->always_on)
++			continue;
++
+ 		err = tps65910_set_ext_sleep_config(pmic, i, 0);
+ 		if (err < 0)
+ 			dev_err(&pdev->dev,
