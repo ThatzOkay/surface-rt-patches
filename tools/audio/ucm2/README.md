@@ -11,6 +11,7 @@ patch 0030 clocks from the codec's GPIO2) and the headset microphone, which appe
 | `Tegra/wm8962/Surface-RT.conf` | verb list and `BootSequence` (speaker volume 110, digital capture gain 127, Input Mode Digital) |
 | `Tegra/wm8962/Surface-RT-HiFi.conf` | the devices `Speaker`, `Headphones`, `Mic`, `Headset` |
 | `conf.d/tegra/Microsoft Surface RT WM8962.conf` | symlink the lookup uses: driver `tegra` (`/proc/asound/cards`), card long name `Microsoft Surface RT WM8962` |
+| `conf.d/tegra/Microsoft-SurfacewithWindowsRT-PV.conf` | the same, for a boot through the Microsoft UEFI firmware (Golden Keys + Yahallo, systemd-boot): the long name then comes from SMBIOS (reported in surface-rt-patches#17) |
 
 ## Verified on the device (2026-11-05, r22 / kernel 7.0.1-r17, PipeWire 1.6.9, alsa-ucm-conf from Alpine edge)
 
@@ -42,7 +43,7 @@ ALSA mixer-path model (a custom ACP profile-set plus paths, selected by a udev r
 ```sh
 cp -r /usr/share/alsa/ucm2 ~/ucm2-test           # a private copy of the system tree
 cp -r Tegra/wm8962 ~/ucm2-test/Tegra/
-cp -P "conf.d/tegra/Microsoft Surface RT WM8962.conf" ~/ucm2-test/conf.d/tegra/
+cp -P conf.d/tegra/*.conf ~/ucm2-test/conf.d/tegra/
 ALSA_CONFIG_UCM2=$HOME/ucm2-test alsaucm -c "Microsoft Surface RT WM8962" set _verb HiFi list _devices
 systemctl --user set-environment ALSA_CONFIG_UCM2=$HOME/ucm2-test && systemctl --user restart wireplumber   # until logout
 ```
@@ -51,10 +52,12 @@ systemctl --user set-environment ALSA_CONFIG_UCM2=$HOME/ucm2-test && systemctl -
 
 ```sh
 sudo cp -r Tegra/wm8962 /usr/share/alsa/ucm2/Tegra/
-sudo cp -P "conf.d/tegra/Microsoft Surface RT WM8962.conf" /usr/share/alsa/ucm2/conf.d/tegra/
+sudo cp -P conf.d/tegra/*.conf /usr/share/alsa/ucm2/conf.d/tegra/
 systemctl --user restart wireplumber
 ```
 
 `tools/build/make-image.sh` installs these files (package `surface-rt-audio`, staged by `tools/build/prepare-audio.py`; `AUDIO_PROFILE=0` omits it)
 and checks them in the finished image. Untested until the next flash.
-`BootSequence` only runs with `alsaucm boot` at boot, not when WirePlumber activates the profile.
+`BootSequence` only runs with `alsaucm boot` at boot, not when WirePlumber activates the profile. So the `Mic` device's
+`EnableSequence` also sets `Digital Capture Volume 127,127` (+23 dB): a UEFI tester found the control left at 96 (0 dB) with PulseAudio, which
+does not drive `Digital Capture` and applies software gain, so speech at 30 cm peaked near -46 dBFS. Checked on the tablet (2026-11-19, kernel 7.0.1): activating the Mic profile sets the control to 127,127 (96,96 before) and the card is found by its SMBIOS long name `Microsoft-SurfacewithWindowsRT-PV`, which this APX-booted tablet reports too. The speech level at 127 was not measured (the one recording attempted was tapping on the microphone).
