@@ -1,0 +1,69 @@
+From 1177f68a448595bea6fc84e0ee1497128ccf380c Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Sat, 21 Nov 2026 02:02:31 +0100
+Subject: [PATCH] grate: fragment loops are refused like NVIDIA's compiler
+ refuses them
+
+The glmark2 loop scene with a uniform bound printed GRATE FRAG TGSI
+UNIMPLEMENTED: 0x63 BGNLOOP, which reads like an opcode still to write.
+It is not: NVIDIA's fragment compiler (cgtest 1 2 on the same GLSL)
+refuses a for loop whose bound is not a constant, error C5013 "profile
+does not support "for" statements and "for" could not be unrolled" (and
+C5053 for break), while a constant bound is unrolled (5 iterations are
+7 instructions, 100 are 102) and a big if/else is flattened (14
+instructions, no branch). The fragment unit has no branches, so
+refusing the shader is what matching NVIDIA means.
+
+The refusal says so. A comment on the vertex stage's
+max_control_flow_depth records why it stays 0 although vp/tgsi.c now
+translates loops: with 0 nir_to_tgsi flattens every if, as NVIDIA's
+vertex compiler does.
+
+Checked: cgtest 1 2 on floop-glmark, floop-simple, floop-break,
+floop-const5, floop-const100 and fif-big (the results above); the
+glmark2 loop scene with fragment-uniform=true prints the new line and
+is refused as before.
+---
+ src/gallium/drivers/grate/fp/tgsi.c      | 9 +++++++++
+ src/gallium/drivers/grate/grate_screen.c | 5 +++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/src/gallium/drivers/grate/fp/tgsi.c b/src/gallium/drivers/grate/fp/tgsi.c
+index 340c8f917ac..ffdba0a2b3a 100644
+--- a/src/gallium/drivers/grate/fp/tgsi.c
++++ b/src/gallium/drivers/grate/fp/tgsi.c
+@@ -1653,6 +1653,15 @@ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *
+       fprintf(stderr, "GRATE FRAG TGSI UNIMPLEMENTED: 0x%02x %s\n",
+               inst->Instruction.Opcode,
+               tgsi_get_opcode_name(inst->Instruction.Opcode));
++      if (inst->Instruction.Opcode == TGSI_OPCODE_BGNLOOP)
++         /* not a gap to fill: the fragment unit has no branches, and
++          * NVIDIA's compiler refuses the same shader (cgtest 1 2 on a for
++          * loop with a uniform bound: error C5013, profile does not
++          * support "for" statements and "for" could not be unrolled; a
++          * constant bound is unrolled). Matching it means refusing too. */
++         fprintf(stderr, "GRATE FRAG: a loop whose bound is not a constant "
++                         "cannot run on the fragment unit; NVIDIA's compiler "
++                         "refuses it too (C5013), the shader is refused\n");
+       fp->allocation_failed = true;
+       break;
+    }
+diff --git a/src/gallium/drivers/grate/grate_screen.c b/src/gallium/drivers/grate/grate_screen.c
+index 2eda6b86f5b..f36a3c3ac27 100644
+--- a/src/gallium/drivers/grate/grate_screen.c
++++ b/src/gallium/drivers/grate/grate_screen.c
+@@ -308,6 +308,11 @@ grate_screen_init_shader_caps(struct grate_screen *screen)
+    caps->max_alu_instructions = 1024;
+    caps->max_tex_instructions = 0;
+    caps->max_tex_indirections = 0;
++   /* Stays 0 although vp/tgsi.c translates loops and ifs into BRA: with 0
++    * nir_to_tgsi flattens every if whatever its size (peephole_select limit
++    * ~0), which is what NVIDIA's compiler does (an 8+8 statement if/else is
++    * 87 instructions without a branch, docs/grate-vertex-control-flow.md).
++    * Only loops reach the BRA path. */
+    caps->max_control_flow_depth = 0;
+    caps->max_inputs = 16;
+    caps->max_outputs = 16;
+-- 
+2.56.0
+
