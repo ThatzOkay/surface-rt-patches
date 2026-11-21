@@ -1,0 +1,49 @@
+From: Jerome Berclaz <26882162+jberclaz@users.noreply.github.com>
+Subject: [PATCH] ARM: tegra: mask imprecise aborts before disabling the data cache
+
+On the Microsoft Surface RT (Tegra 30, Cortex-A9 r2p9) booted through
+U-Boot, taking a CPU offline hangs the system, and so does every
+suspend, since suspend takes the secondary CPUs offline first.
+
+Step markers written by the dying CPU to a PMC scratch register show it
+stopping inside tegra_disable_clean_inv_dcache(), right after SCTLR.C has
+been cleared and the CPU has left SMP coherency, at a different point in
+each build. Removing the PL310 from the devicetree does not change this.
+Masking imprecise aborts and FIQs before the cache is disabled lets the
+CPU get through the flush (ISR.A is clear when the mask is set, so the
+abort arrives during the cache shutdown, and taking it in that state
+wedges the CPU).
+
+tegra30_cpu_shutdown() already masks imprecise aborts, but only after the
+cache has been disabled. Mask them, and FIQs, at the start of
+tegra_disable_clean_inv_dcache(), which all the power-down paths (hotplug,
+LP2 cpuidle, suspend) go through. They are not re-enabled on the way down,
+and __tegra_cpu_reset_handler masks them again on wake-up.
+
+On the Surface RT this is needed together with "ARM: tegra: use a direct
+call to power off a dying CPU". Tested with both on kernel 7.3.1
+(libre-tegra eab1ff1e), U-Boot RAM boot: 10 rounds of taking cpu1-3
+offline and online, and 5 consecutive "deep" (LP2) suspend/resume cycles,
+with cpuidle off and with cpuidle (C7/CC6) enabled.
+
+Assisted-by: Claude (Anthropic)
+---
+--- a/arch/arm/mach-tegra/sleep.S
++++ b/arch/arm/mach-tegra/sleep.S
+@@ -33,6 +33,16 @@
+  * Corrupted registers: r1-r3, r6, r8, r9-r11
+  */
+ ENTRY(tegra_disable_clean_inv_dcache)
++	/*
++	 * Mask imprecise aborts and FIQs before the D-cache is disabled.
++	 * Once the cache is off and the CPU has left coherency, taking an
++	 * exception here hangs the CPU. tegra30_cpu_shutdown() masks aborts
++	 * only after this function has run; on the Microsoft Surface RT an
++	 * imprecise abort arrives in between, hanging CPU hotplug, suspend
++	 * and power-gated cpuidle. Nothing re-enables them on the way down,
++	 * and the reset handler masks them again on wake-up.
++	 */
++	cpsid	af
+ 	stmfd	sp!, {r0, r4-r5, r7, r9-r11, lr}
+ 	dmb					@ ensure ordering
+ 

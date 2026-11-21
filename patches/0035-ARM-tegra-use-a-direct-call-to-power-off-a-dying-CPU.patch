@@ -1,0 +1,58 @@
+From: Jerome Berclaz <26882162+jberclaz@users.noreply.github.com>
+Subject: [PATCH] ARM: tegra: use a direct call to power off a dying CPU
+
+tegra_cpu_die() disables the data cache and leaves SMP coherency, then
+calls the SoC's shutdown routine through the tegra_hotplug_shutdown
+function pointer. On the Microsoft Surface RT (Tegra 30, Cortex-A9
+r2p9) booted through U-Boot, that indirect call hangs the dying CPU: it
+never reaches the flow-controller writes in tegra30_cpu_shutdown(), so
+every CPU offline, and with it every suspend, hangs the system.
+
+Reading the pointer before the cache is disabled does not help; a direct
+branch does. Decide which routine to call while the cache is still on
+and branch to it directly. The LP2 cpuidle path already reaches
+tegra30_cpu_shutdown() through direct branches from assembly and does
+not hang.
+
+Tested on a Surface RT, kernel 7.3.1 (libre-tegra eab1ff1e), U-Boot RAM
+boot, together with "ARM: tegra: mask imprecise aborts before disabling
+the data cache": 10 rounds of taking cpu1-3 offline and online, and 5
+consecutive "deep" (LP2) suspend/resume cycles, both with cpuidle off
+and with cpuidle (C7/CC6) enabled.
+
+Assisted-by: Claude (Anthropic)
+---
+--- a/arch/arm/mach-tegra/hotplug.c
++++ b/arch/arm/mach-tegra/hotplug.c
+@@ -37,16 +37,29 @@
+  */
+ void tegra_cpu_die(unsigned int cpu)
+ {
++	bool t20;
++
+ 	if (!tegra_hotplug_shutdown) {
+ 		WARN(1, "hotplug is not yet initialized\n");
+ 		return;
+ 	}
+ 
++	/* Decide while the data cache is still on. */
++	t20 = IS_ENABLED(CONFIG_ARCH_TEGRA_2x_SOC) &&
++	      tegra_hotplug_shutdown == tegra20_hotplug_shutdown;
++
+ 	/* Clean L1 data cache */
+ 	tegra_disable_clean_inv_dcache(TEGRA_FLUSH_CACHE_LOUIS);
+ 
+-	/* Shut down the current CPU. */
+-	tegra_hotplug_shutdown();
++	/*
++	 * Shut down the current CPU with a direct branch: the data cache is
++	 * off and this CPU has left coherency, and the indirect call through
++	 * tegra_hotplug_shutdown hangs the Microsoft Surface RT here.
++	 */
++	if (t20)
++		tegra20_hotplug_shutdown();
++	else
++		tegra30_hotplug_shutdown();
+ 
+ 	/* Should never return here. */
+ 	BUG();
