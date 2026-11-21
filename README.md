@@ -16,7 +16,9 @@ Measured on one device, 2026-10-29 to 2026-11-05.
 | Area | State |
 |---|---|
 | Display, backlight, touchscreen, USB Ethernet | work |
-| Shutdown / reboot | works with patch 0032 (verified on the UEFI boot path; APX/U-Boot not yet tested) |
+| Shutdown / reboot | works with patch 0032 (verified on the UEFI and APX/U-Boot boot paths) |
+| Suspend (deep, LP2) | works on the APX/U-Boot boot path with patches 0034 and 0035; wakes on the RTC alarm and the power button. Under UEFI only `s2idle` is offered |
+| CPU idle (C7, CC6) | works on the APX/U-Boot boot path with patches 0034 and 0035 (no `cpuidle.off=1`). The EFI devicetree disables it |
 | Cover keyboard | works with patch 0002 |
 | Audio (speakers) | works with patch 0001 |
 | Wi-Fi (Marvell 88W8797) | works with NetworkManager after patch 0025 |
@@ -63,6 +65,8 @@ Apply in numeric order with `patch -p1` to the kernel tree above.
 | `0031-drm-tegra-gr3d-accept-relocations-on-the-PSEQ-command-odd-slots.patch` | 3D engine: the sequencer's DMA commands (used by NVIDIA's driver for fragment programs with more than one epoch, i.e. more than 32 uniform scalars) carry a buffer address in an odd `PSEQ_COMMAND` slot (`0x521 + 2n`). The Grate command stream patcher (`drivers/gpu/drm/grate`) only resolves relocations on registers in `gr3d_addr_regs[]`, so the address reached the sequencer unpatched. Adds the 16 odd slots; every word written there is then a relocation, so userspace must clear the command slots through the even slots only (Mesa patch 0046). Verified on the tablet: the constant and program DMAs and NVIDIA's two-epoch program give the expected pixels. |
 | `0032-regulator-tps65910-keep-external-control-of-always-on-rails-at-shutdown.patch` | Shutdown/reboot hang (black screen, needs a long press): `tps65910_shutdown()` released the EN1 control of the always-on CPU rail `vddctrl`, whose sleep voltage is 0 V, so the CPU lost power before the PMIC got DEV_OFF/restart. Keeps external control on always-on rails. Traced with netconsole + `initcall_debug`. Verified on the UEFI boot path (7.3.1): poweroff and reboot complete. |
 | `0033-drm-grate-arm-connector-hotplug-detection-once-the-connectors-exist.patch` | HDMI hotplug: `drm_kms_helper_poll_init()` runs before the connectors exist, so the HPD callback of the `display-connector` bridge was never set and the connector status did not follow the cable (it only updated after `echo detect > .../status`). Re-arms polling just before `drm_dev_register()`. Verified on the UEFI boot path: the status follows plug and unplug. |
+| `0034-ARM-tegra-mask-imprecise-aborts-before-disabling-the-data-cache.patch` | CPU hotplug / suspend / cpuidle (U-Boot path): a CPU being powered down stopped inside `tegra_disable_clean_inv_dcache()`, right after the D-cache was turned off, at a different point in each build (not the PL310). Masks imprecise aborts and FIQs before the cache is disabled; `tegra30_cpu_shutdown()` only did so after the flush. Needed together with 0035. |
+| `0035-ARM-tegra-use-a-direct-call-to-power-off-a-dying-CPU.patch` | CPU hotplug / suspend (U-Boot path): with 0034, the indirect call through `tegra_hotplug_shutdown` still hung the dying CPU (also when the pointer is read before the flush); a direct branch works, as in the LP2 cpuidle path. Verified with 0034: 10 rounds of cpu1-3 offline/online and 5 LP2 suspend/resume cycles, with and without cpuidle. |
 
 Sub-series:
 
