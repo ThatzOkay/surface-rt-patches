@@ -1,0 +1,110 @@
+From: Jerome Berclaz <26882162+jberclaz@users.noreply.github.com>
+Subject: [PATCH] ARM: tegra: add CFI type hashes to indirectly called sleep functions
+
+tegra20/30_hotplug_shutdown() and tegra20/30_sleep_core_finish() are
+written in assembly and called from C through function pointers
+(tegra_hotplug_shutdown in hotplug.c, tegra_sleep_core_finish in pm.c).
+They are declared with ENTRY(), so with CONFIG_CFI they have no
+__kcfi_typeid hash in front of them and every indirect call traps
+(udf 0x83e1). The trap happens with the console suspended or on a CPU
+that is going offline, so the system just hangs:
+
+ - CPU hotplug: the dying CPU traps in tegra_cpu_die() and cpu_down()
+   never completes, which blocks suspend (disable_nonboot_cpus).
+ - LP1 suspend: tegra_sleep_core() traps right after
+   setup_mm_for_reboot(), before SDRAM is put into self-refresh.
+
+Declare them with SYM_TYPED_FUNC_START() so they carry the type hash.
+
+Found on the Microsoft Surface RT (Tegra 30) with a clang build: the
+faulting PC, recorded in a PMC scratch register by a die notifier, was
+the kCFI check in tegra_sleep_core().
+
+Assisted-by: Claude
+---
+--- a/arch/arm/mach-tegra/sleep-tegra20.S	2026-11-21 13:12:04.361429037 -0800
++++ b/arch/arm/mach-tegra/sleep-tegra20.S	2026-11-21 13:12:04.365365343 -0800
+@@ -7,6 +7,7 @@
+  *         Gary King <gking@nvidia.com>
+  */
+ 
++#include <linux/cfi_types.h>
+ #include <linux/linkage.h>
+ 
+ #include <soc/tegra/flowctrl.h>
+@@ -89,12 +90,12 @@
+  * puts the current cpu in reset
+  * should never return
+  */
+-ENTRY(tegra20_hotplug_shutdown)
++SYM_TYPED_FUNC_START(tegra20_hotplug_shutdown)
+ 	/* Put this CPU down */
+ 	cpu_id	r0
+ 	bl	tegra20_cpu_shutdown
+ 	ret	lr			@ should never get here
+-ENDPROC(tegra20_hotplug_shutdown)
++SYM_FUNC_END(tegra20_hotplug_shutdown)
+ 
+ /*
+  * tegra20_cpu_shutdown(int cpu)
+@@ -140,7 +141,7 @@
+  * Enters suspend in LP0 or LP1 by turning off the mmu and jumping to
+  * tegra20_tear_down_core in IRAM
+  */
+-ENTRY(tegra20_sleep_core_finish)
++SYM_TYPED_FUNC_START(tegra20_sleep_core_finish)
+ 	mov     r4, r0
+ 	/* Flush, disable the L1 data cache and exit SMP */
+ 	mov     r0, #TEGRA_FLUSH_CACHE_ALL
+@@ -157,7 +158,7 @@
+ 	add	r0, r0, r1
+ 
+ 	ret	r3
+-ENDPROC(tegra20_sleep_core_finish)
++SYM_FUNC_END(tegra20_sleep_core_finish)
+ 
+ /*
+  * tegra20_tear_down_cpu
+--- a/arch/arm/mach-tegra/sleep-tegra30.S	2026-11-21 13:12:04.361458872 -0800
++++ b/arch/arm/mach-tegra/sleep-tegra30.S	2026-11-21 13:12:04.367447692 -0800
+@@ -3,6 +3,7 @@
+  * Copyright (c) 2012, NVIDIA Corporation. All rights reserved.
+  */
+ 
++#include <linux/cfi_types.h>
+ #include <linux/linkage.h>
+ 
+ #include <soc/tegra/flowctrl.h>
+@@ -179,12 +180,12 @@
+  * Powergates the current CPU.
+  * Should never return.
+  */
+-ENTRY(tegra30_hotplug_shutdown)
++SYM_TYPED_FUNC_START(tegra30_hotplug_shutdown)
+ 	/* Powergate this CPU */
+ 	mov	r0, #TEGRA30_POWER_HOTPLUG_SHUTDOWN
+ 	bl	tegra30_cpu_shutdown
+ 	ret	lr			@ should never get here
+-ENDPROC(tegra30_hotplug_shutdown)
++SYM_FUNC_END(tegra30_hotplug_shutdown)
+ 
+ /*
+  * tegra30_cpu_shutdown(unsigned long flags)
+@@ -281,7 +282,7 @@
+  * Enters suspend in LP0 or LP1 by turning off the MMU and jumping to
+  * tegra30_tear_down_core in IRAM
+  */
+-ENTRY(tegra30_sleep_core_finish)
++SYM_TYPED_FUNC_START(tegra30_sleep_core_finish)
+ 	mov	r4, r0
+ 	/* Flush, disable the L1 data cache and exit SMP */
+ 	mov	r0, #TEGRA_FLUSH_CACHE_ALL
+@@ -311,7 +312,7 @@
+ 	add	r0, r0, r1
+ 
+ 	ret	r3
+-ENDPROC(tegra30_sleep_core_finish)
++SYM_FUNC_END(tegra30_sleep_core_finish)
+ 
+ /*
+  * tegra30_pm_secondary_cpu_suspend(unsigned long unused_arg)

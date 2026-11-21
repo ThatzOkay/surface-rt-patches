@@ -1,0 +1,28 @@
+From: Jerome Berclaz <26882162+jberclaz@users.noreply.github.com>
+Subject: [PATCH] ARM: dts: tegra30: surface-rt: use LP1 for system suspend
+
+LP1 (SDRAM self-refresh, CPU rail off, SoC clocks at 32 kHz) works on the
+Surface RT once the PMC counts the CPU power-good time correctly ("soc/
+tegra: pmc: count the LP1 CPU power-good time in CLK_M cycles") and the
+indirectly called sleep functions carry CFI type hashes ("ARM: tegra: add
+CFI type hashes to indirectly called sleep functions").
+
+Measured battery drain in suspend: about 33 mA in LP1 versus about 63 mA
+in LP2. Wake-up by RTC alarm, power button and Windows button tested.
+
+The EFI variant deletes the property (suspend is handled differently when
+booted by the Microsoft firmware), so it is not affected.
+
+Assisted-by: Claude
+---
+--- a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts	2026-11-21 13:55:03.041275203 -0800
++++ b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts	2026-11-21 13:55:03.066032813 -0800
+@@ -458,7 +458,7 @@
+ 	pmc@7000e400 {
+ 		status = "okay";
+ 		nvidia,invert-interrupt;
+-		nvidia,suspend-mode = <2>;
++		nvidia,suspend-mode = <1>;
+ 		nvidia,cpu-pwr-good-time = <2000>;
+ 		nvidia,cpu-pwr-off-time = <200>;
+ 		nvidia,core-pwr-good-time = <3845 3845>;
