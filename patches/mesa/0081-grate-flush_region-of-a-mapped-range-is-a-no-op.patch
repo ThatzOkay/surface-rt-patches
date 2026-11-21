@@ -1,0 +1,58 @@
+From fcd4ffbf8a5d3d19ed83a9199f96b71257a60774 Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Sat, 21 Nov 2026 01:23:40 +0100
+Subject: [PATCH] grate: flush_region of a mapped range is a no-op
+
+grate_resource_transfer_flush_region() was a stub that logged "GRATE
+TODO" for every call when GRATE_DEBUG had "unimplemented". The state
+tracker calls it for every explicit-flush map, which includes the
+upload manager's map of a user vertex array on each draw, so a game
+that draws from client arrays printed it once per draw: 254431 lines
+in a 43 MB log in a few minutes of Xash3D (Half-Life), which also made
+the game very slow while the log was written and buried every other
+message.
+
+The mapping is the buffer object itself (a MAP_SHARED mmap, no staging
+copy), so there is nothing to write back. Use Mesa's no-op
+u_default_transfer_flush_region.
+
+Checked: libgallium builds; xash3d on the tablet with the candidate
+library (sha 368405ce5d57) logs 0 flush_region lines (the same run had
+254431 before) and the walls, floors and characters render.
+---
+ src/gallium/drivers/grate/grate_resource.c | 12 +++---------
+ 1 file changed, 3 insertions(+), 9 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/grate_resource.c b/src/gallium/drivers/grate/grate_resource.c
+index c563cdb4560..161fc7c6c93 100644
+--- a/src/gallium/drivers/grate/grate_resource.c
++++ b/src/gallium/drivers/grate/grate_resource.c
+@@ -116,14 +116,6 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
+    return ret;
+ }
+ 
+-static void
+-grate_resource_transfer_flush_region(struct pipe_context *pcontext,
+-                                     struct pipe_transfer *transfer,
+-                                     const struct pipe_box *box)
+-{
+-   grate_unimplemented();
+-}
+-
+ static void
+ grate_resource_transfer_unmap(struct pipe_context *pcontext,
+                               struct pipe_transfer *transfer)
+@@ -896,7 +888,9 @@ grate_context_resource_init(struct pipe_context *pcontext)
+    grate_trace();
+    pcontext->buffer_map = grate_resource_transfer_map;
+    pcontext->texture_map = grate_resource_transfer_map;
+-   pcontext->transfer_flush_region = grate_resource_transfer_flush_region;
++   /* the mapping is the buffer object itself, there is no staging copy
++    * to write back */
++   pcontext->transfer_flush_region = u_default_transfer_flush_region;
+    pcontext->buffer_unmap = grate_resource_transfer_unmap;
+    pcontext->texture_unmap = grate_resource_transfer_unmap;
+    pcontext->buffer_subdata = u_default_buffer_subdata;
+-- 
+2.56.0
+
