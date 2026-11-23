@@ -1,0 +1,107 @@
+From d3a25e0d46332c53477190be6f6c98f1adb14766 Mon Sep 17 00:00:00 2001
+From: Kayori <thatzokay@proton.me>
+Date: Sun, 22 Nov 2026 18:22:05 +0100
+Subject: [PATCH] grate: report refused programs to the state tracker
+
+A fragment or vertex program the compiler refuses (for example KWin's
+colour-pipeline shader, "scalar register bank exhausted") made
+create_fs_state/create_vs_state return NULL without a message. The GL
+program still linked, the application drew with it, and
+grate_draw_vbo() skipped every draw without a trace.
+
+When the state tracker asks (report_compile_error, set at link time),
+set error_message like i915 and r300 do. The link now fails and
+applications fall back to a simpler shader. Also print a line when a
+draw is skipped for lack of a program (GRATE_DEBUG=unimplemented).
+
+Checked on the tablet (installed library 7c524d15f8dd): KWin logs
+"Failed to link shader" for the 7 colour-pipeline variants, then
+"Falling back to shaders without TransformColorspace"; no skipped draw,
+no gr3d reset, lockscreen and Plasma start and run.
+---
+ src/gallium/drivers/grate/grate_draw.c    |  7 +++++-
+ src/gallium/drivers/grate/grate_program.c | 27 +++++++++++++++++++++--
+ 2 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/grate_draw.c b/src/gallium/drivers/grate/grate_draw.c
+index e9f34378a51..3e3dfbd8b05 100644
+--- a/src/gallium/drivers/grate/grate_draw.c
++++ b/src/gallium/drivers/grate/grate_draw.c
+@@ -533,8 +533,13 @@ grate_draw_vbo(struct pipe_context *pcontext,
+ 
+    /* A shader that failed to compile is never created, so the state tracker
+     * binds none. Skip the draw instead of dereferencing it. */
+-   if (!context->vshader || !context->fshader)
++   if (!context->vshader || !context->fshader) {
++      if (grate_debug & GRATE_DEBUG_UNIMPLEMENTED)
++         mesa_logw("GRATE: draw skipped, no %s (%u vertices, %u instances)\n",
++                   !context->vshader ? "vertex program" : "fragment program",
++                   draws[0].count, info->instance_count);
+       return;
++   }
+ 
+    if (context->blend_dual && !context->dual_pass) {
+       grate_draw_dual(pcontext, info, drawid_offset, indirect, draws,
+diff --git a/src/gallium/drivers/grate/grate_program.c b/src/gallium/drivers/grate/grate_program.c
+index 64dc374e3be..a2fed29cd40 100644
+--- a/src/gallium/drivers/grate/grate_program.c
++++ b/src/gallium/drivers/grate/grate_program.c
+@@ -101,6 +101,19 @@ grate_vs_tgsi_transform(const struct tgsi_token *tokens_in)
+    return tgsi_transform_shader(tokens_in, new_len, &ctx.base);
+ }
+ 
++/**
++ * Tell the state tracker that a program cannot be compiled, if it asked to
++ * be told (it does when linking): the GL program then fails to link and the
++ * application can fall back to a simpler shader, instead of drawing with no
++ * program at all (see grate_draw_vbo()).
++ */
++static void
++grate_report_compile_error(const struct pipe_shader_state *template,
++                           const char *message)
++{
++   if (template->report_compile_error)
++      ((struct pipe_shader_state *)template)->error_message = strdup(message);
++}
+ 
+ static void *
+ grate_create_vs_state(struct pipe_context *pcontext,
+@@ -129,8 +142,11 @@ grate_create_vs_state(struct pipe_context *pcontext,
+    }
+ 
+    struct tgsi_token *new_tokens = grate_vs_tgsi_transform(so->base.tokens);
+-   if (!new_tokens)
++   if (!new_tokens) {
++      grate_report_compile_error(template, "cannot transform the vertex "
++                                           "program");
+       return NULL;
++   }
+ 
+    struct tgsi_parse_context parser;
+    unsigned ok = tgsi_parse_init(&parser, new_tokens);
+@@ -141,7 +157,10 @@ grate_create_vs_state(struct pipe_context *pcontext,
+    tgsi_parse_free(&parser);
+    if (vp.failed) {
+       /* refused: the draws that need this shader are skipped, see
+-       * grate_draw_vbo() */
++       * grate_draw_vbo(), unless the link fails because of the message */
++      grate_report_compile_error(template, "the vertex program uses "
++                                           "something the hardware "
++                                           "compiler does not support");
+       FREE(so);
+       return NULL;
+    }
+@@ -1975,6 +1994,10 @@ grate_create_fs_state(struct pipe_context *pcontext,
+    }
+ 
+    if (!grate_compile_fs(context, so, &output)) {
++      grate_report_compile_error(template, "the fragment program is too "
++                                           "large or uses something the "
++                                           "hardware compiler does not "
++                                           "support");
+       if (template->type == PIPE_SHADER_IR_NIR)
+          FREE((void *)so->base.tokens);
+       FREE(so);
+-- 
+2.56.0
+
