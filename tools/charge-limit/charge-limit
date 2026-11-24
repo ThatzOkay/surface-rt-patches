@@ -1,0 +1,107 @@
+#!/bin/sh
+# charge-limit: keep the Surface RT battery between START and STOP percent while the
+# adapter is plugged in, through the EC's "Battery Thermal Limit" register (the one
+# Windows RT's BAT0._DSM writes): 0 = charging stopped, 100 = full charge rate.
+# The EC keeps the value across suspend, reboot and power-off, so "stop" and every
+# exit path write 100 (normal charging). See README.md.
+#
+# Usage: charge-limit run | stop | status | hold | limit | full | on | off
+#   run     loop (systemd service); applies the policy every $INTERVAL s
+#   stop    write 100 (normal charging) - used by the service's ExecStop
+#   status  show EC limit value, battery state, mode
+#   hold    MODE=hold: never charge while plugged in (battery idle), except below FLOOR
+#   limit   MODE=limit: keep the battery between START and STOP (default)
+#   full    MODE=full: charge normally to 100 %
+#           (hold/limit/full are saved in $CONF and applied at once)
+#   on/off  one-shot: write 100 / 0 (testing; the service overrides it within INTERVAL)
+
+CONF=/etc/charge-limit.conf
+START=75      # resume charging at or below this
+STOP=80       # stop charging at or above this
+FLOOR=20      # always charge below this, whatever the settings
+INTERVAL=60
+ENABLED=1     # 0 = no limit (charge to 100 %), same as MODE=full
+MODE=limit    # limit | hold | full
+[ -r "$CONF" ] && . "$CONF"
+
+BUS=4; ADDR=0x0a
+BAT=/sys/class/power_supply/surface-rt-battery
+AC=/sys/class/power_supply/surface-rt-ac-adapter
+
+ec_fw_ok() {
+	# Windows uses register 0x00 when the EC firmware major (reg 0x04) is >= 0x0A,
+	# 0x0D otherwise. Only 0x00 has been tested (EC fw 0x0a.0x0d).
+	maj=$(i2cget -f -y $BUS $ADDR 0x04 b 2>/dev/null) || return 1
+	[ $((maj)) -ge 10 ]
+}
+REG=0x00
+
+# Kernels with the surface-rt-ec charge_behaviour patch (local 0045) expose the EC
+# limit as $BAT/charge_behaviour (auto = 100, inhibit-charge = 0); use it when
+# present, and fall back to direct I2C access otherwise.
+CB=$BAT/charge_behaviour
+
+write_limit() {   # $1 = 0 or 100
+	if [ -w "$CB" ]; then
+		if [ "$1" -ge 100 ]; then echo auto; else echo inhibit-charge; fi > "$CB" 2>/dev/null && LAST=$1
+	else
+		i2cset -f -y $BUS $ADDR $REG "$1" b 2>/dev/null && LAST=$1
+	fi
+}
+read_limit() {
+	if [ -r "$CB" ]; then
+		case "$(cat "$CB")" in *"[auto]"*) echo 100 ;; *"[inhibit-charge]"*) echo 0 ;; esac
+	else
+		v=$(i2cget -f -y $BUS $ADDR $REG b 2>/dev/null) && echo $((v))
+	fi
+}
+
+apply() {
+	cap=$(cat $BAT/capacity 2>/dev/null) || return
+	ac=$(cat $AC/online 2>/dev/null)
+	want=$LAST
+	if [ "$ENABLED" != 1 ] || [ "$MODE" = full ] || [ "$cap" -lt "$FLOOR" ]; then
+		want=100
+	elif [ "$MODE" = hold ]; then
+		want=0
+	elif [ "$cap" -ge "$STOP" ]; then
+		want=0
+	elif [ "$cap" -le "$START" ]; then
+		want=100
+	fi
+	[ -z "$want" ] && want=100   # first run between START and STOP: charge
+	cur=$(read_limit)
+	if [ "$cur" != "$want" ]; then
+		write_limit "$want" && logger -t charge-limit "battery ${cap}% ac=${ac}: limit ${cur:-?} -> ${want}"
+	fi
+	LAST=$want
+}
+
+case "$1" in
+run)
+	[ -e "$CB" ] || ec_fw_ok || { logger -t charge-limit "EC firmware not supported, not limiting"; exit 1; }
+	trap 'write_limit 100; logger -t charge-limit "stopped: normal charging restored"; exit 0' TERM INT HUP
+	LAST=
+	while :; do
+		[ -r "$CONF" ] && . "$CONF"
+		apply
+		sleep "$INTERVAL" &
+		wait $!
+	done ;;
+stop)  write_limit 100 ;;
+hold|limit|full)
+	if grep -q '^MODE=' "$CONF" 2>/dev/null; then
+		sed -i "s/^MODE=.*/MODE=$1/" "$CONF"
+	else
+		echo "MODE=$1" >> "$CONF"
+	fi
+	. "$CONF"; LAST=$(read_limit); apply
+	echo "mode $1: EC limit $(read_limit), battery $(cat $BAT/capacity)%" ;;
+on)    write_limit 100 ;;
+off)   write_limit 0 ;;
+status)
+	echo "EC limit: $(read_limit) (0 = not charging, 100 = normal)"
+	echo "battery: $(cat $BAT/capacity)% $(cat $BAT/status), current $(cat $BAT/current_now) uA, ac=$(cat $AC/online)"
+	echo "policy: mode=$MODE enabled=$ENABLED start=$START stop=$STOP floor=$FLOOR" ;;
+*) echo "usage: $0 run|stop|status|hold|limit|full|on|off" >&2; exit 2 ;;
+esac

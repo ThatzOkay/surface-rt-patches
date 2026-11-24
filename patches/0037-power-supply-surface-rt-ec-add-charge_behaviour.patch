@@ -1,0 +1,196 @@
+From: Jerome Berclaz <jerome.berclaz@proton.me>
+Date: Mon, 23 Nov 2026 19:12:38 -0800
+Subject: [PATCH] power: supply: surface-rt-ec: add charge_behaviour and report
+ "Not charging"
+
+The Surface RT's Windows firmware has a "Battery Thermal Limit" _DSM
+(4c2067e3-887d-475c-9720-4af1d3ed602e) on its battery device. Function 1
+takes a value from 0 to 100, which Microsoft documents as the percentage
+of the maximum charge rate, with 0 meaning that charging is stopped. The
+firmware writes it with an SMBus byte write to EC register 0x00 when the
+EC firmware major version (register 0x04) is 10 or later, and to
+register 0x0d otherwise.
+
+On EC firmware 0x0a.0x0d the EC charges at the full rate with 100 and
+does not charge at all with any lower value (0, 25, 50, 80, 90 and 99
+were tried): the adapter keeps powering the system and the battery
+current drops to zero within a minute. The EC keeps the value across
+adapter removal, suspend, reboot and power-off.
+
+Expose this as the charge_behaviour property of the battery: "auto"
+writes 100, "inhibit-charge" writes 0. Pick the register the way the
+Windows firmware does; only register 0x00 has been tested.
+
+Also report POWER_SUPPLY_STATUS_NOT_CHARGING instead of DISCHARGING when
+the adapter is online and the EC is not charging, as happens with
+charging inhibited.
+
+Tested on a Microsoft Surface RT with a 7.3.1-based kernel (libre-tegra
+tree): charge_behaviour reads "auto [inhibit-charge]" and the status is
+"Not charging" while inhibited on AC; writing "auto" resumes charging
+at about 0.9 A.
+
+The register and its semantics were found, and this change and its
+description written, with the help of an AI coding assistant (Claude),
+from the ACPI tables of the device's Windows firmware and Microsoft's
+battery documentation; I reviewed the change and tested it on my device
+as described above.
+
+Signed-off-by: Jerome Berclaz <jerome.berclaz@proton.me>
+---
+ drivers/power/supply/surface-rt-ec.c | 96 +++++++++++++++++++++++++++-
+ 1 file changed, 94 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/power/supply/surface-rt-ec.c b/drivers/power/supply/surface-rt-ec.c
+index b175bc63c504..164f475f97f8 100644
+--- a/drivers/power/supply/surface-rt-ec.c
++++ b/drivers/power/supply/surface-rt-ec.c
+@@ -11,7 +11,10 @@
+ #include <linux/types.h>
+ 
+ /* Register Addresses (B=byte; W=word; S=string) */
++#define REGB_CHARGE_LIMIT		0x00
+ #define REGB_STATUS			0x02
++#define REGB_FW_MAJOR			0x04
++#define REGB_CHARGE_LIMIT_OLD		0x0d
+ #define REGW_VOLTAGE_NOW		0x20
+ #define REGW_CURRENT_NOW		0x24
+ #define REGW_CAPACITY			0x28
+@@ -37,6 +40,7 @@ struct srt_ec_device {
+ 
+ 	unsigned int technology;
+ 	unsigned int capacity;
++	u8 charge_limit_reg;
+ 
+ 	const char *serial;
+ 	char manufacturer[13];
+@@ -45,6 +49,7 @@ struct srt_ec_device {
+ 
+ static const enum power_supply_property srt_bat_power_supply_props[] = {
+ 	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+ 	POWER_SUPPLY_PROP_CHARGE_NOW,
+ 	POWER_SUPPLY_PROP_CHARGE_FULL,
+ 	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+@@ -126,6 +131,64 @@ static int srt_bat_get_value(struct i2c_client *client, int reg, int *val)
+ 	return 0;
+ }
+ 
++/*
++ * The charge limit is the value of the "Battery Thermal Limit" _DSM of the
++ * Windows firmware (0 to 100 percent of the maximum charge rate). The EC
++ * charges at the full rate with 100 and does not charge at all with any
++ * lower value. It keeps the value across suspend, reboot and power-off.
++ */
++#define SRT_CHARGE_LIMIT_NONE		100
++#define SRT_CHARGE_LIMIT_INHIBIT	0
++
++static int srt_ac_online(struct i2c_client *client)
++{
++	int ret = i2c_smbus_read_byte_data(client, REGB_ONLINE);
++
++	if (ret < 0)
++		return ret;
++
++	return ret & BIT(0);
++}
++
++static int srt_bat_power_supply_set_property(struct power_supply *psy,
++					     enum power_supply_property psp,
++					     const union power_supply_propval *val)
++{
++	struct srt_ec_device *srt = power_supply_get_drvdata(psy);
++	u8 limit;
++	int ret;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		switch (val->intval) {
++		case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
++			limit = SRT_CHARGE_LIMIT_NONE;
++			break;
++		case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
++			limit = SRT_CHARGE_LIMIT_INHIBIT;
++			break;
++		default:
++			return -EINVAL;
++		}
++
++		ret = i2c_smbus_write_byte_data(srt->client,
++						srt->charge_limit_reg, limit);
++		if (ret < 0)
++			return ret;
++
++		power_supply_changed(psy);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int srt_bat_property_is_writeable(struct power_supply *psy,
++					 enum power_supply_property psp)
++{
++	return psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR;
++}
++
+ static int srt_bat_power_supply_get_property(struct power_supply *psy,
+ 					     enum power_supply_property psp,
+ 					     union power_supply_propval *val)
+@@ -170,10 +233,24 @@ static int srt_bat_power_supply_get_property(struct power_supply *psy,
+ 		ret = srt_bat_get_value(client, REGB_ONLINE, &val->intval);
+ 		break;
+ 	case POWER_SUPPLY_PROP_STATUS:
+-		if (srt->capacity < 100)
++		if (srt->capacity < 100) {
+ 			ret = srt_bat_get_value(client, REGB_STATUS, &val->intval);
+-		else
++			if (!ret && val->intval == POWER_SUPPLY_STATUS_DISCHARGING &&
++			    srt_ac_online(client) > 0)
++				val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
++		} else {
+ 			val->intval = POWER_SUPPLY_STATUS_FULL;
++		}
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		ret = i2c_smbus_read_byte_data(client, srt->charge_limit_reg);
++		if (ret < 0)
++			break;
++
++		val->intval = ret == SRT_CHARGE_LIMIT_NONE ?
++			      POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO :
++			      POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
++		ret = 0;
+ 		break;
+ 	case POWER_SUPPLY_PROP_TECHNOLOGY:
+ 		val->intval = srt->technology;
+@@ -246,7 +323,11 @@ static const struct power_supply_desc srt_bat_power_supply_desc = {
+ 	.type = POWER_SUPPLY_TYPE_BATTERY,
+ 	.properties = srt_bat_power_supply_props,
+ 	.num_properties = ARRAY_SIZE(srt_bat_power_supply_props),
++	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
++			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
+ 	.get_property = srt_bat_power_supply_get_property,
++	.set_property = srt_bat_power_supply_set_property,
++	.property_is_writeable = srt_bat_property_is_writeable,
+ 	.external_power_changed = power_supply_changed,
+ };
+ 
+@@ -314,6 +395,17 @@ static int srt_ec_probe(struct i2c_client *client)
+ 	else
+ 		srt->technology = POWER_SUPPLY_TECHNOLOGY_UNKNOWN;
+ 
++	/*
++	 * Like the Windows firmware, use the charge limit register of EC
++	 * firmware 10 and later, and the older one before.
++	 */
++	ret = i2c_smbus_read_byte_data(client, REGB_FW_MAJOR);
++	if (ret < 0)
++		return ret;
++
++	srt->charge_limit_reg = ret >= 0x0a ? REGB_CHARGE_LIMIT :
++					      REGB_CHARGE_LIMIT_OLD;
++
+ 	bat_cfg.drv_data = srt;
+ 	bat_cfg.fwnode = dev_fwnode(dev);
+ 
