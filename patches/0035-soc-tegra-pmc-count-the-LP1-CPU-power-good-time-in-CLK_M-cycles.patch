@@ -1,0 +1,102 @@
+From: Jerome Berclaz <26882162+jberclaz@users.noreply.github.com>
+Subject: [PATCH] soc/tegra: pmc: count the LP1 CPU power-good time in CLK_M cycles
+
+On LP1 entry the CPU rail is turned off through CPU_PWR_REQ and the
+system clock is switched to the 32 kHz clock, with an SCLK burst policy
+that moves SCLK to CLK_M on the wake-up interrupt. The PMC counts its
+timers on its bus clock, so by the time it counts the CPU power-good
+delay on LP1 exit it runs from CLK_M, not from 32 kHz.
+
+tegra_pmc_enter_suspend_mode() converts nvidia,cpu-pwr-good-time with a
+32768 Hz rate for LP1. On the Microsoft Surface RT (Tegra 30, CPU rail
+on the TPS65911 VDDCTRL controlled by EN1, 0 V sleep voltage) 2000 us
+becomes 66 ticks, i.e. a few microseconds at CLK_M (12 MHz). CPU0 is
+released long before the rail has ramped up and never runs: the wake
+interrupt is pending in the LIC, SCLK is in the IRQ burst state and the
+flow controller has left the halt state, but the CPU reset handler is
+never reached and the system stays hung.
+
+Use the CLK_M rate for the power-good timer in LP1. The power-off timer
+keeps the 32 kHz rate since it runs before the wake-up.
+
+Tested on the Microsoft Surface RT: LP1 suspend/resume with the RTC
+alarm works; resume takes about 0.3 s.
+
+Assisted-by: Claude
+Signed-off-by: Jerome Berclaz <26882162+jberclaz@users.noreply.github.com>
+---
+--- a/drivers/soc/tegra/pmc.c	2026-11-21 13:00:09.860642834 -0800
++++ b/drivers/soc/tegra/pmc.c	2026-11-21 13:00:09.872353059 -0800
+@@ -473,6 +473,7 @@
+ 	bool tz_only;
+ 
+ 	unsigned long rate;
++	unsigned long clk_m_rate;
+ 
+ 	enum tegra_suspend_mode suspend_mode;
+ 	u32 cpu_good_time;
+@@ -3123,6 +3124,15 @@
+ 		pmc->rate = clk_get_rate(pmc->clk);
+ 	}
+ 
++	if (IS_ENABLED(CONFIG_PM_SLEEP)) {
++		struct clk *clk_m = clk_get_sys(NULL, "clk_m");
++
++		if (!IS_ERR(clk_m)) {
++			pmc->clk_m_rate = clk_get_rate(clk_m);
++			clk_put(clk_m);
++		}
++	}
++
+ 	err = tegra_pmc_init(pmc);
+ 	if (err < 0) {
+ 		dev_err(&pdev->dev, "failed to initialize PMC: %d\n", err);
+@@ -3152,6 +3162,7 @@
+ #if defined(CONFIG_ARM)
+ 	mutex_lock(&early_pmc->powergates_lock);
+ 	early_pmc->rate = pmc->rate;
++	early_pmc->clk_m_rate = pmc->clk_m_rate;
+ 	iounmap(early_pmc->base);
+ 	early_pmc->base = pmc->base;
+ 	mutex_unlock(&early_pmc->powergates_lock);
+@@ -4980,17 +4991,27 @@
+ 
+ void tegra_pmc_enter_suspend_mode(enum tegra_suspend_mode mode)
+ {
+-	unsigned long long rate = 0;
++	unsigned long long rate = 0, good_rate = 0;
+ 	u64 ticks;
+ 	u32 value;
+ 
+ 	switch (mode) {
+ 	case TEGRA_SUSPEND_LP1:
++		/*
++		 * The CPU rail is switched off at 32 kHz, but the wake-up
++		 * interrupt bursts SCLK (and with it the PMC clock) to CLK_M
++		 * before the PMC counts the CPU power-good time, see the SCLK
++		 * burst policy set up by tegra*_switch_cpu_to_clk32k. Count
++		 * that time in CLK_M cycles so that the CPU rail has ramped up
++		 * before CPU0 is released.
++		 */
+ 		rate = 32768;
++		good_rate = early_pmc->clk_m_rate ?: rate;
+ 		break;
+ 
+ 	case TEGRA_SUSPEND_LP2:
+ 		rate = early_pmc->rate;
++		good_rate = rate;
+ 		break;
+ 
+ 	default:
+@@ -4998,9 +5019,9 @@
+ 	}
+ 
+ 	if (WARN_ON_ONCE(rate == 0))
+-		rate = 100000000;
++		rate = good_rate = 100000000;
+ 
+-	ticks = early_pmc->cpu_good_time * rate + USEC_PER_SEC - 1;
++	ticks = early_pmc->cpu_good_time * good_rate + USEC_PER_SEC - 1;
+ 	do_div(ticks, USEC_PER_SEC);
+ 	tegra_pmc_writel(early_pmc, ticks, PMC_CPUPWRGOOD_TIMER);
+ 
