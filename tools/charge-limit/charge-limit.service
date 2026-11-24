@@ -1,0 +1,14 @@
+[Unit]
+Description=Battery charge limit (Surface RT EC)
+After=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/charge-limit run
+# every exit path restores normal charging: the EC keeps the value while off
+ExecStopPost=/usr/local/sbin/charge-limit stop
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
