@@ -14,6 +14,7 @@ The EFI variant deletes the property (suspend is handled differently when
 booted by the Microsoft firmware), so it is not affected.
 
 Assisted-by: Claude
+Signed-off-by: Jerome Berclaz <26882162+jberclaz@users.noreply.github.com>
 ---
 --- a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts	2026-11-21 13:55:03.041275203 -0800
 +++ b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts	2026-11-21 13:55:03.066032813 -0800

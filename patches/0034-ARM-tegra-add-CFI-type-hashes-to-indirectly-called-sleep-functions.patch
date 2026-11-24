@@ -21,6 +21,7 @@ faulting PC, recorded in a PMC scratch register by a die notifier, was
 the kCFI check in tegra_sleep_core().
 
 Assisted-by: Claude
+Signed-off-by: Jerome Berclaz <26882162+jberclaz@users.noreply.github.com>
 ---
 --- a/arch/arm/mach-tegra/sleep-tegra20.S	2026-11-21 13:12:04.361429037 -0800
 +++ b/arch/arm/mach-tegra/sleep-tegra20.S	2026-11-21 13:12:04.365365343 -0800

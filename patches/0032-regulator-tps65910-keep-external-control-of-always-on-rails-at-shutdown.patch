@@ -19,6 +19,7 @@ Tested on Microsoft Surface RT, kernel 7.3.1 (libre-tegra eab1ff1e),
 UEFI boot: poweroff and reboot complete, the PMIC switches off.
 
 Assisted-by: Claude (Anthropic)
+Signed-off-by: Jerome Berclaz <26882162+jberclaz@users.noreply.github.com>
 ---
 diff --git a/drivers/regulator/tps65910-regulator.c b/drivers/regulator/tps65910-regulator.c
 index 3a3027e..4ba1a79 100644
